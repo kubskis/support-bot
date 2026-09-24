@@ -16,10 +16,13 @@ from aiogram.types import (
 )
 
 # ----------------------------------------------------------------------
-# НАСТРОЙКИ
+# НАСТРОЙКИ (Токен берётся из Environment Variables)
 # ----------------------------------------------------------------------
-BOT_TOKEN = "8969042562:AAHPFajWmZ0gxdR4uOXJWvRRvzdC_Kw1J_0"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_CHAT_ID = -1003945292994  # ID группы поддержки
+
+if not BOT_TOKEN:
+    raise ValueError("ОШИБКА: Токен бота не найден! Укажите BOT_TOKEN в Environment Variables на Render.")
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
