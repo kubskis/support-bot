@@ -19,7 +19,7 @@ from aiogram.types import (
 # НАСТРОЙКИ
 # ----------------------------------------------------------------------
 BOT_TOKEN = "8969042562:AAHPFajWmZ0gxdR4uOXJWvRRvzdC_Kw1J_0"
-ADMIN_CHAT_ID = -1003945292994  # Обновленный ID группы поддержки
+ADMIN_CHAT_ID = -1003945292994  # ID группы поддержки
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
@@ -37,6 +37,11 @@ def get_user_mention(user):
 def init_db():
     conn = sqlite3.connect("support_bot.db")
     cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY
+        )
+    """)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS tickets (
             ticket_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -62,6 +67,21 @@ def init_db():
     conn.close()
 
 init_db()
+
+def register_user(user_id):
+    conn = sqlite3.connect("support_bot.db")
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
+    conn.commit()
+    conn.close()
+
+def get_all_users():
+    conn = sqlite3.connect("support_bot.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id FROM users")
+    rows = cursor.fetchall()
+    conn.close()
+    return [row[0] for row in rows]
 
 def create_ticket(user_id):
     conn = sqlite3.connect("support_bot.db")
@@ -183,6 +203,7 @@ def close_ticket_kb(ticket_id, admin_id):
 
 @router.message(CommandStart(), F.chat.type == "private")
 async def start_cmd(message: Message, state: FSMContext):
+    register_user(message.from_user.id)
     banned = is_banned(message.from_user.id)
     if banned:
         await message.answer(f"❌ Вы заблокированы в поддержке.\n<b>Причина:</b> {html.escape(banned[0])}", parse_mode="HTML")
@@ -200,6 +221,7 @@ async def start_cmd(message: Message, state: FSMContext):
 # ----------------------------------------------------------------------
 @router.message(F.text == BTN_COMPLAINT, F.chat.type == "private")
 async def start_complaint(message: Message, state: FSMContext):
+    register_user(message.from_user.id)
     if is_banned(message.from_user.id): return
     await state.clear()
     await state.set_state(Form.complaint_reason)
@@ -207,6 +229,7 @@ async def start_complaint(message: Message, state: FSMContext):
 
 @router.message(F.text == BTN_APPEAL, F.chat.type == "private")
 async def start_appeal(message: Message, state: FSMContext):
+    register_user(message.from_user.id)
     if is_banned(message.from_user.id): return
     await state.clear()
     await state.set_state(Form.appeal_nickname)
@@ -214,6 +237,7 @@ async def start_appeal(message: Message, state: FSMContext):
 
 @router.message(F.text == BTN_FRIENDS, F.chat.type == "private")
 async def start_friends_temp(message: Message, state: FSMContext):
+    register_user(message.from_user.id)
     if is_banned(message.from_user.id): return
     await state.clear()
     await message.answer(
@@ -225,6 +249,7 @@ async def start_friends_temp(message: Message, state: FSMContext):
 
 @router.message(F.text == BTN_QUESTION, F.chat.type == "private")
 async def start_question(message: Message, state: FSMContext):
+    register_user(message.from_user.id)
     if is_banned(message.from_user.id): return
     await state.clear()
     await state.set_state(Form.question_text)
@@ -249,7 +274,11 @@ async def process_c_nickname(message: Message, state: FSMContext):
 async def process_c_photo(message: Message, state: FSMContext):
     await state.update_data(c_photo=message.photo[-1].file_id)
     await state.set_state(Form.complaint_server)
-    await message.answer("4️⃣ <b>На каком сервере произошло нарушение?</b> (1, 2, 3 или 4):", parse_mode="HTML")
+    await message.answer(
+        "4️⃣ <b>На каком сервере произошло нарушение?</b>\n"
+        "Укажите название или номер сервера (если название повторяется, добавьте уточняющий номер, например: <i>Tower 2</i> или <i>VIP</i>):",
+        parse_mode="HTML"
+    )
 
 @router.message(Form.complaint_server)
 async def process_c_server(message: Message, state: FSMContext):
@@ -412,6 +441,7 @@ async def close_ticket_handler(call: CallbackQuery):
 # ----------------------------------------------------------------------
 @router.message(F.chat.type == "private")
 async def user_private_message(message: Message, state: FSMContext):
+    register_user(message.from_user.id)
     if is_banned(message.from_user.id):
         return
 
@@ -483,7 +513,64 @@ async def admin_reply_in_group(message: Message):
         await message.reply(f"❌ Не удалось отправить сообщение пользователю.\nОшибка: <code>{html.escape(str(e))}</code>", parse_mode="HTML")
 
 # ----------------------------------------------------------------------
-# УНИВЕРСАЛЬНЫЕ КОМАНДЫ БАНА / РАЗБАНА В ГРУППЕ
+# КОМАНДА РАССЫЛКИ /news <текст> (СТРОГО ТОЛЬКО В АДМИН-ГРУППЕ)
+# ----------------------------------------------------------------------
+@router.message(Command("news"), F.chat.id == ADMIN_CHAT_ID)
+async def news_broadcast_command(message: Message):
+    args = message.text.split(maxsplit=1) if message.text else []
+    
+    broadcast_text = args[1] if len(args) > 1 else (message.caption.split(maxsplit=1)[1] if message.caption and len(message.caption.split(maxsplit=1)) > 1 else None)
+    
+    if not broadcast_text and not message.reply_to_message:
+        await message.reply(
+            "📢 <b>Инструкция по рассылке:</b>\n\n"
+            "• Напишите: <code>/news Ваш текст объявления</code>\n"
+            "• Или ответьте (reply) на фото командой <code>/news Ваш текст</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    all_users = get_all_users()
+    if not all_users:
+        await message.reply("❌ В базе данных нет зарегистрированных пользователей для рассылки.")
+        return
+
+    status_msg = await message.reply(f"🚀 Начинаю рассылку для {len(all_users)} пользователей...")
+    
+    success_count = 0
+    failed_count = 0
+
+    photo_id = None
+    if message.photo:
+        photo_id = message.photo[-1].file_id
+    elif message.reply_to_message and message.reply_to_message.photo:
+        photo_id = message.reply_to_message.photo[-1].file_id
+        if not broadcast_text:
+            broadcast_text = message.reply_to_message.caption or message.reply_to_message.text
+
+    final_text = f"📢 <b>НОВОСТИ / ОБЪЯВЛЕНИЕ</b>\n\n{broadcast_text or ''}"
+
+    for user_id in all_users:
+        try:
+            if photo_id:
+                await bot.send_photo(user_id, photo=photo_id, caption=final_text, parse_mode="HTML")
+            else:
+                await bot.send_message(user_id, final_text, parse_mode="HTML")
+            success_count += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            failed_count += 1
+
+    await status_msg.edit_text(
+        f"✅ <b>Рассылка завершена!</b>\n\n"
+        f"📊 <b>Результаты:</b>\n"
+        f"• Доставлено: <b>{success_count}</b>\n"
+        f"• Не доставлено (заблокировали бота): <b>{failed_count}</b>",
+        parse_mode="HTML"
+    )
+
+# ----------------------------------------------------------------------
+# УНИВЕРСАЛЬНЫЕ КОМАНДЫ БАНА / РАЗБАНА В ГРУППЕ (СТРОГО ТОЛЬКО В АДМИН-ГРУППЕ)
 # ----------------------------------------------------------------------
 @router.message(Command("ban"), F.chat.id == ADMIN_CHAT_ID)
 async def ban_command(message: Message):
@@ -574,4 +661,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-                                     
+    
