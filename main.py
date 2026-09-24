@@ -67,6 +67,12 @@ def init_db():
             reason TEXT
         )
     """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS pending_rejections (
+            prompt_message_id INTEGER PRIMARY KEY,
+            ticket_id INTEGER
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -160,6 +166,28 @@ def unban_user_db(user_id):
     conn = sqlite3.connect("support_bot.db")
     cursor = conn.cursor()
     cursor.execute("DELETE FROM banned_users WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+def add_pending_rejection(prompt_message_id, ticket_id):
+    conn = sqlite3.connect("support_bot.db")
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR REPLACE INTO pending_rejections VALUES (?, ?)", (prompt_message_id, ticket_id))
+    conn.commit()
+    conn.close()
+
+def get_pending_rejection(prompt_message_id):
+    conn = sqlite3.connect("support_bot.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT ticket_id FROM pending_rejections WHERE prompt_message_id = ?", (prompt_message_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+def delete_pending_rejection(prompt_message_id):
+    conn = sqlite3.connect("support_bot.db")
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM pending_rejections WHERE prompt_message_id = ?", (prompt_message_id,))
     conn.commit()
     conn.close()
 
@@ -416,16 +444,16 @@ async def reject_ticket_handler(call: CallbackQuery):
         await call.answer("❌ Эта заявка уже обработана или закрыта!", show_alert=True)
         return
 
-    # Отправляем сообщение администратору с проработанной формулировкой
+    # Отправляем отдельный служебный запрос на ввод причины
     prompt_msg = await bot.send_message(
         ADMIN_CHAT_ID,
-        f"❓ <b>Напишите причину отказа для заявки №{ticket_id}:</b>\n<i>(Ответьте/Reply на само сообщение заявки выше или на это сообщение)</i>",
+        f"❓ <b>Укажите причину отказа для заявки №{ticket_id}:</b>\n<i>(Ответьте/Reply именно на ЭТО сообщение текстом причины)</i>",
         reply_markup=ForceReply(selective=True),
         parse_mode="HTML"
     )
-    # Привязываем ID сообщения запроса к той же заявке
-    map_message(prompt_msg.message_id, ticket_info[0], ticket_id)
-    await call.answer("Напишите причину отказа в чате!")
+    # Сохраняем связку ID служебного сообщения с ID заявки
+    add_pending_rejection(prompt_msg.message_id, ticket_id)
+    await call.answer("Напишите причину отказа в ответ на новое сообщение бота!")
 
 @router.callback_query(F.data.startswith("close_"))
 async def close_ticket_handler(call: CallbackQuery):
@@ -504,70 +532,42 @@ async def admin_reply_in_group(message: Message):
     if message.text and message.text.startswith("/"):
         return
 
-    reply_text = message.reply_to_message.text or message.reply_to_message.caption or ""
+    replied_msg_id = message.reply_to_message.message_id
 
-    # Проверка: Ответ на запрос причины отказа или на карточку заявки
-    if "Напишите причину отказа для заявки №" in reply_text or "Заявка №" in reply_text:
-        match_ticket = re.search(r"№(\d+)", reply_text)
-        if match_ticket:
-            ticket_id = int(match_ticket.group(1))
-            ticket_info = get_ticket_info(ticket_id)
-            if ticket_info and ticket_info[2] == 'pending':
-                user_id = ticket_info[0]
-                reject_reason = html.escape(message.text or "Без указания причины")
-                close_ticket_db(ticket_id, status='rejected')
-                
-                # Изменяем исходное сообщение заявки: убираем кнопки и пишем причину отказа
-                try:
-                    orig_msg = message.reply_to_message
-                    reject_status_text = (
-                        f"\n\n❌ <b>Заявка отклонена!</b>"
-                        f"\n👤 <b>Модератор:</b> {message.from_user.mention_html()}"
-                        f"\n💬 <b>Причина:</b> {reject_reason}"
-                    )
-                    
-                    if orig_msg.photo:
-                        await bot.edit_message_caption(
-                            chat_id=ADMIN_CHAT_ID,
-                            message_id=orig_msg.message_id,
-                            caption=(orig_msg.caption or "") + reject_status_text,
-                            reply_markup=None, # Полное удаление кнопок
-                            parse_mode="HTML"
-                        )
-                    else:
-                        await bot.edit_message_text(
-                            chat_id=ADMIN_CHAT_ID,
-                            message_id=orig_msg.message_id,
-                            text=(orig_msg.text or "") + reject_status_text,
-                            reply_markup=None, # Полное удаление кнопок
-                            parse_mode="HTML"
-                        )
-                except Exception as e:
-                    logging.warning(f"Не удалось отредактировать сообщение заявки: {e}")
+    # 1. СТРОГАЯ ПРОВЕРКА: Ответ ли это на запрос ввода причины отказа после нажатия кнопки "Отклонить"
+    pending_ticket_id = get_pending_rejection(replied_msg_id)
+    if pending_ticket_id:
+        ticket_info = get_ticket_info(pending_ticket_id)
+        if ticket_info and ticket_info[2] == 'pending':
+            user_id = ticket_info[0]
+            reject_reason = html.escape(message.text or "Без указания причины")
+            close_ticket_db(pending_ticket_id, status='rejected')
+            delete_pending_rejection(replied_msg_id)
 
-                try:
-                    await bot.send_message(
-                        user_id,
-                        f"❌ Ваша заявка <b>№{ticket_id}</b> была отклонена администрацией.\n\n"
-                        f"<b>Причина:</b> {reject_reason}",
-                        parse_mode="HTML"
-                    )
-                except Exception:
-                    pass
-
-                await message.reply(
-                    f"🚫 Заявка <b>№{ticket_id}</b> пользователя <code>{user_id}</code> успешно отклонена!\n"
+            try:
+                await bot.send_message(
+                    user_id,
+                    f"❌ Ваша заявка <b>№{pending_ticket_id}</b> была отклонена администрацией.\n\n"
                     f"<b>Причина:</b> {reject_reason}",
                     parse_mode="HTML"
                 )
-                return
+            except Exception:
+                pass
 
-    # Обычный ответ пользователю
-    targetdata = get_user_by_group_msg(message.reply_to_message.message_id)
+            await message.reply(
+                f"🚫 Заявка <b>№{pending_ticket_id}</b> пользователя <code>{user_id}</code> успешно отклонена!\n"
+                f"<b>Причина:</b> {reject_reason}",
+                parse_mode="HTML"
+            )
+            return
+
+    # 2. Обычный ответ админа пользователю в принятом тикете
+    targetdata = get_user_by_group_msg(replied_msg_id)
     user_id, ticket_id = None, None
     if targetdata:
         user_id, ticket_id = targetdata[0], targetdata[1]
     else:
+        reply_text = message.reply_to_message.text or message.reply_to_message.caption or ""
         match_id = re.search(r"ID:\s*(\d+)", reply_text)
         match_ticket = re.search(r"Заявка\s*№(\d+)", reply_text)
         if match_id: user_id = int(match_id.group(1))
@@ -596,9 +596,11 @@ async def admin_reply_in_group(message: Message):
             text = html.escape(message.text or '')
             await bot.send_message(user_id, f"👨‍💻 <b>Ответ поддержки:</b>\n\n{text}", parse_mode="HTML")
         
+        # Исправлено: чистый вывод ID без лишних знаков и тегов
         await message.reply(
             f"✅ Ответ отправлен пользователю <code>{user_id}</code>!", 
-            reply_markup=close_ticket_kb(ticket_id, admin_id) if ticket_id else None
+            reply_markup=close_ticket_kb(ticket_id, admin_id) if ticket_id else None,
+            parse_mode="HTML"
         )
     except Exception as e:
         await message.reply(f"❌ Не удалось отправить сообщение пользователю.\nОшибка: <code>{html.escape(str(e))}</code>", parse_mode="HTML")
@@ -774,4 +776,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-                        
+    
