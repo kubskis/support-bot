@@ -1,9 +1,10 @@
 import asyncio
 import logging
 import os
-import sqlite3
 import html
 import re
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -20,10 +21,14 @@ from aiogram.types import (
 # НАСТРОЙКИ
 # ----------------------------------------------------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
 ADMIN_CHAT_ID = -1003945292994  # ID группы поддержки
 
 if not BOT_TOKEN:
     raise ValueError("ОШИБКА: Токен бота не найден! Укажите BOT_TOKEN в Environment Variables на Render.")
+
+if not DATABASE_URL:
+    raise ValueError("ОШИБКА: Строка подключения к базе данных не найдена! Укажите DATABASE_URL в Environment Variables.")
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
@@ -36,159 +41,182 @@ def get_user_mention(user):
     return f'<a href="tg://user?id={user.id}">{safe_name}</a>'
 
 # ----------------------------------------------------------------------
-# БАЗА ДАННЫХ (SQLite)
+# БАЗА ДАННЫХ (Supabase / PostgreSQL)
 # ----------------------------------------------------------------------
+def get_db_connection():
+    return psycopg2.connect(DATABASE_URL, sslmode="require")
+
 def init_db():
-    conn = sqlite3.connect("support_bot.db")
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY
-        )
-    """)
-    cursor.execute("""
+            user_id BIGINT PRIMARY KEY
+        );
         CREATE TABLE IF NOT EXISTS tickets (
-            ticket_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            admin_id INTEGER DEFAULT NULL,
+            ticket_id SERIAL PRIMARY KEY,
+            user_id BIGINT,
+            admin_id BIGINT DEFAULT NULL,
             status TEXT DEFAULT 'pending'
-        )
-    """)
-    cursor.execute("""
+        );
         CREATE TABLE IF NOT EXISTS message_map (
-            group_message_id INTEGER PRIMARY KEY,
-            user_id INTEGER,
+            group_message_id BIGINT PRIMARY KEY,
+            user_id BIGINT,
             ticket_id INTEGER
-        )
-    """)
-    cursor.execute("""
+        );
         CREATE TABLE IF NOT EXISTS banned_users (
-            user_id INTEGER PRIMARY KEY,
+            user_id BIGINT PRIMARY KEY,
             reason TEXT
-        )
-    """)
-    cursor.execute("""
+        );
         CREATE TABLE IF NOT EXISTS pending_rejections (
-            prompt_message_id INTEGER PRIMARY KEY,
+            prompt_message_id BIGINT PRIMARY KEY,
             ticket_id INTEGER
-        )
+        );
     """)
     conn.commit()
+    cursor.close()
     conn.close()
 
 init_db()
 
 def register_user(user_id):
-    conn = sqlite3.connect("support_bot.db")
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
+    cursor.execute("INSERT INTO users (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING", (user_id,))
     conn.commit()
+    cursor.close()
     conn.close()
 
 def get_all_users():
-    conn = sqlite3.connect("support_bot.db")
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT user_id FROM users")
     rows = cursor.fetchall()
+    cursor.close()
     conn.close()
     return [row[0] for row in rows]
 
 def create_ticket(user_id):
-    conn = sqlite3.connect("support_bot.db")
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("INSERT INTO tickets (user_id, status) VALUES (?, 'pending')", (user_id,))
-    ticket_id = cursor.lastrowid
+    cursor.execute("INSERT INTO tickets (user_id, status) VALUES (%s, 'pending') RETURNING ticket_id", (user_id,))
+    ticket_id = cursor.fetchone()[0]
     conn.commit()
+    cursor.close()
     conn.close()
     return ticket_id
 
 def map_message(group_msg_id, user_id, ticket_id):
-    conn = sqlite3.connect("support_bot.db")
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("INSERT OR REPLACE INTO message_map VALUES (?, ?, ?)", (group_msg_id, user_id, ticket_id))
+    cursor.execute(
+        "INSERT INTO message_map (group_message_id, user_id, ticket_id) VALUES (%s, %s, %s) "
+        "ON CONFLICT (group_message_id) DO UPDATE SET user_id = EXCLUDED.user_id, ticket_id = EXCLUDED.ticket_id",
+        (group_msg_id, user_id, ticket_id)
+    )
     conn.commit()
+    cursor.close()
     conn.close()
 
 def get_user_by_group_msg(group_msg_id):
-    conn = sqlite3.connect("support_bot.db")
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT user_id, ticket_id FROM message_map WHERE group_message_id = ?", (group_msg_id,))
+    cursor.execute("SELECT user_id, ticket_id FROM message_map WHERE group_message_id = %s", (group_msg_id,))
     row = cursor.fetchone()
+    cursor.close()
     conn.close()
     return row
 
 def get_ticket_info(ticket_id):
-    conn = sqlite3.connect("support_bot.db")
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT user_id, admin_id, status FROM tickets WHERE ticket_id = ?", (ticket_id,))
+    cursor.execute("SELECT user_id, admin_id, status FROM tickets WHERE ticket_id = %s", (ticket_id,))
     row = cursor.fetchone()
+    cursor.close()
     conn.close()
     return row
 
 def get_active_ticket(user_id):
-    conn = sqlite3.connect("support_bot.db")
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT ticket_id, admin_id FROM tickets WHERE user_id = ? AND status = 'active' ORDER BY ticket_id DESC LIMIT 1", (user_id,))
+    cursor.execute("SELECT ticket_id, admin_id FROM tickets WHERE user_id = %s AND status = 'active' ORDER BY ticket_id DESC LIMIT 1", (user_id,))
     row = cursor.fetchone()
+    cursor.close()
     conn.close()
     return row
 
 def activate_ticket(ticket_id, admin_id):
-    conn = sqlite3.connect("support_bot.db")
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("UPDATE tickets SET status = 'active', admin_id = ? WHERE ticket_id = ?", (admin_id, ticket_id))
+    cursor.execute("UPDATE tickets SET status = 'active', admin_id = %s WHERE ticket_id = %s", (admin_id, ticket_id))
     conn.commit()
+    cursor.close()
     conn.close()
 
 def close_ticket_db(ticket_id, status='closed'):
-    conn = sqlite3.connect("support_bot.db")
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("UPDATE tickets SET status = ? WHERE ticket_id = ?", (status, ticket_id))
+    cursor.execute("UPDATE tickets SET status = %s WHERE ticket_id = %s", (status, ticket_id))
     conn.commit()
+    cursor.close()
     conn.close()
 
 def is_banned(user_id):
-    conn = sqlite3.connect("support_bot.db")
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT reason FROM banned_users WHERE user_id = ?", (user_id,))
+    cursor.execute("SELECT reason FROM banned_users WHERE user_id = %s", (user_id,))
     row = cursor.fetchone()
+    cursor.close()
     conn.close()
     return row
 
 def ban_user_db(user_id, reason):
-    conn = sqlite3.connect("support_bot.db")
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("INSERT OR REPLACE INTO banned_users VALUES (?, ?)", (user_id, reason))
+    cursor.execute(
+        "INSERT INTO banned_users (user_id, reason) VALUES (%s, %s) "
+        "ON CONFLICT (user_id) DO UPDATE SET reason = EXCLUDED.reason",
+        (user_id, reason)
+    )
     conn.commit()
+    cursor.close()
     conn.close()
 
 def unban_user_db(user_id):
-    conn = sqlite3.connect("support_bot.db")
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM banned_users WHERE user_id = ?", (user_id,))
+    cursor.execute("DELETE FROM banned_users WHERE user_id = %s", (user_id,))
     conn.commit()
+    cursor.close()
     conn.close()
 
 def add_pending_rejection(prompt_message_id, ticket_id):
-    conn = sqlite3.connect("support_bot.db")
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("INSERT OR REPLACE INTO pending_rejections VALUES (?, ?)", (prompt_message_id, ticket_id))
+    cursor.execute(
+        "INSERT INTO pending_rejections (prompt_message_id, ticket_id) VALUES (%s, %s) "
+        "ON CONFLICT (prompt_message_id) DO UPDATE SET ticket_id = EXCLUDED.ticket_id",
+        (prompt_message_id, ticket_id)
+    )
     conn.commit()
+    cursor.close()
     conn.close()
 
 def get_pending_rejection(prompt_message_id):
-    conn = sqlite3.connect("support_bot.db")
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT ticket_id FROM pending_rejections WHERE prompt_message_id = ?", (prompt_message_id,))
+    cursor.execute("SELECT ticket_id FROM pending_rejections WHERE prompt_message_id = %s", (prompt_message_id,))
     row = cursor.fetchone()
+    cursor.close()
     conn.close()
     return row[0] if row else None
 
 def delete_pending_rejection(prompt_message_id):
-    conn = sqlite3.connect("support_bot.db")
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM pending_rejections WHERE prompt_message_id = ?", (prompt_message_id,))
+    cursor.execute("DELETE FROM pending_rejections WHERE prompt_message_id = %s", (prompt_message_id,))
     conn.commit()
+    cursor.close()
     conn.close()
 
 # ----------------------------------------------------------------------
@@ -444,14 +472,12 @@ async def reject_ticket_handler(call: CallbackQuery):
         await call.answer("❌ Эта заявка уже обработана или закрыта!", show_alert=True)
         return
 
-    # Отправляем отдельный служебный запрос на ввод причины
     prompt_msg = await bot.send_message(
         ADMIN_CHAT_ID,
         f"❓ <b>Укажите причину отказа для заявки №{ticket_id}:</b>\n<i>(Ответьте/Reply именно на ЭТО сообщение текстом причины)</i>",
         reply_markup=ForceReply(selective=True),
         parse_mode="HTML"
     )
-    # Сохраняем связку ID служебного сообщения с ID заявки
     add_pending_rejection(prompt_msg.message_id, ticket_id)
     await call.answer("Напишите причину отказа в ответ на новое сообщение бота!")
 
@@ -534,7 +560,6 @@ async def admin_reply_in_group(message: Message):
 
     replied_msg_id = message.reply_to_message.message_id
 
-    # 1. СТРОГАЯ ПРОВЕРКА: Ответ ли это на запрос ввода причины отказа после нажатия кнопки "Отклонить"
     pending_ticket_id = get_pending_rejection(replied_msg_id)
     if pending_ticket_id:
         ticket_info = get_ticket_info(pending_ticket_id)
@@ -561,7 +586,6 @@ async def admin_reply_in_group(message: Message):
             )
             return
 
-    # 2. Обычный ответ админа пользователю в принятом тикете
     targetdata = get_user_by_group_msg(replied_msg_id)
     user_id, ticket_id = None, None
     if targetdata:
@@ -596,7 +620,6 @@ async def admin_reply_in_group(message: Message):
             text = html.escape(message.text or '')
             await bot.send_message(user_id, f"👨‍💻 <b>Ответ поддержки:</b>\n\n{text}", parse_mode="HTML")
         
-        # Исправлено: чистый вывод ID без лишних знаков и тегов
         await message.reply(
             f"✅ Ответ отправлен пользователю <code>{user_id}</code>!", 
             reply_markup=close_ticket_kb(ticket_id, admin_id) if ticket_id else None,
