@@ -22,7 +22,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 logging.basicConfig(level=logging.INFO)
 
 # Конфигурация бота
-BOT_TOKEN = "8526419531:AAETEDjGFAC2FW5hHyaPCfuNivTNEiJTgVw"
+BOT_TOKEN = "8969042562:AAGH7ck7qqNN_75ohEDTARYcCtEMgd-cp8A"
 ADMIN_CHAT_ID = -1002364893721  # ID вашей группы/чата администраторов
 DB_NAME = "support_bot.db"
 
