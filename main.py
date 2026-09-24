@@ -353,9 +353,7 @@ async def notify_users_on_startup(bot: Bot):
 async def handle_health_check(request):
     return web.Response(text="Bot Support ToH Secrets is running successfully!")
 
-# --- Главная точка входа ---
-async def main():
-    # Запуск HTTP веб-сервера для Render (убирает ошибку No open ports)
+async def start_web_server():
     app = web.Application()
     app.router.add_get("/", handle_health_check)
     app.router.add_get("/health", handle_health_check)
@@ -366,17 +364,23 @@ async def main():
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
+    print(f"HTTP-сервер слушает порт {port}.")
 
-    print(f"Бот поддержки Tower Of Hell Secrets успешно запущен! HTTP-сервер слушает порт {port}.")
+# --- Главная точка входа ---
+async def main():
+    # Запускаем веб-сервер фоновой задачей
+    asyncio.create_task(start_web_server())
+
+    # Удаляем вебхуки, если они были ранее установлены
+    await bot.delete_webhook(drop_pending_updates=True)
 
     # Фоновая рассылка пользователям об обновлении
     asyncio.create_task(notify_users_on_startup(bot))
 
-    # Запуск поллинга
-    try:
-        await dp.start_polling(bot)
-    finally:
-        await runner.cleanup()
+    print("Бот поддержки Tower Of Hell Secrets успешно запущен в режиме polling!")
+
+    # Запуск поллинга сообщений из Telegram
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
