@@ -13,7 +13,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton,
-    InlineKeyboardMarkup, InlineKeyboardButton
+    InlineKeyboardMarkup, InlineKeyboardButton, ForceReply
 )
 
 # ----------------------------------------------------------------------
@@ -134,10 +134,10 @@ def activate_ticket(ticket_id, admin_id):
     conn.commit()
     conn.close()
 
-def close_ticket_db(ticket_id):
+def close_ticket_db(ticket_id, status='closed'):
     conn = sqlite3.connect("support_bot.db")
     cursor = conn.cursor()
-    cursor.execute("UPDATE tickets SET status = 'closed' WHERE ticket_id = ?", (ticket_id,))
+    cursor.execute("UPDATE tickets SET status = ? WHERE ticket_id = ?", (status, ticket_id))
     conn.commit()
     conn.close()
 
@@ -197,7 +197,8 @@ def main_keyboard():
 
 def take_ticket_kb(ticket_id):
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="📥 Принять заявку", callback_data=f"take_{ticket_id}")
+        InlineKeyboardButton(text="📥 Принять заявку", callback_data=f"take_{ticket_id}"),
+        InlineKeyboardButton(text="❌ Отклонить заявку", callback_data=f"reject_{ticket_id}")
     ]])
 
 def close_ticket_kb(ticket_id, admin_id):
@@ -294,14 +295,13 @@ async def process_c_server(message: Message, state: FSMContext):
     c_nickname = html.escape(data.get('c_nickname', ''))
     c_server = html.escape(message.text or '')
 
-    # Чистый <code> тег строго вокруг цифр для кликабельного копирования
     admin_text = (
         f"🚨 <b>#Жалоба | Заявка №{ticket_id}</b>\n"
         f"👤 От: {user_mention} | ID: <code>{message.from_user.id}</code>\n\n"
         f"1️⃣ <b>Суть:</b> {c_reason}\n"
         f"2️⃣ <b>Ник нарушителя:</b> <code>{c_nickname}</code>\n"
         f"4️⃣ <b>Сервер:</b> {c_server}\n\n"
-        f"🔘 <i>Нажмите «Принять заявку», чтобы начать диалог.</i>"
+        f"🔘 <i>Выберите действие ниже:</i>"
     )
     sent = await bot.send_photo(
         ADMIN_CHAT_ID, 
@@ -335,7 +335,7 @@ async def process_a_reason(message: Message, state: FSMContext):
         f"👤 От: {user_mention} | ID: <code>{message.from_user.id}</code>\n\n"
         f"1️⃣ <b>Ник:</b> <code>{a_nickname}</code>\n"
         f"2️⃣ <b>Причина:</b> {a_reason}\n\n"
-        f"🔘 <i>Нажмите «Принять заявку», чтобы начать диалог.</i>"
+        f"🔘 <i>Выберите действие ниже:</i>"
     )
     sent = await bot.send_message(
         ADMIN_CHAT_ID, 
@@ -358,7 +358,7 @@ async def process_question(message: Message, state: FSMContext):
         f"❓ <b>#Вопрос | Заявка №{ticket_id}</b>\n"
         f"👤 От: {user_mention} | ID: <code>{message.from_user.id}</code>\n\n"
         f"<b>Вопрос:</b> {question}\n\n"
-        f"🔘 <i>Нажмите «Принять заявку», чтобы начать диалог.</i>"
+        f"🔘 <i>Выберите действие ниже:</i>"
     )
     sent = await bot.send_message(
         ADMIN_CHAT_ID, 
@@ -372,7 +372,7 @@ async def process_question(message: Message, state: FSMContext):
     await state.clear()
 
 # ----------------------------------------------------------------------
-# КНОПКИ В ГРУППЕ: ПРИНЯТЬ И ЗАКРЫТЬ ЗАЯВКУ
+# КНОПКИ В ГРУППЕ: ПРИНЯТЬ И ОТКЛОНИТЬ ЗАЯВКУ
 # ----------------------------------------------------------------------
 @router.callback_query(F.data.startswith("take_"))
 async def take_ticket_handler(call: CallbackQuery):
@@ -380,8 +380,8 @@ async def take_ticket_handler(call: CallbackQuery):
     admin_id = call.from_user.id
 
     ticket_info = get_ticket_info(ticket_id)
-    if ticket_info and ticket_info[1] is not None:
-        await call.answer("❌ Эту заявку уже принял другой администратор!", show_alert=True)
+    if ticket_info and ticket_info[2] != 'pending':
+        await call.answer("❌ Эта заявка уже обработана или закрыта!", show_alert=True)
         return
 
     activate_ticket(ticket_id, admin_id)
@@ -406,6 +406,26 @@ async def take_ticket_handler(call: CallbackQuery):
         await call.message.edit_text(text=new_caption_or_text, reply_markup=close_ticket_kb(ticket_id, admin_id), parse_mode="HTML")
 
     await call.answer(f"Вы успешно приняли заявку №{ticket_id}!")
+
+@router.callback_query(F.data.startswith("reject_"))
+async def reject_ticket_handler(call: CallbackQuery):
+    ticket_id = int(call.data.split("_")[1])
+
+    ticket_info = get_ticket_info(ticket_id)
+    if ticket_info and ticket_info[2] != 'pending':
+        await call.answer("❌ Эта заявка уже обработана или закрыта!", show_alert=True)
+        return
+
+    # Отправляем сообщение администратору с просьбой ввести причину
+    prompt_msg = await bot.send_message(
+        ADMIN_CHAT_ID,
+        f"❓ <b>Напишите причину отказа для заявки №{ticket_id}:</b>\n<i>(Ответьте/Reply на это сообщение текстом причины)</i>",
+        reply_markup=ForceReply(selective=True),
+        parse_mode="HTML"
+    )
+    # Привязываем это сообщение под ид отклоняемой заявки
+    map_message(prompt_msg.message_id, ticket_info[0], ticket_id)
+    await call.answer("Напишите причину отказа в чате!")
 
 @router.callback_query(F.data.startswith("close_"))
 async def close_ticket_handler(call: CallbackQuery):
@@ -477,22 +497,51 @@ async def user_private_message(message: Message, state: FSMContext):
     )
 
 # ----------------------------------------------------------------------
-# ОТВЕТ АДМИНА ИЗ ГРУППЫ ПОЛЬЗОВАТЕЛЮ (Reply в чате)
+# ОТВЕТ АДМИНА ИЗ ГРУППЫ ПОЛЬЗОВАТЕЛЮ ИЛИ ВВОД ПРИЧИНЫ ОТКАЗА
 # ----------------------------------------------------------------------
 @router.message(F.chat.id == ADMIN_CHAT_ID, F.reply_to_message)
 async def admin_reply_in_group(message: Message):
     if message.text and message.text.startswith("/"):
         return
 
+    reply_text = message.reply_to_message.text or message.reply_to_message.caption or ""
+
+    # Проверка: Ответ на запрос причины отказа
+    if "Напишите причину отказа для заявки №" in reply_text:
+        match_ticket = re.search(r"№(\d+)", reply_text)
+        if match_ticket:
+            ticket_id = int(match_ticket.group(1))
+            ticket_info = get_ticket_info(ticket_id)
+            if ticket_info and ticket_info[2] == 'pending':
+                user_id = ticket_info[0]
+                reject_reason = html.escape(message.text or "Без указания причины")
+                close_ticket_db(ticket_id, status='rejected')
+                
+                try:
+                    await bot.send_message(
+                        user_id,
+                        f"❌ Ваша заявка <b>№{ticket_id}</b> была отклонена администрацией.\n\n"
+                        f"<b>Причина:</b> {reject_reason}",
+                        parse_mode="HTML"
+                    )
+                except Exception:
+                    pass
+
+                await message.reply(
+                    f"🚫 Заявка <b>№{ticket_id}</b> пользователя <code>{user_id}</code> успешно отклонена!\n"
+                    f"<b>Причина:</b> {reject_reason}",
+                    parse_mode="HTML"
+                )
+                return
+
+    # Обычный ответ пользователю
     targetdata = get_user_by_group_msg(message.reply_to_message.message_id)
-    
     user_id, ticket_id = None, None
     if targetdata:
         user_id, ticket_id = targetdata[0], targetdata[1]
     else:
-        orig_text = message.reply_to_message.text or message.reply_to_message.caption or ""
-        match_id = re.search(r"ID:\s*(\d+)", orig_text)
-        match_ticket = re.search(r"Заявка\s*№(\d+)", orig_text)
+        match_id = re.search(r"ID:\s*(\d+)", reply_text)
+        match_ticket = re.search(r"Заявка\s*№(\d+)", reply_text)
         if match_id: user_id = int(match_id.group(1))
         if match_ticket: ticket_id = int(match_ticket.group(1))
 
@@ -592,24 +641,19 @@ async def ban_command(message: Message):
     args = message.text.split(maxsplit=2)
     reason = "Нарушение правил / спам"
 
-    # 1. Если команда отправлена с упреждением /ban 123456789 причина
     if len(args) > 1 and args[1].isdigit():
         target_user_id = int(args[1])
         if len(args) > 2:
             reason = args[2]
 
-    # 2. Если команда отправлена через Reply на любое сообщение
     elif message.reply_to_message:
-        # Проверка по базе сообщений
         targetdata = get_user_by_group_msg(message.reply_to_message.message_id)
         if targetdata:
             target_user_id = targetdata[0]
         else:
-            # Извлечение ID напрямую из текста или упоминаний (tg://user?id=...)
             orig_msg = message.reply_to_message
             orig_text = orig_msg.text or orig_msg.caption or ""
             
-            # Поиск через сущности Telegram
             if orig_msg.entities or orig_msg.caption_entities:
                 entities = orig_msg.entities or orig_msg.caption_entities
                 for entity in entities:
@@ -617,7 +661,6 @@ async def ban_command(message: Message):
                         target_user_id = int(entity.url.split("id=")[1])
                         break
             
-            # Поиск регулярным выражением (поиск любых 8–11 значных чисел после ID)
             if not target_user_id:
                 match = re.search(r"ID:?\s*(\d{8,11})", orig_text, re.IGNORECASE)
                 if match:
@@ -703,4 +746,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
+            
