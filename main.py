@@ -146,9 +146,6 @@ class Form(StatesGroup):
     appeal_nickname = State()
     appeal_reason = State()
 
-    friends_nickname = State()
-    friends_played_before = State()
-
     question_text = State()
 
 # ----------------------------------------------------------------------
@@ -210,12 +207,17 @@ async def start_appeal(message: Message, state: FSMContext):
     await state.set_state(Form.appeal_nickname)
     await message.answer("1️⃣ **Ваш ник:**\nУкажите ваш основной ник в игре (не display name).")
 
+# --- ВРЕМЕННО ОТКЛЮЧЕННАЯ КНОПКА ДРУЗЕЙ ---
 @router.message(F.text == BTN_FRIENDS, F.chat.type == "private")
-async def start_friends(message: Message, state: FSMContext):
+async def start_friends_temp(message: Message, state: FSMContext):
     if is_banned(message.from_user.id): return
     await state.clear()
-    await state.set_state(Form.friends_nickname)
-    await message.answer("⚠️ **Сначала отправьте запрос в друзья на ник `Farm_Arlekino`!**\n\n1️⃣ **Укажите ваш ник в игре:**")
+    await message.answer(
+        "🛠 **Добавление в друзья временно недоступно.**\n\n"
+        "В данный момент аккаунт находится на обслуживании. Если у вас возник вопрос по поводу VIP или добавления в друзья, пожалуйста, перейдите во вкладку **«❓ Задать вопрос»**.",
+        reply_markup=main_keyboard(),
+        parse_mode="Markdown"
+    )
 
 @router.message(F.text == BTN_QUESTION, F.chat.type == "private")
 async def start_question(message: Message, state: FSMContext):
@@ -299,36 +301,6 @@ async def process_a_reason(message: Message, state: FSMContext):
     map_message(sent.message_id, message.from_user.id, ticket_id)
     
     await message.answer(f"✅ Ваше обжалование отправлено на рассмотрение! Номер заявки: **№{ticket_id}**.", parse_mode="Markdown")
-    await state.clear()
-
-@router.message(Form.friends_nickname)
-async def process_f_nickname(message: Message, state: FSMContext):
-    await state.update_data(f_nickname=message.text)
-    await state.set_state(Form.friends_played_before)
-    await message.answer("2️⃣ **Играли ли вы раньше на наших VIP-серверах?**")
-
-@router.message(Form.friends_played_before)
-async def process_f_played(message: Message, state: FSMContext):
-    data = await state.get_data()
-    ticket_id = create_ticket(message.from_user.id)
-    user_mention = get_user_mention(message.from_user)
-    
-    admin_text = (
-        f"👯‍♀️ **#Друзья | Заявка №{ticket_id}**\n"
-        f"👤 От: {user_mention} (ID: `{message.from_user.id}`)\n\n"
-        f"1️⃣ **Ник:** `{data['f_nickname']}`\n"
-        f"2️⃣ **Играл ли раньше:** {message.text}\n\n"
-        f"🔘 *Нажмите «Принять заявку», чтобы начать диалог.*"
-    )
-    sent = await bot.send_message(
-        ADMIN_CHAT_ID, 
-        admin_text, 
-        reply_markup=take_ticket_kb(ticket_id),
-        parse_mode="Markdown"
-    )
-    map_message(sent.message_id, message.from_user.id, ticket_id)
-    
-    await message.answer(f"✅ Заявка отправлена! Номер заявки: **№{ticket_id}**.", parse_mode="Markdown")
     await state.clear()
 
 @router.message(Form.question_text)
@@ -505,7 +477,6 @@ async def ban_command(message: Message):
     args = message.text.split(maxsplit=2)
     reason = "Нарушение правил / спам"
 
-    # Вариант 1: Через Reply на сообщение
     if message.reply_to_message:
         targetdata = get_user_by_group_msg(message.reply_to_message.message_id)
         if targetdata:
@@ -513,7 +484,6 @@ async def ban_command(message: Message):
             if len(args) > 1:
                 reason = " ".join(args[1:])
 
-    # Вариант 2: По ID (/ban 123456789 Причина)
     if not target_user_id and len(args) > 1 and args[1].isdigit():
         target_user_id = int(args[1])
         if len(args) > 2:
@@ -569,3 +539,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+    
