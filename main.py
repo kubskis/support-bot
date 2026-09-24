@@ -59,7 +59,6 @@ def init_db():
 init_db()
 
 def create_ticket(user_id):
-    """Создает абсолютно новый тикет с уникальным ticket_id"""
     conn = sqlite3.connect("support_bot.db")
     cursor = conn.cursor()
     cursor.execute("INSERT INTO tickets (user_id, status) VALUES (?, 'pending')", (user_id,))
@@ -153,7 +152,7 @@ class Form(StatesGroup):
     question_text = State()
 
 # ----------------------------------------------------------------------
-# МЕНЮ ПОД КЛАВИАТУРОЙ (ReplyKeyboardMarkup)
+# КЛАВИАТУРЫ
 # ----------------------------------------------------------------------
 BTN_COMPLAINT = "🚨 Жалоба на игрока"
 BTN_APPEAL = "😡 Обжалование бана"
@@ -228,7 +227,6 @@ async def start_question(message: Message, state: FSMContext):
 # ----------------------------------------------------------------------
 # СБОР ДАННЫХ В ФОРМАХ (FSM)
 # ----------------------------------------------------------------------
-# --- Жалоба ---
 @router.message(Form.complaint_reason)
 async def process_c_reason(message: Message, state: FSMContext):
     await state.update_data(c_reason=message.text)
@@ -250,7 +248,7 @@ async def process_c_photo(message: Message, state: FSMContext):
 @router.message(Form.complaint_server)
 async def process_c_server(message: Message, state: FSMContext):
     data = await state.get_data()
-    ticket_id = create_ticket(message.from_user.id) # Новая уникальная заявка
+    ticket_id = create_ticket(message.from_user.id)
     user_mention = get_user_mention(message.from_user)
     
     admin_text = (
@@ -273,7 +271,6 @@ async def process_c_server(message: Message, state: FSMContext):
     await message.answer(f"✅ Ваша жалоба отправлена администрации! Номер заявки: **№{ticket_id}**.", parse_mode="Markdown")
     await state.clear()
 
-# --- Обжалование ---
 @router.message(Form.appeal_nickname)
 async def process_a_nickname(message: Message, state: FSMContext):
     await state.update_data(a_nickname=message.text)
@@ -283,7 +280,7 @@ async def process_a_nickname(message: Message, state: FSMContext):
 @router.message(Form.appeal_reason)
 async def process_a_reason(message: Message, state: FSMContext):
     data = await state.get_data()
-    ticket_id = create_ticket(message.from_user.id) # Новая уникальная заявка
+    ticket_id = create_ticket(message.from_user.id)
     user_mention = get_user_mention(message.from_user)
     
     admin_text = (
@@ -304,7 +301,6 @@ async def process_a_reason(message: Message, state: FSMContext):
     await message.answer(f"✅ Ваше обжалование отправлено на рассмотрение! Номер заявки: **№{ticket_id}**.", parse_mode="Markdown")
     await state.clear()
 
-# --- Друзья ---
 @router.message(Form.friends_nickname)
 async def process_f_nickname(message: Message, state: FSMContext):
     await state.update_data(f_nickname=message.text)
@@ -314,7 +310,7 @@ async def process_f_nickname(message: Message, state: FSMContext):
 @router.message(Form.friends_played_before)
 async def process_f_played(message: Message, state: FSMContext):
     data = await state.get_data()
-    ticket_id = create_ticket(message.from_user.id) # Новая уникальная заявка
+    ticket_id = create_ticket(message.from_user.id)
     user_mention = get_user_mention(message.from_user)
     
     admin_text = (
@@ -335,10 +331,9 @@ async def process_f_played(message: Message, state: FSMContext):
     await message.answer(f"✅ Заявка отправлена! Номер заявки: **№{ticket_id}**.", parse_mode="Markdown")
     await state.clear()
 
-# --- Вопрос ---
 @router.message(Form.question_text)
 async def process_question(message: Message, state: FSMContext):
-    ticket_id = create_ticket(message.from_user.id) # Новая уникальная заявка
+    ticket_id = create_ticket(message.from_user.id)
     user_mention = get_user_mention(message.from_user)
     
     admin_text = (
@@ -502,28 +497,43 @@ async def admin_reply_in_group(message: Message):
         await message.reply(f"❌ Не удалось отправить сообщение пользователю.\nОшибка: `{e}`", parse_mode="Markdown")
 
 # ----------------------------------------------------------------------
-# КОМАНДЫ БАНА / РАЗБАНА В ГРУППЕ
+# УНИВЕРСАЛЬНЫЕ КОМАНДЫ БАНА / РАЗБАНА В ГРУППЕ
 # ----------------------------------------------------------------------
 @router.message(Command("ban"), F.chat.id == ADMIN_CHAT_ID)
 async def ban_command(message: Message):
-    if not message.reply_to_message:
-        await message.reply("⚠️ Используйте команду `/ban <причина>` **в ответ** на сообщение/заявку пользователя!")
-        return
+    target_user_id = None
+    args = message.text.split(maxsplit=2)
+    reason = "Нарушение правил / спам"
 
-    targetdata = get_user_by_group_msg(message.reply_to_message.message_id)
-    if not targetdata:
-        await message.reply("❌ Не удалось определить пользователя по этому сообщению.")
-        return
+    # Вариант 1: Через Reply на сообщение
+    if message.reply_to_message:
+        targetdata = get_user_by_group_msg(message.reply_to_message.message_id)
+        if targetdata:
+            target_user_id = targetdata[0]
+            if len(args) > 1:
+                reason = " ".join(args[1:])
 
-    target_user_id = targetdata[0]
-    args = message.text.split(maxsplit=1)
-    reason = args[1] if len(args) > 1 else "Нарушение правил / спам"
+    # Вариант 2: По ID (/ban 123456789 Причина)
+    if not target_user_id and len(args) > 1 and args[1].isdigit():
+        target_user_id = int(args[1])
+        if len(args) > 2:
+            reason = args[2]
+
+    if not target_user_id:
+        await message.reply(
+            "⚠️ **Не удалось заблокировать.**\n\n"
+            "Используйте одним из способов:\n"
+            "1️⃣ Ответьте на сообщение заявки командой: `/ban Причина`\n"
+            "2️⃣ Напишите команду с ID: `/ban 123456789 Причина`",
+            parse_mode="Markdown"
+        )
+        return
 
     ban_user_db(target_user_id, reason)
-    await message.reply(f"🚫 Пользователь `{target_user_id}` заблокирован.\n**Причина:** {reason}", parse_mode="Markdown")
+    await message.reply(f"🚫 Пользователь `{target_user_id}` заблокирован в системе поддержки.\n**Причина:** {reason}", parse_mode="Markdown")
     
     try:
-        await bot.send_message(target_user_id, f"❌ Вы заблокированы в системе поддержки.\n**Причина:** {reason}")
+        await bot.send_message(target_user_id, f"❌ Вы заблокированы в поддержке.\n**Причина:** {reason}")
     except Exception:
         pass
 
