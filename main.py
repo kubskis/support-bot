@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import sqlite3
+import html
 from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -27,7 +28,8 @@ router = Router()
 dp.include_router(router)
 
 def get_user_mention(user):
-    return f"[{user.full_name}]({user.url})"
+    safe_name = html.escape(user.full_name)
+    return f'<a href="tg://user?id={user.id}">{safe_name}</a>'
 
 # ----------------------------------------------------------------------
 # БАЗА ДАННЫХ (SQLite)
@@ -183,15 +185,15 @@ def close_ticket_kb(ticket_id, admin_id):
 async def start_cmd(message: Message, state: FSMContext):
     banned = is_banned(message.from_user.id)
     if banned:
-        await message.answer(f"❌ Вы заблокированы в поддержке.\n**Причина:** {banned[0]}", parse_mode="Markdown")
+        await message.answer(f"❌ Вы заблокированы в поддержке.\n<b>Причина:</b> {html.escape(banned[0])}", parse_mode="HTML")
         return
 
     await state.clear()
     welcome_text = (
-        "🎪 **Добро пожаловать в поддержку Tower Of Hell Secrets (@ToHSecretss)!** 🎪\n\n"
+        "🎪 <b>Добро пожаловать в поддержку Tower Of Hell Secrets (@ToHSecretss)!</b> 🎪\n\n"
         "🤖 Нажмите на нужную кнопку на клавиатуре ниже, чтобы отправить заявку или задать вопрос."
     )
-    await message.answer(welcome_text, reply_markup=main_keyboard(), parse_mode="Markdown")
+    await message.answer(welcome_text, reply_markup=main_keyboard(), parse_mode="HTML")
 
 # ----------------------------------------------------------------------
 # ОБРАБОТКА НАЖАТИЙ НА КНОПКИ КЛАВИАТУРЫ
@@ -201,25 +203,24 @@ async def start_complaint(message: Message, state: FSMContext):
     if is_banned(message.from_user.id): return
     await state.clear()
     await state.set_state(Form.complaint_reason)
-    await message.answer("1️⃣ **Суть нарушения:**\nОпишите подробно, что именно сделал игрок.")
+    await message.answer("1️⃣ <b>Суть нарушения:</b>\nОпишите подробно, что именно сделал игрок.", parse_mode="HTML")
 
 @router.message(F.text == BTN_APPEAL, F.chat.type == "private")
 async def start_appeal(message: Message, state: FSMContext):
     if is_banned(message.from_user.id): return
     await state.clear()
     await state.set_state(Form.appeal_nickname)
-    await message.answer("1️⃣ **Ваш ник:**\nУкажите ваш основной ник в игре (не display name).")
+    await message.answer("1️⃣ <b>Ваш ник:</b>\nУкажите ваш основной ник в игре (не display name).", parse_mode="HTML")
 
-# --- ВРЕМЕННО ОТКЛЮЧЕННАЯ КНОПКА ДРУЗЕЙ ---
 @router.message(F.text == BTN_FRIENDS, F.chat.type == "private")
 async def start_friends_temp(message: Message, state: FSMContext):
     if is_banned(message.from_user.id): return
     await state.clear()
     await message.answer(
-        "🛠 **Добавление в друзья временно недоступно.**\n\n"
-        "В данный момент аккаунт находится на обслуживании. Если у вас возник вопрос по поводу VIP или добавления в друзья, пожалуйста, перейдите во вкладку **«❓ Задать вопрос»**.",
+        "🛠 <b>Добавление в друзья временно недоступно.</b>\n\n"
+        "В данный момент аккаунт находится на обслуживании. Если у вас возник вопрос по поводу VIP или добавления в друзья, пожалуйста, перейдите во вкладку <b>«❓ Задать вопрос»</b>.",
         reply_markup=main_keyboard(),
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
 @router.message(F.text == BTN_QUESTION, F.chat.type == "private")
@@ -227,7 +228,7 @@ async def start_question(message: Message, state: FSMContext):
     if is_banned(message.from_user.id): return
     await state.clear()
     await state.set_state(Form.question_text)
-    await message.answer("❓ **Задайте ваш вопрос одним сообщением:**")
+    await message.answer("❓ <b>Задайте ваш вопрос одним сообщением:</b>", parse_mode="HTML")
 
 # ----------------------------------------------------------------------
 # СБОР ДАННЫХ В ФОРМАХ (FSM)
@@ -236,19 +237,19 @@ async def start_question(message: Message, state: FSMContext):
 async def process_c_reason(message: Message, state: FSMContext):
     await state.update_data(c_reason=message.text)
     await state.set_state(Form.complaint_nickname)
-    await message.answer("2️⃣ **Ник нарушителя:**\nУкажите основной ник (не display name).")
+    await message.answer("2️⃣ <b>Ник нарушителя:</b>\nУкажите основной ник (не display name).", parse_mode="HTML")
 
 @router.message(Form.complaint_nickname)
 async def process_c_nickname(message: Message, state: FSMContext):
     await state.update_data(c_nickname=message.text)
     await state.set_state(Form.complaint_photo)
-    await message.answer("3️⃣ **Доказательства (Фото/Скриншот):**\n⚠️ Фото НЕ ОБРЕЗАТЬ! Плашка уровней справа должна быть видна.")
+    await message.answer("3️⃣ <b>Доказательства (Фото/Скриншот):</b>\n⚠️ Фото НЕ ОБРЕЗАТЬ! Плашка уровней справа должна быть видна.", parse_mode="HTML")
 
 @router.message(Form.complaint_photo, F.photo)
 async def process_c_photo(message: Message, state: FSMContext):
     await state.update_data(c_photo=message.photo[-1].file_id)
     await state.set_state(Form.complaint_server)
-    await message.answer("4️⃣ **На каком сервере произошло нарушение?** (1, 2, 3 или 4):")
+    await message.answer("4️⃣ <b>На каком сервере произошло нарушение?</b> (1, 2, 3 или 4):", parse_mode="HTML")
 
 @router.message(Form.complaint_server)
 async def process_c_server(message: Message, state: FSMContext):
@@ -256,31 +257,35 @@ async def process_c_server(message: Message, state: FSMContext):
     ticket_id = create_ticket(message.from_user.id)
     user_mention = get_user_mention(message.from_user)
     
+    c_reason = html.escape(data.get('c_reason', ''))
+    c_nickname = html.escape(data.get('c_nickname', ''))
+    c_server = html.escape(message.text or '')
+
     admin_text = (
-        f"🚨 **#Жалоба | Заявка №{ticket_id}**\n"
-        f"👤 От: {user_mention} (ID: `{message.from_user.id}`)\n\n"
-        f"1️⃣ **Суть:** {data['c_reason']}\n"
-        f"2️⃣ **Ник нарушителя:** `{data['c_nickname']}`\n"
-        f"4️⃣ **Сервер:** {message.text}\n\n"
-        f"🔘 *Нажмите «Принять заявку», чтобы начать диалог.*"
+        f"🚨 <b>#Жалоба | Заявка №{ticket_id}</b>\n"
+        f"👤 От: {user_mention} (ID: <code>{message.from_user.id}</code>)\n\n"
+        f"1️⃣ <b>Суть:</b> {c_reason}\n"
+        f"2️⃣ <b>Ник нарушителя:</b> <code>{c_nickname}</code>\n"
+        f"4️⃣ <b>Сервер:</b> {c_server}\n\n"
+        f"🔘 <i>Нажмите «Принять заявку», чтобы начать диалог.</i>"
     )
     sent = await bot.send_photo(
         ADMIN_CHAT_ID, 
         photo=data['c_photo'], 
         caption=admin_text, 
         reply_markup=take_ticket_kb(ticket_id),
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
     map_message(sent.message_id, message.from_user.id, ticket_id)
     
-    await message.answer(f"✅ Ваша жалоба отправлена администрации! Номер заявки: **№{ticket_id}**.", parse_mode="Markdown")
+    await message.answer(f"✅ Ваша жалоба отправлена администрации! Номер заявки: <b>№{ticket_id}</b>.", parse_mode="HTML")
     await state.clear()
 
 @router.message(Form.appeal_nickname)
 async def process_a_nickname(message: Message, state: FSMContext):
     await state.update_data(a_nickname=message.text)
     await state.set_state(Form.appeal_reason)
-    await message.answer("2️⃣ **Почему вы считаете, что должны быть разблокированы?**")
+    await message.answer("2️⃣ <b>Почему вы считаете, что должны быть разблокированы?</b>", parse_mode="HTML")
 
 @router.message(Form.appeal_reason)
 async def process_a_reason(message: Message, state: FSMContext):
@@ -288,44 +293,48 @@ async def process_a_reason(message: Message, state: FSMContext):
     ticket_id = create_ticket(message.from_user.id)
     user_mention = get_user_mention(message.from_user)
     
+    a_nickname = html.escape(data.get('a_nickname', ''))
+    a_reason = html.escape(message.text or '')
+
     admin_text = (
-        f"😡 **#Обжалование | Заявка №{ticket_id}**\n"
-        f"👤 От: {user_mention} (ID: `{message.from_user.id}`)\n\n"
-        f"1️⃣ **Ник:** `{data['a_nickname']}`\n"
-        f"2️⃣ **Причина:** {message.text}\n\n"
-        f"🔘 *Нажмите «Принять заявку», чтобы начать диалог.*"
+        f"😡 <b>#Обжалование | Заявка №{ticket_id}</b>\n"
+        f"👤 От: {user_mention} (ID: <code>{message.from_user.id}</code>)\n\n"
+        f"1️⃣ <b>Ник:</b> <code>{a_nickname}</code>\n"
+        f"2️⃣ <b>Причина:</b> {a_reason}\n\n"
+        f"🔘 <i>Нажмите «Принять заявку», чтобы начать диалог.</i>"
     )
     sent = await bot.send_message(
         ADMIN_CHAT_ID, 
         admin_text, 
         reply_markup=take_ticket_kb(ticket_id),
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
     map_message(sent.message_id, message.from_user.id, ticket_id)
     
-    await message.answer(f"✅ Ваше обжалование отправлено на рассмотрение! Номер заявки: **№{ticket_id}**.", parse_mode="Markdown")
+    await message.answer(f"✅ Ваше обжалование отправлено на рассмотрение! Номер заявки: <b>№{ticket_id}</b>.", parse_mode="HTML")
     await state.clear()
 
 @router.message(Form.question_text)
 async def process_question(message: Message, state: FSMContext):
     ticket_id = create_ticket(message.from_user.id)
     user_mention = get_user_mention(message.from_user)
+    question = html.escape(message.text or '')
     
     admin_text = (
-        f"❓ **#Вопрос | Заявка №{ticket_id}**\n"
-        f"👤 От: {user_mention} (ID: `{message.from_user.id}`)\n\n"
-        f"**Вопрос:** {message.text}\n\n"
-        f"🔘 *Нажмите «Принять заявку», чтобы начать диалог.*"
+        f"❓ <b>#Вопрос | Заявка №{ticket_id}</b>\n"
+        f"👤 От: {user_mention} (ID: <code>{message.from_user.id}</code>)\n\n"
+        f"<b>Вопрос:</b> {question}\n\n"
+        f"🔘 <i>Нажмите «Принять заявку», чтобы начать диалог.</i>"
     )
     sent = await bot.send_message(
         ADMIN_CHAT_ID, 
         admin_text, 
         reply_markup=take_ticket_kb(ticket_id),
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
     map_message(sent.message_id, message.from_user.id, ticket_id)
     
-    await message.answer(f"✅ Ваш вопрос отправлен поддержке! Номер заявки: **№{ticket_id}**.", parse_mode="Markdown")
+    await message.answer(f"✅ Ваш вопрос отправлен поддержке! Номер заявки: <b>№{ticket_id}</b>.", parse_mode="HTML")
     await state.clear()
 
 # ----------------------------------------------------------------------
@@ -335,7 +344,6 @@ async def process_question(message: Message, state: FSMContext):
 async def take_ticket_handler(call: CallbackQuery):
     ticket_id = int(call.data.split("_")[1])
     admin_id = call.from_user.id
-    admin_name = call.from_user.full_name
 
     ticket_info = get_ticket_info(ticket_id)
     if ticket_info and ticket_info[1] is not None:
@@ -349,14 +357,14 @@ async def take_ticket_handler(call: CallbackQuery):
         try:
             await bot.send_message(
                 user_id, 
-                f"👨‍💻 Администратор **{admin_name}** принял вашу заявку **№{ticket_id}**!\n\n"
+                f"👨‍💻 Администратор <b>{html.escape(call.from_user.full_name)}</b> принял вашу заявку <b>№{ticket_id}</b>!\n\n"
                 f"Теперь вы можете писать сюда сообщения напрямую — они сразу отправятся администратору.",
-                parse_mode="Markdown"
+                parse_mode="HTML"
             )
         except Exception:
             pass
 
-    new_caption_or_text = (call.message.caption or call.message.text or "") + f"\n\n✅ **Взял в работу:** {call.from_user.mention_html()}"
+    new_caption_or_text = (call.message.caption or call.message.text or "") + f"\n\n✅ <b>Взял в работу:</b> {call.from_user.mention_html()}"
     
     if call.message.photo:
         await call.message.edit_caption(caption=new_caption_or_text, reply_markup=close_ticket_kb(ticket_id, admin_id), parse_mode="HTML")
@@ -383,14 +391,14 @@ async def close_ticket_handler(call: CallbackQuery):
         try:
             await bot.send_message(
                 user_id, 
-                f"🔒 Ваша заявка **№{ticket_id}** закрыта администратором. Спасибо за обращение!\n\n"
+                f"🔒 Ваша заявка <b>№{ticket_id}</b> закрыта администратором. Спасибо за обращение!\n\n"
                 f"Если у вас возникнут новые вопросы, воспользуйтесь меню на клавиатуре ниже.",
-                parse_mode="Markdown"
+                parse_mode="HTML"
             )
         except Exception:
             pass
 
-    status_text = f"\n\n🔒 **Заявка №{ticket_id} закрыта** администратором {call.from_user.mention_html()}."
+    status_text = f"\n\n🔒 <b>Заявка №{ticket_id} закрыта</b> администратором {call.from_user.mention_html()}."
     
     if call.message.photo:
         await call.message.edit_caption(caption=(call.message.caption or "") + status_text, parse_mode="HTML")
@@ -415,21 +423,22 @@ async def user_private_message(message: Message, state: FSMContext):
     
     if active_ticket:
         user_mention = get_user_mention(message.from_user)
-        text_to_group = f"📩 **Сообщение по заявке №{active_ticket[0]} от {user_mention}:**\n\n{message.text or ''}"
+        user_text = html.escape(message.text or '')
+        text_to_group = f"📩 <b>Сообщение по заявке №{active_ticket[0]} от {user_mention}:</b>\n\n{user_text}"
         
         if message.photo:
-            sent = await bot.send_photo(ADMIN_CHAT_ID, photo=message.photo[-1].file_id, caption=text_to_group, parse_mode="Markdown")
+            sent = await bot.send_photo(ADMIN_CHAT_ID, photo=message.photo[-1].file_id, caption=text_to_group, parse_mode="HTML")
         else:
-            sent = await bot.send_message(ADMIN_CHAT_ID, text_to_group, parse_mode="Markdown")
+            sent = await bot.send_message(ADMIN_CHAT_ID, text_to_group, parse_mode="HTML")
         
         map_message(sent.message_id, message.from_user.id, active_ticket[0])
         return
 
     await message.answer(
-        "⚠️ **Общение не через формы запрещено.**\n"
+        "⚠️ <b>Общение не через формы запрещено.</b>\n"
         "Чтобы отправить заявку или задать вопрос, выберите раздел на клавиатуре ниже 👇",
         reply_markup=main_keyboard(),
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
 # ----------------------------------------------------------------------
@@ -452,7 +461,7 @@ async def admin_reply_in_group(message: Message):
     if ticket_info:
         assigned_admin = ticket_info[1]
         if assigned_admin is None:
-            await message.reply("⚠️ **Сначала нажмите кнопку «Принять заявку»**, чтобы отвечать на неё!")
+            await message.reply("⚠️ <b>Сначала нажмите кнопку «Принять заявку»</b>, чтобы отвечать на неё!", parse_mode="HTML")
             return
         elif assigned_admin != admin_id:
             await message.reply("❌ Эту заявку обрабатывает другой администратор! Вы не можете отправлять ответы в этот тикет.")
@@ -460,16 +469,18 @@ async def admin_reply_in_group(message: Message):
 
     try:
         if message.photo:
-            await bot.send_photo(user_id, photo=message.photo[-1].file_id, caption=f"👨‍💻 **Ответ поддержки (по заявке №{ticket_id}):**\n\n{message.caption or ''}", parse_mode="Markdown")
+            caption = html.escape(message.caption or '')
+            await bot.send_photo(user_id, photo=message.photo[-1].file_id, caption=f"👨‍💻 <b>Ответ поддержки (по заявке №{ticket_id}):</b>\n\n{caption}", parse_mode="HTML")
         else:
-            await bot.send_message(user_id, f"👨‍💻 **Ответ поддержки (по заявке №{ticket_id}):**\n\n{message.text}", parse_mode="Markdown")
+            text = html.escape(message.text or '')
+            await bot.send_message(user_id, f"👨‍💻 <b>Ответ поддержки (по заявке №{ticket_id}):</b>\n\n{text}", parse_mode="HTML")
         
         await message.reply(
             f"✅ Ответ по заявке №{ticket_id} отправлен!", 
             reply_markup=close_ticket_kb(ticket_id, admin_id)
         )
     except Exception as e:
-        await message.reply(f"❌ Не удалось отправить сообщение пользователю.\nОшибка: `{e}`", parse_mode="Markdown")
+        await message.reply(f"❌ Не удалось отправить сообщение пользователю.\nОшибка: <code>{html.escape(str(e))}</code>", parse_mode="HTML")
 
 # ----------------------------------------------------------------------
 # УНИВЕРСАЛЬНЫЕ КОМАНДЫ БАНА / РАЗБАНА В ГРУППЕ
@@ -494,19 +505,19 @@ async def ban_command(message: Message):
 
     if not target_user_id:
         await message.reply(
-            "⚠️ **Не удалось заблокировать.**\n\n"
+            "⚠️ <b>Не удалось заблокировать.</b>\n\n"
             "Используйте одним из способов:\n"
-            "1️⃣ Ответьте на сообщение заявки командой: `/ban Причина`\n"
-            "2️⃣ Напишите команду с ID: `/ban 123456789 Причина`",
-            parse_mode="Markdown"
+            "1️⃣ Ответьте на сообщение заявки командой: <code>/ban Причина</code>\n"
+            "2️⃣ Напишите команду с ID: <code>/ban 123456789 Причина</code>",
+            parse_mode="HTML"
         )
         return
 
     ban_user_db(target_user_id, reason)
-    await message.reply(f"🚫 Пользователь `{target_user_id}` заблокирован в системе поддержки.\n**Причина:** {reason}", parse_mode="Markdown")
+    await message.reply(f"🚫 Пользователь <code>{target_user_id}</code> заблокирован в системе поддержки.\n<b>Причина:</b> {html.escape(reason)}", parse_mode="HTML")
     
     try:
-        await bot.send_message(target_user_id, f"❌ Вы заблокированы в поддержке.\n**Причина:** {reason}")
+        await bot.send_message(target_user_id, f"❌ Вы заблокированы в поддержке.\n<b>Причина:</b> {html.escape(reason)}", parse_mode="HTML")
     except Exception:
         pass
 
@@ -523,11 +534,11 @@ async def unban_command(message: Message):
             target_user_id = targetdata[0]
 
     if not target_user_id:
-        await message.reply("⚠️ Укажите ID пользователя (`/unban 1234567`) или ответьте на его сообщение этой командой.")
+        await message.reply("⚠️ Укажите ID пользователя (<code>/unban 1234567</code>) или ответьте на его сообщение этой командой.", parse_mode="HTML")
         return
 
     unban_user_db(target_user_id)
-    await message.reply(f"✅ Пользователь `{target_user_id}` разблокирован!")
+    await message.reply(f"✅ Пользователь <code>{target_user_id}</code> разблокирован!", parse_mode="HTML")
     try:
         await bot.send_message(target_user_id, "✅ Ваш доступ к поддержке восстановлен!")
     except Exception:
@@ -563,3 +574,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+    
