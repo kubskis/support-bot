@@ -294,10 +294,10 @@ async def process_c_server(message: Message, state: FSMContext):
     c_nickname = html.escape(data.get('c_nickname', ''))
     c_server = html.escape(message.text or '')
 
-    # Моноширинный ID с возможностью быстрого копирования
+    # Чистый <code> тег строго вокруг цифр для кликабельного копирования
     admin_text = (
         f"🚨 <b>#Жалоба | Заявка №{ticket_id}</b>\n"
-        f"👤 От: {user_mention} (ID: <code>{message.from_user.id}</code>)\n\n"
+        f"👤 От: {user_mention} | ID: <code>{message.from_user.id}</code>\n\n"
         f"1️⃣ <b>Суть:</b> {c_reason}\n"
         f"2️⃣ <b>Ник нарушителя:</b> <code>{c_nickname}</code>\n"
         f"4️⃣ <b>Сервер:</b> {c_server}\n\n"
@@ -332,7 +332,7 @@ async def process_a_reason(message: Message, state: FSMContext):
 
     admin_text = (
         f"😡 <b>#Обжалование | Заявка №{ticket_id}</b>\n"
-        f"👤 От: {user_mention} (ID: <code>{message.from_user.id}</code>)\n\n"
+        f"👤 От: {user_mention} | ID: <code>{message.from_user.id}</code>\n\n"
         f"1️⃣ <b>Ник:</b> <code>{a_nickname}</code>\n"
         f"2️⃣ <b>Причина:</b> {a_reason}\n\n"
         f"🔘 <i>Нажмите «Принять заявку», чтобы начать диалог.</i>"
@@ -356,7 +356,7 @@ async def process_question(message: Message, state: FSMContext):
     
     admin_text = (
         f"❓ <b>#Вопрос | Заявка №{ticket_id}</b>\n"
-        f"👤 От: {user_mention} (ID: <code>{message.from_user.id}</code>)\n\n"
+        f"👤 От: {user_mention} | ID: <code>{message.from_user.id}</code>\n\n"
         f"<b>Вопрос:</b> {question}\n\n"
         f"🔘 <i>Нажмите «Принять заявку», чтобы начать диалог.</i>"
     )
@@ -459,8 +459,7 @@ async def user_private_message(message: Message, state: FSMContext):
     if active_ticket:
         user_mention = get_user_mention(message.from_user)
         user_text = html.escape(message.text or '')
-        # Моноширинный ID в сообщениях
-        text_to_group = f"📩 <b>Сообщение по заявке №{active_ticket[0]} от {user_mention} (ID: <code>{message.from_user.id}</code>):</b>\n\n{user_text}"
+        text_to_group = f"📩 <b>Сообщение по заявке №{active_ticket[0]} от {user_mention} | ID: <code>{message.from_user.id}</code>:</b>\n\n{user_text}"
         
         if message.photo:
             sent = await bot.send_photo(ADMIN_CHAT_ID, photo=message.photo[-1].file_id, caption=text_to_group, parse_mode="HTML")
@@ -487,7 +486,6 @@ async def admin_reply_in_group(message: Message):
 
     targetdata = get_user_by_group_msg(message.reply_to_message.message_id)
     
-    # Если в базе нет связки, пробуем спарсить ID из текста оригинального сообщения
     user_id, ticket_id = None, None
     if targetdata:
         user_id, ticket_id = targetdata[0], targetdata[1]
@@ -594,34 +592,46 @@ async def ban_command(message: Message):
     args = message.text.split(maxsplit=2)
     reason = "Нарушение правил / спам"
 
-    # 1. Если команда отправлена в ответ на сообщение (Reply)
-    if message.reply_to_message:
-        # Пробуем найти ID через базу
-        targetdata = get_user_by_group_msg(message.reply_to_message.message_id)
-        if targetdata:
-            target_user_id = targetdata[0]
-        else:
-            # Иначе ищем ID регулярой прямо в тексте карточки заявки
-            orig_text = message.reply_to_message.text or message.reply_to_message.caption or ""
-            match = re.search(r"ID:\s*(\d+)", orig_text)
-            if match:
-                target_user_id = int(match.group(1))
-
-        if len(args) > 1:
-            reason = " ".join(args[1:])
-
-    # 2. Если команда отправлена напрямую с ID: /ban 123456789 причина
-    if not target_user_id and len(args) > 1 and args[1].isdigit():
+    # 1. Если команда отправлена с упреждением /ban 123456789 причина
+    if len(args) > 1 and args[1].isdigit():
         target_user_id = int(args[1])
         if len(args) > 2:
             reason = args[2]
 
+    # 2. Если команда отправлена через Reply на любое сообщение
+    elif message.reply_to_message:
+        # Проверка по базе сообщений
+        targetdata = get_user_by_group_msg(message.reply_to_message.message_id)
+        if targetdata:
+            target_user_id = targetdata[0]
+        else:
+            # Извлечение ID напрямую из текста или упоминаний (tg://user?id=...)
+            orig_msg = message.reply_to_message
+            orig_text = orig_msg.text or orig_msg.caption or ""
+            
+            # Поиск через сущности Telegram
+            if orig_msg.entities or orig_msg.caption_entities:
+                entities = orig_msg.entities or orig_msg.caption_entities
+                for entity in entities:
+                    if entity.type == "text_link" and entity.url and "tg://user?id=" in entity.url:
+                        target_user_id = int(entity.url.split("id=")[1])
+                        break
+            
+            # Поиск регулярным выражением (поиск любых 8–11 значных чисел после ID)
+            if not target_user_id:
+                match = re.search(r"ID:?\s*(\d{8,11})", orig_text, re.IGNORECASE)
+                if match:
+                    target_user_id = int(match.group(1))
+
+        if len(args) > 1:
+            reason = " ".join(args[1:])
+
     if not target_user_id:
         await message.reply(
-            "⚠️ <b>Не удалось определить пользователя.</b>\n\n"
-            "Используйте одним из способов:\n"
-            "1️⃣ Ответьте на карточку заявки/сообщение командой: <code>/ban Причина</code>\n"
-            "2️⃣ Напишите с указанием ID: <code>/ban 123456789 Причина</code>",
+            "⚠️ <b>Не удалось определить ID пользователя.</b>\n\n"
+            "Вы можете:\n"
+            "1️⃣ Нажать на моноширинный ID в карточке заявки (он скопируется), после чего написать: <code>/ban 123456789 Причина</code>\n"
+            "2️⃣ Или ответить командой <code>/ban Причина</code> прямо на сообщение заявки.",
             parse_mode="HTML"
         )
         return
@@ -646,8 +656,9 @@ async def unban_command(message: Message):
         if targetdata:
             target_user_id = targetdata[0]
         else:
-            orig_text = message.reply_to_message.text or message.reply_to_message.caption or ""
-            match = re.search(r"ID:\s*(\d+)", orig_text)
+            orig_msg = message.reply_to_message
+            orig_text = orig_msg.text or orig_msg.caption or ""
+            match = re.search(r"ID:?\s*(\d{8,11})", orig_text, re.IGNORECASE)
             if match:
                 target_user_id = int(match.group(1))
 
