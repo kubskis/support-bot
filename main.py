@@ -3,6 +3,7 @@ import logging
 import os
 import sqlite3
 import html
+import re
 from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -16,7 +17,7 @@ from aiogram.types import (
 )
 
 # ----------------------------------------------------------------------
-# НАСТРОЙКИ (Токен берётся из Environment Variables)
+# НАСТРОЙКИ
 # ----------------------------------------------------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_CHAT_ID = -1003945292994  # ID группы поддержки
@@ -293,6 +294,7 @@ async def process_c_server(message: Message, state: FSMContext):
     c_nickname = html.escape(data.get('c_nickname', ''))
     c_server = html.escape(message.text or '')
 
+    # Моноширинный ID с возможностью быстрого копирования
     admin_text = (
         f"🚨 <b>#Жалоба | Заявка №{ticket_id}</b>\n"
         f"👤 От: {user_mention} (ID: <code>{message.from_user.id}</code>)\n\n"
@@ -457,7 +459,8 @@ async def user_private_message(message: Message, state: FSMContext):
     if active_ticket:
         user_mention = get_user_mention(message.from_user)
         user_text = html.escape(message.text or '')
-        text_to_group = f"📩 <b>Сообщение по заявке №{active_ticket[0]} от {user_mention}:</b>\n\n{user_text}"
+        # Моноширинный ID в сообщениях
+        text_to_group = f"📩 <b>Сообщение по заявке №{active_ticket[0]} от {user_mention} (ID: <code>{message.from_user.id}</code>):</b>\n\n{user_text}"
         
         if message.photo:
             sent = await bot.send_photo(ADMIN_CHAT_ID, photo=message.photo[-1].file_id, caption=text_to_group, parse_mode="HTML")
@@ -483,40 +486,50 @@ async def admin_reply_in_group(message: Message):
         return
 
     targetdata = get_user_by_group_msg(message.reply_to_message.message_id)
-    if not targetdata:
+    
+    # Если в базе нет связки, пробуем спарсить ID из текста оригинального сообщения
+    user_id, ticket_id = None, None
+    if targetdata:
+        user_id, ticket_id = targetdata[0], targetdata[1]
+    else:
+        orig_text = message.reply_to_message.text or message.reply_to_message.caption or ""
+        match_id = re.search(r"ID:\s*(\d+)", orig_text)
+        match_ticket = re.search(r"Заявка\s*№(\d+)", orig_text)
+        if match_id: user_id = int(match_id.group(1))
+        if match_ticket: ticket_id = int(match_ticket.group(1))
+
+    if not user_id:
         return
 
-    user_id, ticket_id = targetdata[0], targetdata[1]
     admin_id = message.from_user.id
-
-    ticket_info = get_ticket_info(ticket_id)
-    
-    if ticket_info:
-        assigned_admin = ticket_info[1]
-        if assigned_admin is None:
-            await message.reply("⚠️ <b>Сначала нажмите кнопку «Принять заявку»</b>, чтобы отвечать на неё!", parse_mode="HTML")
-            return
-        elif assigned_admin != admin_id:
-            await message.reply("❌ Эту заявку обрабатывает другой администратор! Вы не можете отправлять ответы в этот тикет.")
-            return
+    if ticket_id:
+        ticket_info = get_ticket_info(ticket_id)
+        if ticket_info:
+            assigned_admin = ticket_info[1]
+            if assigned_admin is None:
+                await message.reply("⚠️ <b>Сначала нажмите кнопку «Принять заявку»</b>, чтобы отвечать на неё!", parse_mode="HTML")
+                return
+            elif assigned_admin != admin_id:
+                await message.reply("❌ Эту заявку обрабатывает другой администратор! Вы не можете отправлять ответы в этот тикет.")
+                return
 
     try:
         if message.photo:
             caption = html.escape(message.caption or '')
-            await bot.send_photo(user_id, photo=message.photo[-1].file_id, caption=f"👨‍💻 <b>Ответ поддержки (по заявке №{ticket_id}):</b>\n\n{caption}", parse_mode="HTML")
+            await bot.send_photo(user_id, photo=message.photo[-1].file_id, caption=f"👨‍💻 <b>Ответ поддержки:</b>\n\n{caption}", parse_mode="HTML")
         else:
             text = html.escape(message.text or '')
-            await bot.send_message(user_id, f"👨‍💻 <b>Ответ поддержки (по заявке №{ticket_id}):</b>\n\n{text}", parse_mode="HTML")
+            await bot.send_message(user_id, f"👨‍💻 <b>Ответ поддержки:</b>\n\n{text}", parse_mode="HTML")
         
         await message.reply(
-            f"✅ Ответ по заявке №{ticket_id} отправлен!", 
-            reply_markup=close_ticket_kb(ticket_id, admin_id)
+            f"✅ Ответ отправлен пользователю <code>{user_id}</code>!", 
+            reply_markup=close_ticket_kb(ticket_id, admin_id) if ticket_id else None
         )
     except Exception as e:
         await message.reply(f"❌ Не удалось отправить сообщение пользователю.\nОшибка: <code>{html.escape(str(e))}</code>", parse_mode="HTML")
 
 # ----------------------------------------------------------------------
-# КОМАНДА РАССЫЛКИ /news <текст> (СТРОГО ТОЛЬКО В АДМИН-ГРУППЕ)
+# КОМАНДА РАССЫЛКИ /news <текст>
 # ----------------------------------------------------------------------
 @router.message(Command("news"), F.chat.id == ADMIN_CHAT_ID)
 async def news_broadcast_command(message: Message):
@@ -568,12 +581,12 @@ async def news_broadcast_command(message: Message):
         f"✅ <b>Рассылка завершена!</b>\n\n"
         f"📊 <b>Результаты:</b>\n"
         f"• Доставлено: <b>{success_count}</b>\n"
-        f"• Не доставлено (заблокировали бота): <b>{failed_count}</b>",
+        f"• Не доставлено: <b>{failed_count}</b>",
         parse_mode="HTML"
     )
 
 # ----------------------------------------------------------------------
-# УНИВЕРСАЛЬНЫЕ КОМАНДЫ БАНА / РАЗБАНА В ГРУППЕ (СТРОГО ТОЛЬКО В АДМИН-ГРУППЕ)
+# УНИВЕРСАЛЬНЫЕ КОМАНДЫ БАНА / РАЗБАНА В ГРУППЕ
 # ----------------------------------------------------------------------
 @router.message(Command("ban"), F.chat.id == ADMIN_CHAT_ID)
 async def ban_command(message: Message):
@@ -581,13 +594,23 @@ async def ban_command(message: Message):
     args = message.text.split(maxsplit=2)
     reason = "Нарушение правил / спам"
 
+    # 1. Если команда отправлена в ответ на сообщение (Reply)
     if message.reply_to_message:
+        # Пробуем найти ID через базу
         targetdata = get_user_by_group_msg(message.reply_to_message.message_id)
         if targetdata:
             target_user_id = targetdata[0]
-            if len(args) > 1:
-                reason = " ".join(args[1:])
+        else:
+            # Иначе ищем ID регулярой прямо в тексте карточки заявки
+            orig_text = message.reply_to_message.text or message.reply_to_message.caption or ""
+            match = re.search(r"ID:\s*(\d+)", orig_text)
+            if match:
+                target_user_id = int(match.group(1))
 
+        if len(args) > 1:
+            reason = " ".join(args[1:])
+
+    # 2. Если команда отправлена напрямую с ID: /ban 123456789 причина
     if not target_user_id and len(args) > 1 and args[1].isdigit():
         target_user_id = int(args[1])
         if len(args) > 2:
@@ -595,10 +618,10 @@ async def ban_command(message: Message):
 
     if not target_user_id:
         await message.reply(
-            "⚠️ <b>Не удалось заблокировать.</b>\n\n"
+            "⚠️ <b>Не удалось определить пользователя.</b>\n\n"
             "Используйте одним из способов:\n"
-            "1️⃣ Ответьте на сообщение заявки командой: <code>/ban Причина</code>\n"
-            "2️⃣ Напишите команду с ID: <code>/ban 123456789 Причина</code>",
+            "1️⃣ Ответьте на карточку заявки/сообщение командой: <code>/ban Причина</code>\n"
+            "2️⃣ Напишите с указанием ID: <code>/ban 123456789 Причина</code>",
             parse_mode="HTML"
         )
         return
@@ -622,6 +645,11 @@ async def unban_command(message: Message):
         targetdata = get_user_by_group_msg(message.reply_to_message.message_id)
         if targetdata:
             target_user_id = targetdata[0]
+        else:
+            orig_text = message.reply_to_message.text or message.reply_to_message.caption or ""
+            match = re.search(r"ID:\s*(\d+)", orig_text)
+            if match:
+                target_user_id = int(match.group(1))
 
     if not target_user_id:
         await message.reply("⚠️ Укажите ID пользователя (<code>/unban 1234567</code>) или ответьте на его сообщение этой командой.", parse_mode="HTML")
