@@ -416,14 +416,14 @@ async def reject_ticket_handler(call: CallbackQuery):
         await call.answer("❌ Эта заявка уже обработана или закрыта!", show_alert=True)
         return
 
-    # Отправляем сообщение администратору с просьбой ввести причину
+    # Отправляем сообщение администратору с проработанной формулировкой
     prompt_msg = await bot.send_message(
         ADMIN_CHAT_ID,
-        f"❓ <b>Напишите причину отказа для заявки №{ticket_id}:</b>\n<i>(Ответьте/Reply на это сообщение текстом причины)</i>",
+        f"❓ <b>Напишите причину отказа для заявки №{ticket_id}:</b>\n<i>(Ответьте/Reply на само сообщение заявки выше или на это сообщение)</i>",
         reply_markup=ForceReply(selective=True),
         parse_mode="HTML"
     )
-    # Привязываем это сообщение под ид отклоняемой заявки
+    # Привязываем ID сообщения запроса к той же заявке
     map_message(prompt_msg.message_id, ticket_info[0], ticket_id)
     await call.answer("Напишите причину отказа в чате!")
 
@@ -506,8 +506,8 @@ async def admin_reply_in_group(message: Message):
 
     reply_text = message.reply_to_message.text or message.reply_to_message.caption or ""
 
-    # Проверка: Ответ на запрос причины отказа
-    if "Напишите причину отказа для заявки №" in reply_text:
+    # Проверка: Ответ на запрос причины отказа или на карточку заявки
+    if "Напишите причину отказа для заявки №" in reply_text or "Заявка №" in reply_text:
         match_ticket = re.search(r"№(\d+)", reply_text)
         if match_ticket:
             ticket_id = int(match_ticket.group(1))
@@ -517,6 +517,34 @@ async def admin_reply_in_group(message: Message):
                 reject_reason = html.escape(message.text or "Без указания причины")
                 close_ticket_db(ticket_id, status='rejected')
                 
+                # Изменяем исходное сообщение заявки: убираем кнопки и пишем причину отказа
+                try:
+                    orig_msg = message.reply_to_message
+                    reject_status_text = (
+                        f"\n\n❌ <b>Заявка отклонена!</b>"
+                        f"\n👤 <b>Модератор:</b> {message.from_user.mention_html()}"
+                        f"\n💬 <b>Причина:</b> {reject_reason}"
+                    )
+                    
+                    if orig_msg.photo:
+                        await bot.edit_message_caption(
+                            chat_id=ADMIN_CHAT_ID,
+                            message_id=orig_msg.message_id,
+                            caption=(orig_msg.caption or "") + reject_status_text,
+                            reply_markup=None, # Полное удаление кнопок
+                            parse_mode="HTML"
+                        )
+                    else:
+                        await bot.edit_message_text(
+                            chat_id=ADMIN_CHAT_ID,
+                            message_id=orig_msg.message_id,
+                            text=(orig_msg.text or "") + reject_status_text,
+                            reply_markup=None, # Полное удаление кнопок
+                            parse_mode="HTML"
+                        )
+                except Exception as e:
+                    logging.warning(f"Не удалось отредактировать сообщение заявки: {e}")
+
                 try:
                     await bot.send_message(
                         user_id,
@@ -746,4 +774,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-            
+                        
