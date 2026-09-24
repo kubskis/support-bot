@@ -18,8 +18,8 @@ from aiogram.types import (
 # ----------------------------------------------------------------------
 # НАСТРОЙКИ
 # ----------------------------------------------------------------------
-BOT_TOKEN = "8969042562:AAGH7ck7qqNN_75ohEDTARYcCtEMgd-cp8A"
-ADMIN_CHAT_ID = -1002364893721  # ID вашей группы поддержки
+BOT_TOKEN = "8969042562:AAHPFajWmZ0gxdR4uOXJWvRRvzdC_Kw1J_0"
+ADMIN_CHAT_ID = -1003945292994  # Обновленный ID группы поддержки
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
@@ -574,4 +574,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
+                                     
