@@ -309,7 +309,7 @@ async def callback_ban_user(callback: types.CallbackQuery):
     await callback.answer(f"Пользователь {user_id} забанен.", show_alert=True)
 
 # --- Команды админов (Разбан/Бан) ---
-@dp.command(Command("unban"))
+@dp.message(Command("unban"))
 async def cmd_unban(message: types.Message):
     if message.chat.id != ADMIN_CHAT_ID:
         return
