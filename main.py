@@ -287,7 +287,7 @@ async def start_cmd(message: Message, state: FSMContext):
     await state.clear()
     welcome_text = (
         "🤍 <b>Добро пожаловать в поддержку Tower Of Hell Secrets (@ToHSecretss)!</b> 🤍\n\n"
-        "🤍 Нажмите на нужную кнопку на клавиатуре ниже, чтобы отправить заявку или задать вопрос.🤍"
+        "Нажмите на нужную кнопку на клавиатуре ниже, чтобы отправить заявку или задать вопрос."
     )
     await message.answer(welcome_text, reply_markup=main_keyboard(), parse_mode="HTML")
 
