@@ -47,54 +47,65 @@ def get_db_connection():
     return psycopg2.connect(DATABASE_URL, sslmode="require")
 
 def init_db():
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id BIGINT PRIMARY KEY
-        );
-        CREATE TABLE IF NOT EXISTS tickets (
-            ticket_id SERIAL PRIMARY KEY,
-            user_id BIGINT,
-            admin_id BIGINT DEFAULT NULL,
-            status TEXT DEFAULT 'pending'
-        );
-        CREATE TABLE IF NOT EXISTS message_map (
-            group_message_id BIGINT PRIMARY KEY,
-            user_id BIGINT,
-            ticket_id INTEGER
-        );
-        CREATE TABLE IF NOT EXISTS banned_users (
-            user_id BIGINT PRIMARY KEY,
-            reason TEXT
-        );
-        CREATE TABLE IF NOT EXISTS pending_rejections (
-            prompt_message_id BIGINT PRIMARY KEY,
-            ticket_id INTEGER
-        );
-    """)
-    conn.commit()
-    cursor.close()
-    conn.close()
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY
+            );
+            CREATE TABLE IF NOT EXISTS tickets (
+                ticket_id SERIAL PRIMARY KEY,
+                user_id BIGINT,
+                admin_id BIGINT DEFAULT NULL,
+                status TEXT DEFAULT 'pending'
+            );
+            CREATE TABLE IF NOT EXISTS message_map (
+                group_message_id BIGINT PRIMARY KEY,
+                user_id BIGINT,
+                ticket_id INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS banned_users (
+                user_id BIGINT PRIMARY KEY,
+                reason TEXT
+            );
+            CREATE TABLE IF NOT EXISTS pending_rejections (
+                prompt_message_id BIGINT PRIMARY KEY,
+                ticket_id INTEGER
+            );
+        """)
+        conn.commit()
+        cursor.close()
+        conn.close()
+        print("База данных успешно инициализирована.")
+    except Exception as e:
+        print(f"Внимание: ошибка при инициализации БД (продолжаем работу): {e}")
 
+# Вызываем инициализацию
 init_db()
 
 def register_user(user_id):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("INSERT INTO users (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING", (user_id,))
-    conn.commit()
-    cursor.close()
-    conn.close()
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO users (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING", (user_id,))
+        conn.commit()
+        cursor.close()
+        conn.close()
+    except Exception as e:
+        print(f"Ошибка регистрации пользователя: {e}")
 
 def get_all_users():
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_id FROM users")
-    rows = cursor.fetchall()
-    cursor.close()
-    conn.close()
-    return [row[0] for row in rows]
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id FROM users")
+        rows = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        return [row[0] for row in rows]
+    except Exception:
+        return []
 
 def create_ticket(user_id):
     conn = get_db_connection()
@@ -162,13 +173,16 @@ def close_ticket_db(ticket_id, status='closed'):
     conn.close()
 
 def is_banned(user_id):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT reason FROM banned_users WHERE user_id = %s", (user_id,))
-    row = cursor.fetchone()
-    cursor.close()
-    conn.close()
-    return row
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT reason FROM banned_users WHERE user_id = %s", (user_id,))
+        row = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        return row
+    except Exception:
+        return None
 
 def ban_user_db(user_id, reason):
     conn = get_db_connection()
@@ -786,7 +800,7 @@ async def start_web_server():
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    print(f"HTTP-сервер слушает порт {port}.")
+    print(f"HTTP-сервер успешно запущен и слушает порт {port}.")
 
 # ----------------------------------------------------------------------
 # ЗАПУСК БОТА
@@ -799,4 +813,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
+                
