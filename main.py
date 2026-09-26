@@ -20,7 +20,7 @@ from aiogram.types import (
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 ADMIN_CHAT_ID = -1003945292994  # ID группы поддержки
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # Твой личный Telegram ID (Главный админ)
+OWNER_ID = int(os.getenv("ADMIN_ID", "0"))  # Главный создатель бота (из переменных окружения)
 
 if not BOT_TOKEN:
     raise ValueError("ОШИБКА: Токен бота не найден! Укажите BOT_TOKEN в Environment Variables.")
@@ -36,17 +36,6 @@ dp.include_router(router)
 def get_user_mention(user):
     safe_name = html.escape(user.full_name)
     return f'<a href="tg://user?id={user.id}">{safe_name}</a>'
-
-async def is_support_member(user_id: int) -> bool:
-    if ADMIN_ID and user_id == ADMIN_ID:
-        return True
-    try:
-        member = await bot.get_chat_member(chat_id=ADMIN_CHAT_ID, user_id=user_id)
-        if member.status in ["creator", "administrator", "member"]:
-            return True
-    except Exception:
-        pass
-    return False
 
 # ----------------------------------------------------------------------
 # БАЗА ДАННЫХ (Supabase / PostgreSQL)
@@ -93,11 +82,20 @@ def init_db():
                 score INTEGER,
                 review TEXT
             );
+            CREATE TABLE IF NOT EXISTS main_admins (
+                admin_id BIGINT PRIMARY KEY
+            );
         """)
         cursor.execute("""
             ALTER TABLE tickets ADD COLUMN IF NOT EXISTS category TEXT DEFAULT 'general';
         """)
         conn.commit()
+        
+        # Добавляем владельца в главные админы по умолчанию, если таблица пуста
+        if OWNER_ID:
+            cursor.execute("INSERT INTO main_admins (admin_id) VALUES (%s) ON CONFLICT (admin_id) DO NOTHING", (OWNER_ID,))
+            conn.commit()
+
         cursor.close()
         conn.close()
         print("База данных успешно инициализирована.")
@@ -105,6 +103,31 @@ def init_db():
         print(f"Внимание: ошибка при инициализации БД: {e}")
 
 init_db()
+
+def is_main_admin(user_id: int) -> bool:
+    if OWNER_ID and user_id == OWNER_ID:
+        return True
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT admin_id FROM main_admins WHERE admin_id = %s", (user_id,))
+        row = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        return row is not None
+    except Exception:
+        return False
+
+async def is_support_member(user_id: int) -> bool:
+    if is_main_admin(user_id):
+        return True
+    try:
+        member = await bot.get_chat_member(chat_id=ADMIN_CHAT_ID, user_id=user_id)
+        if member.status in ["creator", "administrator", "member"]:
+            return True
+    except Exception:
+        pass
+    return False
 
 def get_setting(key, default="false"):
     try:
@@ -166,7 +189,7 @@ def get_tickets_stats():
         cursor.execute("SELECT COUNT(*) FROM tickets WHERE status = 'rejected'")
         rejected = cursor.fetchone()[0]
         
-        cursor.execute("SELECT COALESCE(AVG(score), 0) FROM ratings WHERE user_id != %s", (ADMIN_ID,))
+        cursor.execute("SELECT COALESCE(AVG(score), 0) FROM ratings WHERE user_id != %s", (OWNER_ID,))
         avg_rating = cursor.fetchone()[0]
         
         cursor.close()
@@ -174,6 +197,24 @@ def get_tickets_stats():
         return total, closed, rejected, round(float(avg_rating), 2)
     except Exception:
         return 0, 0, 0, 0.0
+
+def get_admin_list_stats():
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT admin_id, COUNT(*) as closed_count, COALESCE(AVG(score), 0) as avg_score
+            FROM tickets t
+            LEFT JOIN ratings r ON t.ticket_id = r.ticket_id
+            WHERE t.admin_id IS NOT NULL AND t.status = 'closed'
+            GROUP BY t.admin_id
+        """)
+        rows = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        return rows
+    except Exception:
+        return []
 
 def create_ticket(user_id, category='general'):
     conn = get_db_connection()
@@ -318,10 +359,15 @@ class Form(StatesGroup):
     question_text = State()
     set_friend_nick = State()
     
-    # Состояния для набора в хелперы
+    # Набор в хелперы
     helper_age = State()
     helper_timezone = State()
     helper_experience = State()
+
+    # Набор в искатели секреток
+    secret_age = State()
+    secret_experience = State()
+    secret_activity = State()
 
 # ----------------------------------------------------------------------
 # КЛАВИАТУРЫ
@@ -331,6 +377,7 @@ BTN_APPEAL = "😡 Обжалование бана"
 BTN_FRIENDS = "👯‍♀️ Добавление в друзья (VIP)"
 BTN_QUESTION = "❓ Задать вопрос"
 BTN_HELPER_APPLY = "📝 Подать заявку на хелпера"
+BTN_SECRET_APPLY = "🔍 Набор в искатели секреток"
 BTN_ADMIN_PANEL = "⚙️ Админ-панель"
 BTN_REFRESH = "🔄 Перезагрузить меню"
 
@@ -338,10 +385,10 @@ def main_keyboard(user_id):
     keyboard = [
         [KeyboardButton(text=BTN_COMPLAINT), KeyboardButton(text=BTN_APPEAL)],
         [KeyboardButton(text=BTN_FRIENDS), KeyboardButton(text=BTN_QUESTION)],
-        [KeyboardButton(text=BTN_HELPER_APPLY)],
+        [KeyboardButton(text=BTN_HELPER_APPLY), KeyboardButton(text=BTN_SECRET_APPLY)],
         [KeyboardButton(text=BTN_REFRESH)]
     ]
-    if ADMIN_ID and user_id == ADMIN_ID:
+    if is_main_admin(user_id):
         keyboard.append([KeyboardButton(text=BTN_ADMIN_PANEL)])
 
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True, persistent=True)
@@ -349,10 +396,14 @@ def main_keyboard(user_id):
 def admin_panel_kb():
     friend_status = "🟢 Вкл" if get_setting("friend_active", "false") == "true" else "🔴 Выкл"
     helper_status = "🟢 Вкл" if get_setting("helper_recruitment", "true") == "true" else "🔴 Выкл"
+    secret_status = "🟢 Вкл" if get_setting("secret_recruitment", "true") == "true" else "🔴 Выкл"
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📊 Статистика", callback_data="adm_stats")],
+        [InlineKeyboardButton(text="📊 Общая статистика", callback_data="adm_stats"),
+         InlineKeyboardButton(text="👥 Статистика по админам", callback_data="adm_list_stats")],
         [InlineKeyboardButton(text=f"👯‍♀️ Добавление в друзья: {friend_status}", callback_data="toggle_friend")],
         [InlineKeyboardButton(text=f"📝 Набор в хелперы: {helper_status}", callback_data="toggle_helper")],
+        [InlineKeyboardButton(text=f"🔍 Искатели секреток: {secret_status}", callback_data="toggle_secret")],
+        [InlineKeyboardButton(text="👑 Управление главными админами", callback_data="manage_main_admins")],
         [InlineKeyboardButton(text="✏️ Изменить ник для друзей", callback_data="change_friend_nick")]
     ])
 
@@ -387,6 +438,12 @@ def helper_decision_kb(user_id):
         InlineKeyboardButton(text="🔴 Отклонить", callback_data=f"helper_reject_{user_id}")
     ]])
 
+def secret_decision_kb(user_id):
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🟢 Принять", callback_data=f"secret_accept_{user_id}"),
+        InlineKeyboardButton(text="🔴 Отклонить", callback_data=f"secret_reject_{user_id}")
+    ]])
+
 # ----------------------------------------------------------------------
 # СТАРТ И МЕНЮ
 # ----------------------------------------------------------------------
@@ -414,21 +471,21 @@ async def refresh_menu_handler(message: Message, state: FSMContext):
 
 @router.message(F.text == BTN_ADMIN_PANEL, F.chat.type == "private")
 async def open_admin_panel(message: Message, state: FSMContext):
-    if not ADMIN_ID or message.from_user.id != ADMIN_ID:
+    if not is_main_admin(message.from_user.id):
         return
     await state.clear()
     await message.answer("⚙️ <b>Панель администратора</b>", reply_markup=admin_panel_kb(), parse_mode="HTML")
 
 @router.callback_query(F.data == "adm_stats")
 async def callback_stats(call: CallbackQuery):
-    if not ADMIN_ID or call.from_user.id != ADMIN_ID:
+    if not is_main_admin(call.from_user.id):
         await call.answer("Нет доступа", show_alert=True)
         return
     users_count = get_all_users_count()
     total, closed, rejected, avg_rating = get_tickets_stats()
 
     stats_text = (
-        "📊 <b>Статистика поддержки:</b>\n\n"
+        "📊 <b>Общая статистика поддержки:</b>\n\n"
         f"👥 Активных пользователей: <code>{users_count}</code>\n"
         f"📬 Всего тикетов: <code>{total}</code>\n"
         f"✅ Успешно закрыто: <code>{closed}</code>\n"
@@ -438,27 +495,90 @@ async def callback_stats(call: CallbackQuery):
     await call.message.edit_text(stats_text, reply_markup=admin_panel_kb(), parse_mode="HTML")
     await call.answer()
 
+@router.callback_query(F.data == "adm_list_stats")
+async def callback_admin_list_stats(call: CallbackQuery):
+    if not is_main_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    
+    rows = get_admin_list_stats()
+    if not rows:
+        text = "👥 <b>Статистика по администраторам:</b>\n\nПока нет закрытых тикетов у админов."
+    else:
+        text = "👥 <b>Статистика по администраторам:</b>\n\n"
+        for admin_id, closed_cnt, avg_score in rows:
+            try:
+                chat_member = await bot.get_chat(admin_id)
+                name = chat_member.full_name
+            except Exception:
+                name = f"ID: {admin_id}"
+            text += f"👤 <b>{html.escape(name)}</b> (<code>{admin_id}</code>)\n"
+            text += f"   • Закрыто тикетов: <code>{closed_cnt}</code>\n"
+            text += f"   • Средняя оценка: <code>{round(float(avg_score), 2)} / 5.0</code>\n\n"
+
+    back_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_adm")]])
+    await call.message.edit_text(text, reply_markup=back_kb, parse_mode="HTML")
+    await call.answer()
+
+@router.callback_query(F.data == "back_to_adm")
+async def back_to_admin_panel(call: CallbackQuery):
+    if not is_main_admin(call.from_user.id): return
+    await call.message.edit_text("⚙️ <b>Панель администратора</b>", reply_markup=admin_panel_kb(), parse_mode="HTML")
+    await call.answer()
+
+@router.callback_query(F.data == "manage_main_admins")
+async def manage_main_admins_callback(call: CallbackQuery):
+    if not is_main_admin(call.from_user.id): return
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT admin_id FROM main_admins")
+        res = cursor.fetchall()
+        cursor.close()
+        conn.close()
+    except Exception:
+        res = []
+
+    text = "👑 <b>Главные администраторы бота:</b>\n\n"
+    for r in res:
+        text += f"• <code>{r[0]}</code>\n"
+    
+    text += "\nЧтобы добавить главного админа, отправьте в чат группы:\n<code>/addadmin [user_id]</code>\nЧтобы удалить:\n<code>/deladmin [user_id]</code>"
+    
+    back_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_adm")]])
+    await call.message.edit_text(text, reply_markup=back_kb, parse_mode="HTML")
+    await call.answer()
+
 @router.callback_query(F.data == "toggle_friend")
 async def toggle_friend_callback(call: CallbackQuery):
-    if not ADMIN_ID or call.from_user.id != ADMIN_ID: return
+    if not is_main_admin(call.from_user.id): return
     current = get_setting("friend_active", "false")
     new_val = "false" if current == "true" else "true"
     set_setting("friend_active", new_val)
-    await call.answer(f"Статус изменен")
+    await call.answer("Статус изменен")
     await call.message.edit_reply_markup(reply_markup=admin_panel_kb())
 
 @router.callback_query(F.data == "toggle_helper")
 async def toggle_helper_callback(call: CallbackQuery):
-    if not ADMIN_ID or call.from_user.id != ADMIN_ID: return
+    if not is_main_admin(call.from_user.id): return
     current = get_setting("helper_recruitment", "true")
     new_val = "false" if current == "true" else "true"
     set_setting("helper_recruitment", new_val)
-    await call.answer(f"Статус набора изменен")
+    await call.answer("Статус набора хелперов изменен")
+    await call.message.edit_reply_markup(reply_markup=admin_panel_kb())
+
+@router.callback_query(F.data == "toggle_secret")
+async def toggle_secret_callback(call: CallbackQuery):
+    if not is_main_admin(call.from_user.id): return
+    current = get_setting("secret_recruitment", "true")
+    new_val = "false" if current == "true" else "true"
+    set_setting("secret_recruitment", new_val)
+    await call.answer("Статус набора в искатели изменен")
     await call.message.edit_reply_markup(reply_markup=admin_panel_kb())
 
 @router.callback_query(F.data == "change_friend_nick")
 async def change_friend_nick_callback(call: CallbackQuery, state: FSMContext):
-    if not ADMIN_ID or call.from_user.id != ADMIN_ID: return
+    if not is_main_admin(call.from_user.id): return
     await state.set_state(Form.set_friend_nick)
     current_nick = get_setting("friend_nickname", "Не задан")
     await call.message.answer(f"✏️ Введите новый ник для друзей. Текущий: <code>{html.escape(current_nick)}</code>", parse_mode="HTML")
@@ -466,13 +586,57 @@ async def change_friend_nick_callback(call: CallbackQuery, state: FSMContext):
 
 @router.message(Form.set_friend_nick)
 async def save_friend_nick(message: Message, state: FSMContext):
-    if not ADMIN_ID or message.from_user.id != ADMIN_ID: return
+    if not is_main_admin(message.from_user.id): return
     set_setting("friend_nickname", message.text.strip())
     await state.clear()
     await message.answer("✅ Ник успешно изменен!", reply_markup=main_keyboard(message.from_user.id))
 
 # ----------------------------------------------------------------------
-# СИСТЕМА НАБОРА В ХЕЛПЕРЫ
+# УПРАВЛЕНИЕ ГЛАВНЫМИ АДМИНАМИ ЧЕРЕЗ КОМАНДЫ В ГРУППЕ
+# ----------------------------------------------------------------------
+@router.message(Command("addadmin"), F.chat.id == ADMIN_CHAT_ID)
+async def cmd_add_admin(message: Message):
+    if not is_main_admin(message.from_user.id): return
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer("Использование: <code>/addadmin [user_id]</code>", parse_mode="HTML")
+        return
+    try:
+        new_id = int(args[1])
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO main_admins (admin_id) VALUES (%s) ON CONFLICT (admin_id) DO NOTHING", (new_id,))
+        conn.commit()
+        cursor.close()
+        conn.close()
+        await message.answer(f"✅ Пользователь <code>{new_id}</code> назначен главным администратором.", parse_mode="HTML")
+    except ValueError:
+        await message.answer("❌ Неверный формат ID.")
+
+@router.message(Command("deladmin"), F.chat.id == ADMIN_CHAT_ID)
+async def cmd_del_admin(message: Message):
+    if not is_main_admin(message.from_user.id): return
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer("Использование: <code>/deladmin [user_id]</code>", parse_mode="HTML")
+        return
+    try:
+        del_id = int(args[1])
+        if OWNER_ID and del_id == OWNER_ID:
+            await message.answer("❌ Нельзя удалить создателя бота.")
+            return
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM main_admins WHERE admin_id = %s", (del_id,))
+        conn.commit()
+        cursor.close()
+        conn.close()
+        await message.answer(f"✅ Пользователь <code>{del_id}</code> снят с поста главного администратора.", parse_mode="HTML")
+    except ValueError:
+        await message.answer("❌ Неверный формат ID.")
+
+# ----------------------------------------------------------------------
+# СИСТЕМА НАБОРА В ХЕЛПЕРЫ И ИСКАТЕЛИ СЕКРЕТОВ
 # ----------------------------------------------------------------------
 @router.message(F.text == BTN_HELPER_APPLY, F.chat.type == "private")
 async def start_helper_apply(message: Message, state: FSMContext):
@@ -538,6 +702,76 @@ async def helper_reject_callback(call: CallbackQuery):
     user_id = int(call.data.split("_")[2])
     try:
         await bot.send_message(user_id, "❌ К сожалению, ваша заявка на хелпера была отклонена.", parse_mode="HTML")
+    except Exception:
+        pass
+    await call.message.edit_text(call.message.text + "\n\n🔴 <b>Статус:</b> Отклонено ❌", parse_mode="HTML")
+    await call.answer("Заявка отклонена!")
+
+# --- Набор в искатели секреток ---
+@router.message(F.text == BTN_SECRET_APPLY, F.chat.type == "private")
+async def start_secret_apply(message: Message, state: FSMContext):
+    register_user(message.from_user.id)
+    if is_banned(message.from_user.id): return
+    if get_setting("secret_recruitment", "true") != "true":
+        await message.answer("🛠 Набор в искатели секреток в данный момент закрыт.")
+        return
+    await state.clear()
+    await state.set_state(Form.secret_age)
+    await message.answer("🔍 <b>Заявка в искатели секреток</b>\n\n1️⃣ Укажите ваш возраст:", parse_mode="HTML")
+
+@router.message(Form.secret_age)
+async def process_secret_age(message: Message, state: FSMContext):
+    await state.update_data(secret_age=message.text)
+    await state.set_state(Form.secret_experience)
+    await message.answer("2️⃣ Есть ли у вас опыт поиска секретов/пасхалок? Расскажите о своих успехах:", parse_mode="HTML")
+
+@router.message(Form.secret_experience)
+async def process_secret_experience(message: Message, state: FSMContext):
+    await state.update_data(secret_experience=message.text)
+    await state.set_state(Form.secret_activity)
+    await message.answer("3️⃣ Сколько времени вы готовы уделять игре и проекту ежедневно?", parse_mode="HTML")
+
+@router.message(Form.secret_activity)
+async def process_secret_activity(message: Message, state: FSMContext):
+    data = await state.get_data()
+    user = message.from_user
+    user_mention = get_user_mention(user)
+
+    admin_text = (
+        f"🔍 <b>Новая заявка в искатели секреток!</b>\n\n"
+        f"👤 От: {user_mention}\n"
+        f"🆔 ID: <code>{user.id}</code>\n"
+        f"👤 Username: @{user.username if user.username else 'отсутствует'}\n\n"
+        f"👶 <b>Возраст:</b> {html.escape(data.get('secret_age'))}\n"
+        f"💼 <b>Опыт:</b> {html.escape(data.get('secret_experience'))}\n"
+        f"⏱ <b>Онлайн:</b> {html.escape(message.text)}"
+    )
+
+    await bot.send_message(ADMIN_CHAT_ID, admin_text, reply_markup=secret_decision_kb(user.id), parse_mode="HTML")
+    await message.answer("✅ Ваша заявка в искатели секреток успешно отправлена! Ожидайте ответа.", reply_markup=main_keyboard(user.id), parse_mode="HTML")
+    await state.clear()
+
+@router.callback_query(F.data.startswith("secret_accept_"))
+async def secret_accept_callback(call: CallbackQuery):
+    if not await is_support_member(call.from_user.id):
+        await call.answer("❌ У вас нет прав!", show_alert=True)
+        return
+    user_id = int(call.data.split("_")[2])
+    try:
+        await bot.send_message(user_id, "🎉 <b>Поздравляем! Ваша заявка в искатели секреток принята!</b>", parse_mode="HTML")
+    except Exception:
+        pass
+    await call.message.edit_text(call.message.text + "\n\n🟢 <b>Статус:</b> Одобрено ✅", parse_mode="HTML")
+    await call.answer("Заявка принята!")
+
+@router.callback_query(F.data.startswith("secret_reject_"))
+async def secret_reject_callback(call: CallbackQuery):
+    if not await is_support_member(call.from_user.id):
+        await call.answer("❌ У вас нет прав!", show_alert=True)
+        return
+    user_id = int(call.data.split("_")[2])
+    try:
+        await bot.send_message(user_id, "❌ К сожалению, ваша заявка в искатели секреток была отклонена.", parse_mode="HTML")
     except Exception:
         pass
     await call.message.edit_text(call.message.text + "\n\n🔴 <b>Статус:</b> Отклонено ❌", parse_mode="HTML")
@@ -717,7 +951,7 @@ async def close_ticket_handler(call: CallbackQuery):
     ticket_id = int(parts[1])
     assigned_admin_id = int(parts[2])
 
-    if call.from_user.id != assigned_admin_id and (not ADMIN_ID or call.from_user.id != ADMIN_ID):
+    if call.from_user.id != assigned_admin_id and not is_main_admin(call.from_user.id):
         if not await is_support_member(call.from_user.id):
             await call.answer("❌ Нет доступа!", show_alert=True)
             return
@@ -770,7 +1004,7 @@ async def process_rating(call: CallbackQuery, state: FSMContext):
 
     save_rating_db(ticket_id, user_id, admin_id, score)
 
-    if ADMIN_ID and user_id == ADMIN_ID:
+    if is_main_admin(user_id):
         await call.message.edit_text(f"⭐ [ТЕСТ АДМИНА] Оценка {score}/5 сохранена, но в общую статистику не пошла.", parse_mode="HTML")
     else:
         await call.message.edit_text(f"⭐ Спасибо за оценку ({score}/5)! Ваше мнение учтено.", parse_mode="HTML")
@@ -836,7 +1070,7 @@ async def admin_reply_in_group(message: Message):
         ticket_info = get_ticket_info(ticket_id)
 
         if ticket_info and ticket_info[2] == 'active':
-            if ticket_info[1] != message.from_user.id and (not ADMIN_ID or message.from_user.id != ADMIN_ID):
+            if ticket_info[1] != message.from_user.id and not is_main_admin(message.from_user.id):
                 await message.answer("❌ Этот тикет ведет другой администратор. Вы не можете в него отвечать!")
                 return
 
