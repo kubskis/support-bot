@@ -369,6 +369,10 @@ class Form(StatesGroup):
     secret_experience = State()
     secret_activity = State()
 
+    # Управление главными админами (через ЛС)
+    add_main_admin_id = State()
+    del_main_admin_id = State()
+
 # ----------------------------------------------------------------------
 # КЛАВИАТУРЫ
 # ----------------------------------------------------------------------
@@ -528,7 +532,10 @@ async def back_to_admin_panel(call: CallbackQuery):
 
 @router.callback_query(F.data == "manage_main_admins")
 async def manage_main_admins_callback(call: CallbackQuery):
-    if not is_main_admin(call.from_user.id): return
+    if OWNER_ID and call.from_user.id != OWNER_ID:
+        await call.answer("❌ Только создатель бота может управлять главными админами!", show_alert=True)
+        return
+    
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -543,11 +550,68 @@ async def manage_main_admins_callback(call: CallbackQuery):
     for r in res:
         text += f"• <code>{r[0]}</code>\n"
     
-    text += "\nЧтобы добавить главного админа, отправьте в чат группы:\n<code>/addadmin [user_id]</code>\nЧтобы удалить:\n<code>/deladmin [user_id]</code>"
-    
-    back_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_adm")]])
-    await call.message.edit_text(text, reply_markup=back_kb, parse_mode="HTML")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить главного админа", callback_data="add_main_admin_start")],
+        [InlineKeyboardButton(text="➖ Удалить главного админа", callback_data="del_main_admin_start")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_adm")]
+    ])
+    await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     await call.answer()
+
+@router.callback_query(F.data == "add_main_admin_start")
+async def add_main_admin_start(call: CallbackQuery, state: FSMContext):
+    if OWNER_ID and call.from_user.id != OWNER_ID:
+        await call.answer("❌ Доступно только создателю бота!", show_alert=True)
+        return
+    await state.set_state(Form.add_main_admin_id)
+    await call.message.answer("➕ Введите <b>Telegram ID</b> пользователя, которого хотите сделать главным администратором:", parse_mode="HTML")
+    await call.answer()
+
+@router.message(Form.add_main_admin_id, F.chat.type == "private")
+async def process_add_main_admin(message: Message, state: FSMContext):
+    if OWNER_ID and message.from_user.id != OWNER_ID:
+        return
+    try:
+        new_id = int(message.text.strip())
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO main_admins (admin_id) VALUES (%s) ON CONFLICT (admin_id) DO NOTHING", (new_id,))
+        conn.commit()
+        cursor.close()
+        conn.close()
+        await state.clear()
+        await message.answer(f"✅ Пользователь <code>{new_id}</code> успешно назначен главным администратором!", reply_markup=main_keyboard(message.from_user.id), parse_mode="HTML")
+    except ValueError:
+        await message.answer("❌ Неверный формат ID. Введите числовой Telegram ID:")
+
+@router.callback_query(F.data == "del_main_admin_start")
+async def del_main_admin_start(call: CallbackQuery, state: FSMContext):
+    if OWNER_ID and call.from_user.id != OWNER_ID:
+        await call.answer("❌ Доступно только создателю бота!", show_alert=True)
+        return
+    await state.set_state(Form.del_main_admin_id)
+    await call.message.answer("➖ Введите <b>Telegram ID</b> главного администратора, которого хотите снять:", parse_mode="HTML")
+    await call.answer()
+
+@router.message(Form.del_main_admin_id, F.chat.type == "private")
+async def process_del_main_admin(message: Message, state: FSMContext):
+    if OWNER_ID and message.from_user.id != OWNER_ID:
+        return
+    try:
+        del_id = int(message.text.strip())
+        if OWNER_ID and del_id == OWNER_ID:
+            await message.answer("❌ Нельзя удалить создателя бота!")
+            return
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM main_admins WHERE admin_id = %s", (del_id,))
+        conn.commit()
+        cursor.close()
+        conn.close()
+        await state.clear()
+        await message.answer(f"✅ Пользователь <code>{del_id}</code> снят с поста главного администратора.", reply_markup=main_keyboard(message.from_user.id), parse_mode="HTML")
+    except ValueError:
+        await message.answer("❌ Неверный формат ID. Введите числовой Telegram ID:")
 
 @router.callback_query(F.data == "toggle_friend")
 async def toggle_friend_callback(call: CallbackQuery):
@@ -590,50 +654,6 @@ async def save_friend_nick(message: Message, state: FSMContext):
     set_setting("friend_nickname", message.text.strip())
     await state.clear()
     await message.answer("✅ Ник успешно изменен!", reply_markup=main_keyboard(message.from_user.id))
-
-# ----------------------------------------------------------------------
-# УПРАВЛЕНИЕ ГЛАВНЫМИ АДМИНАМИ ЧЕРЕЗ КОМАНДЫ В ГРУППЕ
-# ----------------------------------------------------------------------
-@router.message(Command("addadmin"), F.chat.id == ADMIN_CHAT_ID)
-async def cmd_add_admin(message: Message):
-    if not is_main_admin(message.from_user.id): return
-    args = message.text.split(maxsplit=1)
-    if len(args) < 2:
-        await message.answer("Использование: <code>/addadmin [user_id]</code>", parse_mode="HTML")
-        return
-    try:
-        new_id = int(args[1])
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("INSERT INTO main_admins (admin_id) VALUES (%s) ON CONFLICT (admin_id) DO NOTHING", (new_id,))
-        conn.commit()
-        cursor.close()
-        conn.close()
-        await message.answer(f"✅ Пользователь <code>{new_id}</code> назначен главным администратором.", parse_mode="HTML")
-    except ValueError:
-        await message.answer("❌ Неверный формат ID.")
-
-@router.message(Command("deladmin"), F.chat.id == ADMIN_CHAT_ID)
-async def cmd_del_admin(message: Message):
-    if not is_main_admin(message.from_user.id): return
-    args = message.text.split(maxsplit=1)
-    if len(args) < 2:
-        await message.answer("Использование: <code>/deladmin [user_id]</code>", parse_mode="HTML")
-        return
-    try:
-        del_id = int(args[1])
-        if OWNER_ID and del_id == OWNER_ID:
-            await message.answer("❌ Нельзя удалить создателя бота.")
-            return
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM main_admins WHERE admin_id = %s", (del_id,))
-        conn.commit()
-        cursor.close()
-        conn.close()
-        await message.answer(f"✅ Пользователь <code>{del_id}</code> снят с поста главного администратора.", parse_mode="HTML")
-    except ValueError:
-        await message.answer("❌ Неверный формат ID.")
 
 # ----------------------------------------------------------------------
 # СИСТЕМА НАБОРА В ХЕЛПЕРЫ И ИСКАТЕЛИ СЕКРЕТОВ
@@ -1149,4 +1169,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
+        
