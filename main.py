@@ -186,7 +186,7 @@ class AdminStates(StatesGroup):
     waiting_for_new_type_declined = State()
     waiting_for_new_timer = State()
     waiting_for_admin_input = State()
-    waiting_for_secret_admin_input = State() # Ввод для админов секреток
+    waiting_for_secret_admin_input = State()
     waiting_for_template_active = State()
     waiting_for_template_expired = State()
 
@@ -202,17 +202,28 @@ def get_main_reply_keyboard(user_id: int):
     
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True) if keyboard else None
 
+# Главное меню админки (теперь с кнопкой перехода в подменю секреток)
 def get_admin_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📊 Статистика за день", callback_data="adm_stats")],
             [InlineKeyboardButton(text="👥 Управление админами", callback_data="adm_manage_admins")],
-            [InlineKeyboardButton(text="🔑 Админы секреток", callback_data="adm_manage_secret_admins")], # Новая кнопка
+            [InlineKeyboardButton(text="🔑 Админы секреток", callback_data="adm_manage_secret_admins")],
+            [InlineKeyboardButton(text="⚙️ Управление секретками (Меню)", callback_data="open_secrets_panel")],
+            [InlineKeyboardButton(text="🔙 Выход", callback_data="adm_exit")],
+        ]
+    )
+
+# Подменю управления секретками
+def get_secrets_admin_keyboard(timer_str: str):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"⏱ Таймер удаления: {timer_str}", callback_data="noop")],
             [InlineKeyboardButton(text="📝 Редактировать шаблоны", callback_data="adm_edit_templates")],
             [InlineKeyboardButton(text="➕ Добавить тип секретки", callback_data="adm_add_type")],
             [InlineKeyboardButton(text="🗑 Удалить тип секретки", callback_data="adm_del_type")],
             [InlineKeyboardButton(text="⏱ Изменить время таймера", callback_data="adm_set_timer")],
-            [InlineKeyboardButton(text="🔙 Выход", callback_data="adm_exit")],
+            [InlineKeyboardButton(text="🔙 Назад в админку", callback_data="adm_back_to_main")],
         ]
     )
 
@@ -221,7 +232,7 @@ def get_templates_keyboard():
         inline_keyboard=[
             [InlineKeyboardButton(text="✏️ Шаблон активного поста", callback_data="tmpl_active")],
             [InlineKeyboardButton(text="✏️ Шаблон истекшего поста", callback_data="tmpl_expired")],
-            [InlineKeyboardButton(text="🔙 Назад в админ-панель", callback_data="adm_back")],
+            [InlineKeyboardButton(text="🔙 Назад в меню секреток", callback_data="open_secrets_panel")],
         ]
     )
 
@@ -313,7 +324,7 @@ async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     welcome_text = (
         "Привет! Добро пожаловать в бота.\n"
-        "Для начала работы привяжи свой канал с помощью команды `/addchannel @юз_канала`",
+        "Для начала работы привяжи свой канал с помощью команды `/addchannel @юз_канала`"
     )
     await message.answer(welcome_text, reply_markup=get_main_reply_keyboard(message.from_user.id))
 
@@ -358,23 +369,44 @@ async def cmd_add_channel(message: Message, bot: Bot):
         await message.answer(f"❌ Ошибка: {e}")
 
 
-# ==================== АДМИН-ПАНЕЛЬ И СТАТИСТИКА ====================
+# ==================== АДМИН-ПАНЕЛЬ И ПОДМЕНЮ ====================
 
 @router.message(F.text == "⚙️ Админ-панель")
 async def admin_panel(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
     await state.clear()
+    text = "⚙️ <b>Панель управления администратора</b>\n\nВыберите нужный раздел:"
+    await message.answer(text, parse_mode="HTML", reply_markup=get_admin_keyboard())
+
+
+# Переход в подменю управления секретками
+@router.callback_query(F.data == "open_secrets_panel")
+async def open_secrets_panel(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
     current_timer = get_timer_duration()
     minutes = current_timer // 60
     seconds = current_timer % 60
-    
+    timer_str = f"{minutes} мин. {seconds} сек."
+
     text = (
-        f"⚙️ <b>Панель управления администратора</b>\n\n"
-        f"⏱ Время таймера до удаления ссылки: <b>{minutes} мин. {seconds} сек.</b>\n"
-        f"Выберите действие:"
+        f"⚙️ <b>Управление секретками</b>\n\n"
+        f"⏱ Текущий таймер: <b>{timer_str}</b>\n"
+        f"Выберите настройку:"
     )
-    await message.answer(text, parse_mode="HTML", reply_markup=get_admin_keyboard())
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=get_secrets_admin_keyboard(timer_str))
+    await callback.answer()
+
+
+# Возврат назад в главное меню админки
+@router.callback_query(F.data == "adm_back_to_main")
+async def adm_back_to_main(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    text = "⚙️ <b>Панель управления администратора</b>\n\nВыберите нужный раздел:"
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=get_admin_keyboard())
+    await callback.answer()
 
 
 @router.callback_query(F.data == "adm_stats")
@@ -409,7 +441,7 @@ async def adm_stats(callback: CallbackQuery, bot: Bot):
         await callback.message.edit_text(
             "📊 <b>Статистика за последние 24 часа (МСК):</b>\n\n📭 За это время не было опубликовано ни одной секретки.",
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="adm_back")]])
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="adm_back_to_main")]])
         )
         await callback.answer()
         return
@@ -454,7 +486,7 @@ async def adm_stats(callback: CallbackQuery, bot: Bot):
         stats_text,
         parse_mode="HTML",
         disable_web_page_preview=True,
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="adm_back")]])
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="adm_back_to_main")]])
     )
     await callback.answer()
 
@@ -483,7 +515,7 @@ async def adm_manage_admins(callback: CallbackQuery, state: FSMContext):
 
     text += "\nНажми кнопку ниже, чтобы добавить нового администратора."
     buttons.append([InlineKeyboardButton(text="➕ Добавить администратора", callback_data="add_admin_prompt")])
-    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="adm_back")])
+    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="adm_back_to_main")])
 
     await callback.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
     await callback.answer()
@@ -581,7 +613,7 @@ async def adm_manage_secret_admins(callback: CallbackQuery, state: FSMContext):
 
     text += "\nНажми кнопку ниже, чтобы добавить нового админа секреток."
     buttons.append([InlineKeyboardButton(text="➕ Добавить админа секреток", callback_data="add_secret_admin_prompt")])
-    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="adm_back")])
+    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="adm_back_to_main")])
 
     await callback.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
     await callback.answer()
@@ -829,7 +861,7 @@ async def adm_del_type(callback: CallbackQuery, state: FSMContext):
     buttons = []
     for s_name in types_dict.keys():
         buttons.append([InlineKeyboardButton(text=f"🗑 Удалить: {s_name}", callback_data=f"deltype_{s_name}")])
-    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="adm_back")])
+    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="open_secrets_panel")])
 
     await callback.message.edit_text("🗑 Выберите тип секретки для удаления:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
     await callback.answer()
@@ -851,19 +883,8 @@ async def process_delete_type(callback: CallbackQuery):
     await callback.answer()
 
 
-@router.callback_query(F.data == "adm_back")
-async def adm_back(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-    current_timer = get_timer_duration()
-    minutes = current_timer // 60
-    seconds = current_timer % 60
-    text = (
-        f"⚙️ <b>Панель управления администратора</b>\n\n"
-        f"⏱ Время таймера до удаления ссылки: <b>{minutes} мин. {seconds} сек.</b>\n"
-        f"Выберите действие:"
-    )
-    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=get_admin_keyboard())
+@router.callback_query(F.data == "noop")
+async def noop_handler(callback: CallbackQuery):
     await callback.answer()
 
 
@@ -1136,4 +1157,4 @@ async def on_startup():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     uvicorn.run(app, host="0.0.0.0", port=port)
-        
+    
