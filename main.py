@@ -37,13 +37,11 @@ def get_user_mention(user):
     safe_name = html.escape(user.full_name)
     return f'<a href="tg://user?id={user.id}">{safe_name}</a>'
 
-# Проверка: состоит ли пользователь в админ-чате (без выдачи админки в ТГ)
 async def is_support_member(user_id: int) -> bool:
     if ADMIN_ID and user_id == ADMIN_ID:
         return True
     try:
         member = await bot.get_chat_member(chat_id=ADMIN_CHAT_ID, user_id=user_id)
-        # Если участник в чате и его статус не 'left' или 'kicked'
         if member.status in ["creator", "administrator", "member"]:
             return True
     except Exception:
@@ -164,8 +162,11 @@ def get_tickets_stats():
         closed = cursor.fetchone()[0]
         cursor.execute("SELECT COUNT(*) FROM tickets WHERE status = 'rejected'")
         rejected = cursor.fetchone()[0]
-        cursor.execute("SELECT COALESCE(AVG(score), 0) FROM ratings")
+        
+        # Считаем средний рейтинг, исключая оценки Главного админа (чтобы тесты не портили стату)
+        cursor.execute("SELECT COALESCE(AVG(score), 0) FROM ratings WHERE user_id != %s", (ADMIN_ID,))
         avg_rating = cursor.fetchone()[0]
+        
         cursor.close()
         conn.close()
         return total, closed, rejected, round(float(avg_rating), 2)
@@ -495,7 +496,6 @@ async def start_question(message: Message, state: FSMContext):
     await state.set_state(Form.question_text)
     await message.answer("❓ Задайте ваш вопрос одним сообщением:", parse_mode="HTML")
 
-# Шаги заполнения анкет (сохраняют защиту через check_active_ticket)
 @router.message(Form.friends_nickname)
 async def process_friends_nickname(message: Message, state: FSMContext):
     if await check_active_ticket(message): return
@@ -520,7 +520,6 @@ async def process_question(message: Message, state: FSMContext):
 
 @router.message(Form.complaint_reason)
 async def process_c_reason(message: Message, state: FSMContext):
-    if await check_active_ticket(message): return
     await state.update_data(c_reason=message.text)
     await state.set_state(Form.complaint_nickname)
     await message.answer("2️⃣ Укажите ник нарушителя:", parse_mode="HTML")
@@ -533,6 +532,7 @@ async def process_c_nickname(message: Message, state: FSMContext):
 
 @router.message(Form.complaint_photo, F.photo)
 async def process_c_photo(message: Message, state: FSMContext):
+    if await check_active_ticket(message): return
     await state.update_data(c_photo=message.photo[-1].file_id)
     ticket_id = create_ticket(message.from_user.id, "complaint")
     data = await state.get_data()
@@ -545,13 +545,13 @@ async def process_c_photo(message: Message, state: FSMContext):
 
 @router.message(Form.appeal_nickname)
 async def process_a_nickname(message: Message, state: FSMContext):
-    if await check_active_ticket(message): return
     await state.update_data(a_nickname=message.text)
     await state.set_state(Form.appeal_reason)
     await message.answer("2️⃣ Опишите, почему вы хотите разблокировку:", parse_mode="HTML")
 
 @router.message(Form.appeal_reason)
 async def process_a_reason(message: Message, state: FSMContext):
+    if await check_active_ticket(message): return
     data = await state.get_data()
     ticket_id = create_ticket(message.from_user.id, "appeal")
     user_mention = get_user_mention(message.from_user)
@@ -621,7 +621,6 @@ async def close_ticket_handler(call: CallbackQuery):
     ticket_id = int(parts[1])
     assigned_admin_id = int(parts[2])
 
-    # Закрыть может только принявший админ или главный админ
     if call.from_user.id != assigned_admin_id and (not ADMIN_ID or call.from_user.id != ADMIN_ID):
         if not await is_support_member(call.from_user.id):
             await call.answer("❌ Нет доступа!", show_alert=True)
@@ -661,7 +660,7 @@ async def user_cancel_ticket(call: CallbackQuery):
         await call.answer("❌ Заявка уже взята в работу или закрыта, отмена недоступна.", show_alert=True)
 
 # ----------------------------------------------------------------------
-# СИСТЕМА ОЦЕНОК И ЗАЩИТА ОТ НАКРУТКИ
+# СИСТЕМА ОЦЕНОК (Тест для админа + защита общей статы)
 # ----------------------------------------------------------------------
 @router.callback_query(F.data.startswith("rate_"))
 async def process_rating(call: CallbackQuery, state: FSMContext):
@@ -670,16 +669,17 @@ async def process_rating(call: CallbackQuery, state: FSMContext):
     score = int(parts[2])
     user_id = call.from_user.id
 
-    # Защита от накрутки: участники админ-чата не могут оценивать
-    if await is_support_member(user_id):
-        await call.answer("❌ Администраторы не могут оставлять оценки!", show_alert=True)
-        return
-
     ticket_info = get_ticket_info(ticket_id)
     admin_id = ticket_info[1] if ticket_info else 0
 
+    # Сохраняем оценку в базу данных (даже если это ставит Главный админ для тестов)
     save_rating_db(ticket_id, user_id, admin_id, score)
-    await call.message.edit_text(f"⭐ Спасибо за оценку ({score}/5)! Ваше мнение учтено.", parse_mode="HTML")
+
+    if ADMIN_ID and user_id == ADMIN_ID:
+        await call.message.edit_text(f"⭐ [ТЕСТ АДМИНА] Оценка {score}/5 сохранена, но в общую статистику не пошла.", parse_mode="HTML")
+    else:
+        await call.message.edit_text(f"⭐ Спасибо за оценку ({score}/5)! Ваше мнение учтено.", parse_mode="HTML")
+    
     await call.answer("Оценка сохранена!")
 
 # ----------------------------------------------------------------------
@@ -740,7 +740,6 @@ async def admin_reply_in_group(message: Message):
         user_id, ticket_id = mapping[0], mapping[1]
         ticket_info = get_ticket_info(ticket_id)
 
-        # Проверка: отвечает ли тот самый админ, который взял тикет (или главный админ)
         if ticket_info and ticket_info[2] == 'active':
             if ticket_info[1] != message.from_user.id and (not ADMIN_ID or message.from_user.id != ADMIN_ID):
                 await message.answer("❌ Этот тикет ведет другой администратор. Вы не можете в него отвечать!")
@@ -757,7 +756,6 @@ async def admin_reply_in_group(message: Message):
             except Exception as e:
                 await message.answer(f"❌ Ошибка отправки: {e}")
 
-# Быстрый бан через Reply командой /ban
 @router.message(Command("ban"), F.chat.id == ADMIN_CHAT_ID, F.reply_to_message)
 async def cmd_ban_reply(message: Message):
     if not await is_support_member(message.from_user.id): return
