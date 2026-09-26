@@ -202,7 +202,7 @@ def get_main_reply_keyboard(user_id: int):
     
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True) if keyboard else None
 
-# Главное меню админки (теперь с кнопкой перехода в подменю секреток)
+# Главное меню админки
 def get_admin_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -380,7 +380,6 @@ async def admin_panel(message: Message, state: FSMContext):
     await message.answer(text, parse_mode="HTML", reply_markup=get_admin_keyboard())
 
 
-# Переход в подменю управления секретками
 @router.callback_query(F.data == "open_secrets_panel")
 async def open_secrets_panel(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
@@ -399,7 +398,6 @@ async def open_secrets_panel(callback: CallbackQuery):
     await callback.answer()
 
 
-# Возврат назад в главное меню админки
 @router.callback_query(F.data == "adm_back_to_main")
 async def adm_back_to_main(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
@@ -1157,4 +1155,4 @@ async def on_startup():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
     uvicorn.run(app, host="0.0.0.0", port=port)
-    
+        
