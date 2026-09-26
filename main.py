@@ -94,7 +94,6 @@ def init_db():
                 review TEXT
             );
         """)
-        # Автоматическое добавление колонки category, если таблица была создана ранее без нее
         cursor.execute("""
             ALTER TABLE tickets ADD COLUMN IF NOT EXISTS category TEXT DEFAULT 'general';
         """)
@@ -313,13 +312,16 @@ class Form(StatesGroup):
     complaint_reason = State()
     complaint_nickname = State()
     complaint_photo = State()
-    complaint_server = State()
     appeal_nickname = State()
     appeal_reason = State()
     friends_nickname = State()
     question_text = State()
     set_friend_nick = State()
-    rating_review = State()
+    
+    # Состояния для набора в хелперы
+    helper_age = State()
+    helper_timezone = State()
+    helper_experience = State()
 
 # ----------------------------------------------------------------------
 # КЛАВИАТУРЫ
@@ -328,6 +330,7 @@ BTN_COMPLAINT = "🚨 Жалоба на игрока"
 BTN_APPEAL = "😡 Обжалование бана"
 BTN_FRIENDS = "👯‍♀️ Добавление в друзья (VIP)"
 BTN_QUESTION = "❓ Задать вопрос"
+BTN_HELPER_APPLY = "📝 Подать заявку на хелпера"
 BTN_ADMIN_PANEL = "⚙️ Админ-панель"
 BTN_REFRESH = "🔄 Перезагрузить меню"
 
@@ -335,6 +338,7 @@ def main_keyboard(user_id):
     keyboard = [
         [KeyboardButton(text=BTN_COMPLAINT), KeyboardButton(text=BTN_APPEAL)],
         [KeyboardButton(text=BTN_FRIENDS), KeyboardButton(text=BTN_QUESTION)],
+        [KeyboardButton(text=BTN_HELPER_APPLY)],
         [KeyboardButton(text=BTN_REFRESH)]
     ]
     if ADMIN_ID and user_id == ADMIN_ID:
@@ -344,9 +348,11 @@ def main_keyboard(user_id):
 
 def admin_panel_kb():
     friend_status = "🟢 Вкл" if get_setting("friend_active", "false") == "true" else "🔴 Выкл"
+    helper_status = "🟢 Вкл" if get_setting("helper_recruitment", "true") == "true" else "🔴 Выкл"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📊 Статистика", callback_data="adm_stats")],
         [InlineKeyboardButton(text=f"👯‍♀️ Добавление в друзья: {friend_status}", callback_data="toggle_friend")],
+        [InlineKeyboardButton(text=f"📝 Набор в хелперы: {helper_status}", callback_data="toggle_helper")],
         [InlineKeyboardButton(text="✏️ Изменить ник для друзей", callback_data="change_friend_nick")]
     ])
 
@@ -373,6 +379,12 @@ def rating_kb(ticket_id):
         InlineKeyboardButton(text="⭐ 3", callback_data=f"rate_{ticket_id}_3"),
         InlineKeyboardButton(text="⭐ 4", callback_data=f"rate_{ticket_id}_4"),
         InlineKeyboardButton(text="⭐ 5", callback_data=f"rate_{ticket_id}_5"),
+    ]])
+
+def helper_decision_kb(user_id):
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🟢 Принять", callback_data=f"helper_accept_{user_id}"),
+        InlineKeyboardButton(text="🔴 Отклонить", callback_data=f"helper_reject_{user_id}")
     ]])
 
 # ----------------------------------------------------------------------
@@ -435,6 +447,15 @@ async def toggle_friend_callback(call: CallbackQuery):
     await call.answer(f"Статус изменен")
     await call.message.edit_reply_markup(reply_markup=admin_panel_kb())
 
+@router.callback_query(F.data == "toggle_helper")
+async def toggle_helper_callback(call: CallbackQuery):
+    if not ADMIN_ID or call.from_user.id != ADMIN_ID: return
+    current = get_setting("helper_recruitment", "true")
+    new_val = "false" if current == "true" else "true"
+    set_setting("helper_recruitment", new_val)
+    await call.answer(f"Статус набора изменен")
+    await call.message.edit_reply_markup(reply_markup=admin_panel_kb())
+
 @router.callback_query(F.data == "change_friend_nick")
 async def change_friend_nick_callback(call: CallbackQuery, state: FSMContext):
     if not ADMIN_ID or call.from_user.id != ADMIN_ID: return
@@ -451,7 +472,79 @@ async def save_friend_nick(message: Message, state: FSMContext):
     await message.answer("✅ Ник успешно изменен!", reply_markup=main_keyboard(message.from_user.id))
 
 # ----------------------------------------------------------------------
-# СОЗДАНИЕ ТИКЕТОВ (С защитой от мульти-тикетов)
+# СИСТЕМА НАБОРА В ХЕЛПЕРЫ
+# ----------------------------------------------------------------------
+@router.message(F.text == BTN_HELPER_APPLY, F.chat.type == "private")
+async def start_helper_apply(message: Message, state: FSMContext):
+    register_user(message.from_user.id)
+    if is_banned(message.from_user.id): return
+    if get_setting("helper_recruitment", "true") != "true":
+        await message.answer("🛠 Набор в команду поддержки в данный момент закрыт.")
+        return
+    await state.clear()
+    await state.set_state(Form.helper_age)
+    await message.answer("📝 <b>Заявка в команду поддержки (Хелперы)</b>\n\n1️⃣ Укажите ваш возраст:", parse_mode="HTML")
+
+@router.message(Form.helper_age)
+async def process_helper_age(message: Message, state: FSMContext):
+    await state.update_data(helper_age=message.text)
+    await state.set_state(Form.helper_timezone)
+    await message.answer("2️⃣ Укажите ваш часовой пояс (например, МСК, +2 от МСК):", parse_mode="HTML")
+
+@router.message(Form.helper_timezone)
+async def process_helper_timezone(message: Message, state: FSMContext):
+    await state.update_data(helper_timezone=message.text)
+    await state.set_state(Form.helper_experience)
+    await message.answer("3️⃣ Был ли у вас опыт работы в поддержке или на аналогичных проектах? Опишите кратко:", parse_mode="HTML")
+
+@router.message(Form.helper_experience)
+async def process_helper_experience(message: Message, state: FSMContext):
+    data = await state.get_data()
+    user = message.from_user
+    user_mention = get_user_mention(user)
+
+    admin_text = (
+        f"📝 <b>Новая заявка на хелпера!</b>\n\n"
+        f"👤 От: {user_mention}\n"
+        f"🆔 ID: <code>{user.id}</code>\n"
+        f"👤 Username: @{user.username if user.username else 'отсутствует'}\n\n"
+        f"👶 <b>Возраст:</b> {html.escape(data.get('helper_age'))}\n"
+        f"🌍 <b>Часовой пояс:</b> {html.escape(data.get('helper_timezone'))}\n"
+        f"💼 <b>Опыт:</b> {html.escape(message.text)}"
+    )
+
+    await bot.send_message(ADMIN_CHAT_ID, admin_text, reply_markup=helper_decision_kb(user.id), parse_mode="HTML")
+    await message.answer("✅ Ваша анкета успешно отправлена администрации! Ожидайте ответа.", reply_markup=main_keyboard(user.id), parse_mode="HTML")
+    await state.clear()
+
+@router.callback_query(F.data.startswith("helper_accept_"))
+async def helper_accept_callback(call: CallbackQuery):
+    if not await is_support_member(call.from_user.id):
+        await call.answer("❌ У вас нет прав!", show_alert=True)
+        return
+    user_id = int(call.data.split("_")[2])
+    try:
+        await bot.send_message(user_id, "🎉 <b>Поздравляем! Ваша заявка на хелпера принята!</b> Админы свяжутся с вами в ближайшее время.", parse_mode="HTML")
+    except Exception:
+        pass
+    await call.message.edit_text(call.message.text + "\n\n🟢 <b>Статус:</b> Одобрено ✅", parse_mode="HTML")
+    await call.answer("Заявка принята!")
+
+@router.callback_query(F.data.startswith("helper_reject_"))
+async def helper_reject_callback(call: CallbackQuery):
+    if not await is_support_member(call.from_user.id):
+        await call.answer("❌ У вас нет прав!", show_alert=True)
+        return
+    user_id = int(call.data.split("_")[2])
+    try:
+        await bot.send_message(user_id, "❌ К сожалению, ваша заявка на хелпера была отклонена.", parse_mode="HTML")
+    except Exception:
+        pass
+    await call.message.edit_text(call.message.text + "\n\n🔴 <b>Статус:</b> Отклонено ❌", parse_mode="HTML")
+    await call.answer("Заявка отклонена!")
+
+# ----------------------------------------------------------------------
+# СОЗДАНИЕ ТИКЕТОВ
 # ----------------------------------------------------------------------
 async def check_active_ticket(message: Message) -> bool:
     active = get_active_ticket(message.from_user.id)
@@ -565,7 +658,7 @@ async def process_a_reason(message: Message, state: FSMContext):
     await state.clear()
 
 # ----------------------------------------------------------------------
-# КНОПКИ УПРАВЛЕНИЯ ТИКЕТАМИ (В ГРУППЕ АДМИНОВ)
+# КНОПКИ УПРАВЛЕНИЯ ТИКЕТАМИ
 # ----------------------------------------------------------------------
 @router.callback_query(F.data.startswith("take_"))
 async def take_ticket_handler(call: CallbackQuery):
@@ -663,7 +756,7 @@ async def user_cancel_ticket(call: CallbackQuery):
         await call.answer("❌ Заявка уже взята в работу или закрыта, отмена недоступна.", show_alert=True)
 
 # ----------------------------------------------------------------------
-# СИСТЕМА ОЦЕНОК (Тест для админа + защита общей статы)
+# СИСТЕМА ОЦЕНОК
 # ----------------------------------------------------------------------
 @router.callback_query(F.data.startswith("rate_"))
 async def process_rating(call: CallbackQuery, state: FSMContext):
@@ -685,7 +778,7 @@ async def process_rating(call: CallbackQuery, state: FSMContext):
     await call.answer("Оценка сохранена!")
 
 # ----------------------------------------------------------------------
-# ДИАЛОГ И БАНЫ (/ban)
+# ДИАЛОГ И БАНЫ
 # ----------------------------------------------------------------------
 @router.message(F.chat.type == "private")
 async def user_private_message(message: Message, state: FSMContext):
