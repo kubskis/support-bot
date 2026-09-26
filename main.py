@@ -16,9 +16,9 @@ from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton, ForceReply
 )
 
-----------------------------------------------------------------------
-НАСТРОЙКИ
-----------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# НАСТРОЙКИ
+# ----------------------------------------------------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 ADMIN_CHAT_ID = -1003945292994  # ID группы поддержки
@@ -38,9 +38,9 @@ def get_user_mention(user):
     safe_name = html.escape(user.full_name)
     return f'<a href="tg://user?id={user.id}">{safe_name}</a>'
 
-----------------------------------------------------------------------
-БАЗА ДАННЫХ (Supabase / PostgreSQL)
-----------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# БАЗА ДАННЫХ (Supabase / PostgreSQL)
+# ----------------------------------------------------------------------
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL, sslmode="require")
 
@@ -231,9 +231,9 @@ def delete_pending_rejection(prompt_message_id):
     cursor.close()
     conn.close()
 
-----------------------------------------------------------------------
-СОСТОЯНИЯ (FSM)
-----------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# СОСТОЯНИЯ (FSM)
+# ----------------------------------------------------------------------
 class Form(StatesGroup):
     complaint_reason = State()
     complaint_nickname = State()
@@ -245,9 +245,9 @@ class Form(StatesGroup):
     friends_receipt = State()
     question_text = State()
 
-----------------------------------------------------------------------
-КЛАВИАТУРЫ
-----------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# КЛАВИАТУРЫ
+# ----------------------------------------------------------------------
 BTN_COMPLAINT = "🚨 Жалоба на игрока"
 BTN_APPEAL = "😡 Обжалование бана"
 BTN_FRIENDS = "👯‍♀️ Добавление в друзья (VIP)"
@@ -290,9 +290,9 @@ async def start_cmd(message: Message, state: FSMContext):
     )
     await message.answer(welcome_text, reply_markup=main_keyboard(), parse_mode="HTML")
 
-----------------------------------------------------------------------
-ОБРАБОТКА НАЖАТИЙ НА КНОПКИ КЛАВИАТУРЫ
-----------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# ОБРАБОТКА НАЖАТИЙ НА КНОПКИ КЛАВИАТУРЫ
+# ----------------------------------------------------------------------
 @router.message(F.text == BTN_REFRESH, F.chat.type == "private")
 async def refresh_menu_handler(message: Message, state: FSMContext):
     register_user(message.from_user.id)
@@ -329,11 +329,6 @@ async def start_friends(message: Message, state: FSMContext):
     if is_banned(message.from_user.id): return
     await state.clear()
     
-    # ПРИМЕЧАНИЕ: Если вкладка добавления в друзья снова полностью заработает, 
-    # можно убрать технический блок ниже и раскомментировать строчку со стейтом:
-    # await state.set_state(Form.friends_nickname)
-    # await message.answer("1️⃣ <b>Ваш ник в Roblox:</b>\nУкажите ваш точный ник.", parse_mode="HTML")
-
     # Техническое сообщение для вкладки добавления в друзья:
     await message.answer(
         "🛠 <b>Вкладка добавления в друзья находится на технических работах.</b>\n\n"
@@ -350,9 +345,9 @@ async def start_question(message: Message, state: FSMContext):
     await state.set_state(Form.question_text)
     await message.answer("❓ <b>Задайте ваш вопрос одним сообщением:</b>", parse_mode="HTML")
 
-----------------------------------------------------------------------
-СБОР ДАННЫХ В ФОРМАХ (FSM)
-----------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# СБОР ДАННЫХ В ФОРМАХ (FSM)
+# ----------------------------------------------------------------------
 @router.message(Form.complaint_reason)
 async def process_c_reason(message: Message, state: FSMContext):
     await state.update_data(c_reason=message.text)
@@ -436,38 +431,6 @@ async def process_a_reason(message: Message, state: FSMContext):
     await message.answer(f"✅ Ваше обжалование отправлено на рассмотрение! Номер заявки: <b>№{ticket_id}</b>.", parse_mode="HTML", reply_markup=main_keyboard())
     await state.clear()
 
-# --- Логика заполнения заявки на добавление в друзья (если тех. работы будут отключены) ---
-@router.message(Form.friends_nickname)
-async def process_f_nickname(message: Message, state: FSMContext):
-    await state.update_data(f_nickname=message.text)
-    await state.set_state(Form.friends_receipt)
-    await message.answer("2️⃣ <b>Пришлите скриншот подтверждения/чека (если требуется):</b>", parse_mode="HTML")
-
-@router.message(Form.friends_receipt, F.photo)
-async def process_f_receipt(message: Message, state: FSMContext):
-    data = await state.get_data()
-    ticket_id = create_ticket(message.from_user.id)
-    user_mention = get_user_mention(message.from_user)
-    f_nickname = html.escape(data.get('f_nickname', ''))
-
-    admin_text = (
-        f"👯‍♀️ <b>#ДрузьяVIP | Заявка №{ticket_id}</b>\n"
-        f"👤 От: {user_mention} | ID: <code>{message.from_user.id}</code>\n\n"
-        f"1️⃣ <b>Ник:</b> <code>{f_nickname}</code>\n\n"
-        f"🔘 <i>Выберите действие ниже:</i>"
-    )
-
-    sent = await bot.send_photo(
-        ADMIN_CHAT_ID,
-        photo=message.photo[-1].file_id,
-        caption=admin_text,
-        reply_markup=take_ticket_kb(ticket_id),
-        parse_mode="HTML"
-    )
-    map_message(sent.message_id, message.from_user.id, ticket_id)
-    await message.answer(f"✅ Ваша заявка на добавление в друзья отправлена! Номер заявки: <b>№{ticket_id}</b>.", parse_mode="HTML", reply_markup=main_keyboard())
-    await state.clear()
-
 @router.message(Form.question_text)
 async def process_question(message: Message, state: FSMContext):
     ticket_id = create_ticket(message.from_user.id)
@@ -491,9 +454,9 @@ async def process_question(message: Message, state: FSMContext):
     await message.answer(f"✅ Ваш вопрос отправлен поддержке! Номер заявки: <b>№{ticket_id}</b>.", parse_mode="HTML", reply_markup=main_keyboard())
     await state.clear()
 
-----------------------------------------------------------------------
-КНОПКИ В ГРУППЕ: ПРИНЯТЬ И ОТКЛОНИТЬ ЗАЯВКУ
-----------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# КНОПКИ В ГРУППЕ: ПРИНЯТЬ И ОТКЛОНИТЬ ЗАЯВКУ
+# ----------------------------------------------------------------------
 @router.callback_query(F.data.startswith("take_"))
 async def take_ticket_handler(call: CallbackQuery):
     ticket_id = int(call.data.split("_")[1])
@@ -574,9 +537,9 @@ async def close_ticket_handler(call: CallbackQuery):
 
     await call.answer(f"Заявка №{ticket_id} успешно закрыта!")
 
-----------------------------------------------------------------------
-ПЕРЕСЫЛКА СООБЩЕНИЙ ОТ ЮЗЕРА В ГРУППУ
-----------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# ПЕРЕСЫЛКА СООБЩЕНИЙ ОТ ЮЗЕРА В ГРУППУ
+# ----------------------------------------------------------------------
 @router.message(F.chat.type == "private")
 async def user_private_message(message: Message, state: FSMContext):
     register_user(message.from_user.id)
@@ -608,9 +571,9 @@ async def user_private_message(message: Message, state: FSMContext):
         parse_mode="HTML"
     )
 
-----------------------------------------------------------------------
-ОТВЕТ АДМИНА ИЗ ГРУППЫ ПОЛЬЗОВАТЕЛЮ ИЛИ ВВОД ПРИЧИНЫ ОТКАЗА
-----------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# ОТВЕТ АДМИНА ИЗ ГРУППЫ ПОЛЬЗОВАТЕЛЮ ИЛИ ВВОД ПРИЧИНЫ ОТКАЗА
+# ----------------------------------------------------------------------
 @router.message(F.chat.id == ADMIN_CHAT_ID, F.reply_to_message)
 async def admin_reply_in_group(message: Message):
     if message.text and message.text.startswith("/"):
@@ -618,3 +581,117 @@ async def admin_reply_in_group(message: Message):
 
     replied_msg_id = message.reply_to_message.message_id
     pending_ticket_id = get_pending_rejection(replied_msg_id)
+    
+    if pending_ticket_id:
+        ticket_info = get_ticket_info(pending_ticket_id)
+        if ticket_info:
+            user_id = ticket_info[0]
+            reason = html.escape(message.text or "Причина не указана")
+            close_ticket_db(pending_ticket_id, status='rejected')
+            try:
+                await bot.send_message(
+                    user_id,
+                    f"❌ Ваша заявка <b>№{pending_ticket_id}</b> была отклонена администратором.\n\n"
+                    f"<b>Причина:</b> {reason}",
+                    parse_mode="HTML",
+                    reply_markup=main_keyboard()
+                )
+            except Exception:
+                pass
+
+            orig_msg = message.reply_to_message
+            status_text = f"\n\n❌ <b>Заявка отклонена</b>\n<b>Причина:</b> {reason}"
+            if orig_msg.photo:
+                await orig_msg.edit_caption(caption=(orig_msg.caption or "") + status_text, parse_mode="HTML")
+            else:
+                await orig_msg.edit_text(text=(orig_msg.text or "") + status_text, parse_mode="HTML")
+
+        delete_pending_rejection(replied_msg_id)
+        await message.answer("✅ Отказ успешно отправлен пользователю, заявка закрыта.")
+        return
+
+    mapping = get_user_by_group_msg(replied_msg_id)
+    if mapping:
+        user_id, ticket_id = mapping[0], mapping[1]
+        ticket_info = get_ticket_info(ticket_id)
+
+        if ticket_info and ticket_info[2] == 'active' and ticket_info[1] == message.from_user.id:
+            admin_name = html.escape(message.from_user.full_name)
+            admin_text = message.text or message.caption or ""
+            safe_admin_text = html.escape(admin_text)
+            
+            client_msg_text = f"👨‍💻 <b>Ответ от администратора {admin_name}:</b>\n\n{safe_admin_text}"
+
+            try:
+                if message.photo:
+                    await bot.send_photo(user_id, photo=message.photo[-1].file_id, caption=client_msg_text, parse_mode="HTML")
+                else:
+                    await bot.send_message(user_id, client_msg_text, parse_mode="HTML")
+                await message.react([{"type": "emoji", "emoji": "👍"}])
+            except Exception as e:
+                await message.answer(f"❌ Не удалось отправить сообщение пользователю: {e}")
+        else:
+            await message.answer("❌ Этот тикет неактивен или вы не являетесь назначенным администратором этого тикета.")
+
+# ----------------------------------------------------------------------
+# КОМАНДЫ БАНА / РАЗБАНА ДЛЯ АДМИНОВ
+# ----------------------------------------------------------------------
+@router.message(Command("ban"), F.chat.id == ADMIN_CHAT_ID)
+async def cmd_ban(message: Message):
+    args = message.text.split(maxsplit=2)
+    if len(args) < 2:
+        await message.answer("Использование: <code>/ban [user_id] [причина]</code>", parse_mode="HTML")
+        return
+    try:
+        user_id = int(args[1])
+        reason = args[2] if len(args) > 2.2 else "Нарушение правил" # type: ignore
+        ban_user_db(user_id, reason)
+        await message.answer(f"✅ Пользователь <code>{user_id}</code> заблокирован.\nПричина: {html.escape(reason)}", parse_mode="HTML")
+        try:
+            await bot.send_message(user_id, f"❌ Вы заблокированы в поддержке.\n<b>Причина:</b> {html.escape(reason)}", parse_mode="HTML")
+        except Exception:
+            pass
+    except ValueError:
+        await message.answer("❌ Неверный формат user_id.")
+
+@router.message(Command("unban"), F.chat.id == ADMIN_CHAT_ID)
+async def cmd_unban(message: Message):
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer("Использование: <code>/unban [user_id]</code>", parse_mode="HTML")
+        return
+    try:
+        user_id = int(args[1])
+        unban_user_db(user_id)
+        await message.answer(f"✅ Пользователь <code>{user_id}</code> разблокирован.", parse_mode="HTML")
+        try:
+            await bot.send_message(user_id, "✅ Вы были разблокированы в поддержке. Теперь вы снова можете создавать заявки.", parse_mode="HTML", reply_markup=main_keyboard())
+        except Exception:
+            pass
+    except ValueError:
+        await message.answer("❌ Неверный формат user_id.")
+
+# ----------------------------------------------------------------------
+# ЗАПУСК ВЕБ-СЕРВЕРА ДЛЯ RENDER (Health Check)
+# ----------------------------------------------------------------------
+async def handle_ping(request):
+    return web.Response(text="Bot is running!")
+
+async def web_server():
+    app = web.Application()
+    app.router.add_get("/", handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"Веб-сервер запущен на порту {port}")
+
+async def main():
+    await web_server()
+    print("Бот запущен и ожидает сообщения...")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+    
