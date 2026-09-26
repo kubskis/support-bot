@@ -94,6 +94,10 @@ def init_db():
                 review TEXT
             );
         """)
+        # Автоматическое добавление колонки category, если таблица была создана ранее без нее
+        cursor.execute("""
+            ALTER TABLE tickets ADD COLUMN IF NOT EXISTS category TEXT DEFAULT 'general';
+        """)
         conn.commit()
         cursor.close()
         conn.close()
@@ -163,7 +167,6 @@ def get_tickets_stats():
         cursor.execute("SELECT COUNT(*) FROM tickets WHERE status = 'rejected'")
         rejected = cursor.fetchone()[0]
         
-        # Считаем средний рейтинг, исключая оценки Главного админа (чтобы тесты не портили стату)
         cursor.execute("SELECT COALESCE(AVG(score), 0) FROM ratings WHERE user_id != %s", (ADMIN_ID,))
         avg_rating = cursor.fetchone()[0]
         
@@ -672,7 +675,6 @@ async def process_rating(call: CallbackQuery, state: FSMContext):
     ticket_info = get_ticket_info(ticket_id)
     admin_id = ticket_info[1] if ticket_info else 0
 
-    # Сохраняем оценку в базу данных (даже если это ставит Главный админ для тестов)
     save_rating_db(ticket_id, user_id, admin_id, score)
 
     if ADMIN_ID and user_id == ADMIN_ID:
