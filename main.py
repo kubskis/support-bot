@@ -21,7 +21,7 @@ from fastapi import FastAPI
 import uvicorn
 
 # Токен и ID главного администратора из переменных окружения
-TOKEN = os.getenv("TOKEN")
+TOKEN = os.getenv("BOT_TOKEN")
 SUPER_ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
 # Включаем логирование
