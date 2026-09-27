@@ -63,7 +63,6 @@ def get_user_mention(user):
     return f'<a href="tg://user?id={user.id}">{safe_name}</a>'
 
 def is_night_time() -> bool:
-    """Проверяет, попадает ли текущее время в диапазон 22:00 - 10:00 по МСК"""
     now_msk = datetime.now(MSK_TZ)
     hour = now_msk.hour
     return hour >= 22 or hour < 10
@@ -134,6 +133,7 @@ def get_db():
 def _init_db_sync():
     with get_db() as conn:
         with conn.cursor() as cursor:
+            # Основные таблицы поддержки
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     user_id BIGINT PRIMARY KEY
@@ -182,6 +182,32 @@ def _init_db_sync():
                     agent_number INTEGER UNIQUE
                 );
             """)
+
+            # Таблицы публикатора секреток
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS secret_publishers (
+                    user_id BIGINT PRIMARY KEY
+                );
+                CREATE TABLE IF NOT EXISTS secret_channels (
+                    user_id BIGINT PRIMARY KEY,
+                    channel_id TEXT
+                );
+                CREATE TABLE IF NOT EXISTS secret_types (
+                    name TEXT PRIMARY KEY,
+                    declined TEXT
+                );
+                CREATE TABLE IF NOT EXISTS secret_posts (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT,
+                    channel_id TEXT,
+                    message_id BIGINT,
+                    secret_type TEXT,
+                    base_text TEXT,
+                    is_expired BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+
             cursor.execute("""
                 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS category TEXT DEFAULT 'general';
                 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP;
@@ -190,6 +216,7 @@ def _init_db_sync():
                 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS reminded_idle BOOLEAN DEFAULT FALSE;
                 ALTER TABLE pending_rejections ADD COLUMN IF NOT EXISTS card_message_id BIGINT;
             """)
+
             if OWNER_ID:
                 cursor.execute(
                     "INSERT INTO main_admins (admin_id) VALUES (%s) ON CONFLICT (admin_id) DO NOTHING",
@@ -199,6 +226,39 @@ def _init_db_sync():
                     "INSERT INTO admin_agents (admin_id, agent_number) VALUES (%s, 1) ON CONFLICT (admin_id) DO NOTHING",
                     (OWNER_ID,)
                 )
+
+            # Дефолтные значения секреток
+            default_types = [("Лапка", "лапки"), ("Сердечко", "сердечка"), ("Тропы", "троп")]
+            for s_name, s_dec in default_types:
+                cursor.execute("INSERT INTO secret_types (name, declined) VALUES (%s, %s) ON CONFLICT (name) DO NOTHING", (s_name, s_dec))
+
+            cursor.execute("INSERT INTO settings (key, value) VALUES ('timer_seconds', '510') ON CONFLICT (key) DO NOTHING")
+
+            default_active_template = (
+                "❕Секретка❕\n"
+                "Секретка: [Тип_Секретки]\n\n"
+                "Правила:\n"
+                "1. Не ускорять\n"
+                "2. Выйти с сервера после получения [Склоненный_Тип]\n"
+                "3. Не покупать негативные мутаторы\n"
+                "4. Не подниматься выше уровня над секреткой и не идти к воротам ускорения\n"
+                "При несоблюдении правил, вы получите бан.\n"
+                "Обжаловать бан можно в <a href='https://t.me/ToHSecrets_bot'>поддержке</a>!\n\n"
+                "Секретка: [Ссылка]\n\n"
+                "🤍Наш <a href='https://t.me/SecretsToH'>чат</a> | Наш <a href='https://t.me/ToHSecretss'>канал</a> | Наш <a href='https://t.me/ToHSecrets_bot'>бот</a>🤍"
+            )
+            cursor.execute("INSERT INTO settings (key, value) VALUES ('template_active', %s) ON CONFLICT (key) DO NOTHING", (default_active_template,))
+
+            default_expired_template = (
+                "❕Секретка❕\n"
+                "Секретка: [Тип_Секретки]\n\n"
+                "Секретка: Время вышло! В канале еще будут секретки и вы успеете попасть на них🤍\n\n"
+                "🤍Наш <a href='https://t.me/SecretsToH'>чат</a> | "
+                "Наш <a href='https://t.me/ToHSecretss'>канал</a> | "
+                "Наш <a href='https://t.me/ToHSecrets_bot'>бот</a>🤍"
+            )
+            cursor.execute("INSERT INTO settings (key, value) VALUES ('template_expired', %s) ON CONFLICT (key) DO NOTHING", (default_expired_template,))
+
     logging.info("База данных успешно инициализирована.")
 
 _init_db_sync()
@@ -211,6 +271,18 @@ async def is_main_admin(user_id: int) -> bool:
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT admin_id FROM main_admins WHERE admin_id = %s", (user_id,))
+                return cur.fetchone() is not None
+    try:
+        return await asyncio.to_thread(_query)
+    except Exception:
+        return False
+
+async def is_secret_publisher(user_id: int) -> bool:
+    """Проверяет, выдан ли пользователю доступ к публикации секреток"""
+    def _query():
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT user_id FROM secret_publishers WHERE user_id = %s", (user_id,))
                 return cur.fetchone() is not None
     try:
         return await asyncio.to_thread(_query)
@@ -488,8 +560,57 @@ async def delete_pending_rejection(prompt_message_id: int):
     await asyncio.to_thread(_query)
 
 # ----------------------------------------------------------------------
-# АВТООЧИСТКА ЗАКРЫТЫХ ТИКЕТОВ ЧЕРЕЗ 1 ЧАС
+# ФУНКЦИИ И ХЕЛПЕРЫ ДЛЯ СЕКРЕТОК (SUPABASE)
 # ----------------------------------------------------------------------
+async def get_secret_types_dict() -> dict:
+    def _query():
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT name, declined FROM secret_types")
+                return {row[0]: row[1] for row in cur.fetchall()}
+    return await asyncio.to_thread(_query)
+
+async def check_channel_rights(bot: Bot, user_id: int) -> str | None:
+    def _query():
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT channel_id FROM secret_channels WHERE user_id = %s", (user_id,))
+                row = cur.fetchone()
+                return row[0] if row else None
+    ch_id = await asyncio.to_thread(_query)
+    if not ch_id:
+        return None
+
+    try:
+        b_mem = await bot.get_chat_member(chat_id=ch_id, user_id=bot.id)
+        if b_mem.status not in ["administrator", "creator"]:
+            return None
+        u_mem = await bot.get_chat_member(chat_id=ch_id, user_id=user_id)
+        if u_mem.status not in ["administrator", "creator"]:
+            def _del():
+                with get_db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("DELETE FROM secret_channels WHERE user_id = %s", (user_id,))
+            await asyncio.to_thread(_del)
+            return None
+        return ch_id
+    except Exception:
+        return None
+
+async def expire_secret_post(bot: Bot, post_id: int, channel_id: str, message_id: int, s_type: str):
+    def _mark():
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE secret_posts SET is_expired = TRUE WHERE id = %s", (post_id,))
+    await asyncio.to_thread(_mark)
+
+    expired_tmpl = await get_setting("template_expired", "❕Секретка❕\nСекретка: [Тип_Секретки]\n\nВремя вышло!")
+    final_text = expired_tmpl.replace("[Тип_Секретки]", s_type)
+    try:
+        await bot.edit_message_caption(chat_id=channel_id, message_id=message_id, caption=final_text, parse_mode="HTML")
+    except Exception as e:
+        logging.error(f"Не удалось обновить истекший пост №{post_id}: {e}")
+
 async def schedule_ticket_cleanup(ticket_id: int, card_message_id: int = None):
     await asyncio.sleep(3600)
     try:
@@ -533,6 +654,22 @@ class Form(StatesGroup):
     add_main_admin_id = State()
     del_main_admin_id = State()
 
+class SecretPublisherStates(StatesGroup):
+    waiting_for_channel = State()
+    waiting_for_type = State()
+    waiting_for_photo = State()
+    waiting_for_link = State()
+    waiting_for_confirm = State()
+
+class SecretAdminStates(StatesGroup):
+    add_publisher_id = State()
+    del_publisher_id = State()
+    add_type_name = State()
+    add_type_declined = State()
+    set_timer = State()
+    template_active = State()
+    template_expired = State()
+
 # ----------------------------------------------------------------------
 # КЛАВИАТУРЫ
 # ----------------------------------------------------------------------
@@ -544,14 +681,21 @@ BTN_HELPER_APPLY = "📝 Подать заявку на хелпера"
 BTN_SECRET_APPLY = "🔍 Набор в искатели секреток"
 BTN_ADMIN_PANEL = "⚙️ Админ-панель"
 BTN_REFRESH = "🔄 Перезагрузить меню"
+BTN_SECRETS = "🔮 Секретки"
 
 async def main_keyboard(user_id: int):
     keyboard = [
         [KeyboardButton(text=BTN_COMPLAINT), KeyboardButton(text=BTN_APPEAL)],
         [KeyboardButton(text=BTN_FRIENDS), KeyboardButton(text=BTN_QUESTION)],
-        [KeyboardButton(text=BTN_HELPER_APPLY), KeyboardButton(text=BTN_SECRET_APPLY)],
-        [KeyboardButton(text=BTN_REFRESH)]
+        [KeyboardButton(text=BTN_HELPER_APPLY), KeyboardButton(text=BTN_SECRET_APPLY)]
     ]
+    
+    # Кнопка "Секретки" ТОЛЬКО если человек есть в secret_publishers
+    if await is_secret_publisher(user_id):
+        keyboard.append([KeyboardButton(text=BTN_SECRETS)])
+
+    keyboard.append([KeyboardButton(text=BTN_REFRESH)])
+
     if await is_main_admin(user_id):
         keyboard.append([KeyboardButton(text=BTN_ADMIN_PANEL)])
 
@@ -567,13 +711,32 @@ async def admin_panel_kb():
     secret_status = "🟢 Вкл" if s_active == "true" else "🔴 Выкл"
     
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📊 Общая статистика", callback_data="adm_stats"),
-         InlineKeyboardButton(text="👥 Статистика по админам", callback_data="adm_list_stats")],
+        [InlineKeyboardButton(text="📊 Статистика поддержки", callback_data="adm_stats"),
+         InlineKeyboardButton(text="👥 Статистика хелперов", callback_data="adm_list_stats")],
         [InlineKeyboardButton(text=f"👯‍♀️ Добавление в друзья: {friend_status}", callback_data="toggle_friend")],
         [InlineKeyboardButton(text=f"📝 Набор в хелперы: {helper_status}", callback_data="toggle_helper")],
         [InlineKeyboardButton(text=f"🔍 Искатели секреток: {secret_status}", callback_data="toggle_secret")],
-        [InlineKeyboardButton(text="👑 Управление главными админами", callback_data="manage_main_admins")],
-        [InlineKeyboardButton(text="✏️ Изменить ник для друзей", callback_data="change_friend_nick")]
+        [InlineKeyboardButton(text="👑 Главные админы поддержки", callback_data="manage_main_admins")],
+        [InlineKeyboardButton(text="✏️ Ник для друзей", callback_data="change_friend_nick")],
+        [InlineKeyboardButton(text="🔮 Управление Секретками (Панель)", callback_data="adm_secret_panel")]
+    ])
+
+def secret_admin_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👥 Управление публикаторами", callback_data="sec_manage_pubs")],
+        [InlineKeyboardButton(text="📊 Статистика постов (24ч)", callback_data="sec_stats")],
+        [InlineKeyboardButton(text="📝 Редактировать шаблоны", callback_data="sec_templates")],
+        [InlineKeyboardButton(text="➕ Добавить тип", callback_data="sec_add_type"),
+         InlineKeyboardButton(text="🗑 Удалить тип", callback_data="sec_del_type")],
+        [InlineKeyboardButton(text="⏱ Настроить таймер", callback_data="sec_set_timer")],
+        [InlineKeyboardButton(text="🔙 Назад в админку", callback_data="back_to_adm")]
+    ])
+
+def publisher_menu_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📥 Отправить секретку", callback_data="pub_send_secret")],
+        [InlineKeyboardButton(text="📋 Мои активные посты", callback_data="pub_my_posts")],
+        [InlineKeyboardButton(text="📢 Привязать канал", callback_data="pub_bind_channel")]
     ])
 
 def take_ticket_kb(ticket_id: int):
@@ -844,6 +1007,423 @@ async def save_friend_nick(message: Message, state: FSMContext):
     await state.clear()
     kb = await main_keyboard(message.from_user.id)
     await message.answer("<tg-emoji emoji-id='5346300789558101141'>🔥</tg-emoji> Ник успешно изменен!", reply_markup=kb)
+
+# ----------------------------------------------------------------------
+# АДМИН-ПАНЕЛЬ: УПРАВЛЕНИЕ СЕКРЕТКАМИ
+# ----------------------------------------------------------------------
+@router.callback_query(F.data == "adm_secret_panel")
+async def adm_secret_panel(call: CallbackQuery):
+    if not await is_main_admin(call.from_user.id): return
+    dur = await get_setting("timer_seconds", "510")
+    dur_int = int(dur) if dur.isdigit() else 510
+    m, s = dur_int // 60, dur_int % 60
+    text = (
+        f"🔮 <b>Панель управления секретками</b>\n\n"
+        f"⏱ Таймер удаления ссылки: <b>{m} мин. {s} сек.</b> (<code>{dur_int}</code> сек.)\n"
+        f"Настройте нужные параметры ниже:"
+    )
+    await call.message.edit_text(text, reply_markup=secret_admin_kb(), parse_mode="HTML")
+    await call.answer()
+
+@router.callback_query(F.data == "sec_manage_pubs")
+async def sec_manage_pubs(call: CallbackQuery):
+    if not await is_main_admin(call.from_user.id): return
+    def _query():
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT user_id FROM secret_publishers")
+                return [r[0] for r in cur.fetchall()]
+    pubs = await asyncio.to_thread(_query)
+    text = "👥 <b>Список публикаторов секреток:</b>\n\n"
+    if pubs:
+        for p in pubs:
+            text += f"• <code>{p}</code>\n"
+    else:
+        text += "<i>Список пуст (кнопка 'Секретки' никому не видна).</i>\n"
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить публикатора", callback_data="sec_add_pub")],
+        [InlineKeyboardButton(text="➖ Удалить публикатора", callback_data="sec_del_pub")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="adm_secret_panel")]
+    ])
+    await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    await call.answer()
+
+@router.callback_query(F.data == "sec_add_pub")
+async def sec_add_pub_prompt(call: CallbackQuery, state: FSMContext):
+    if not await is_main_admin(call.from_user.id): return
+    await state.set_state(SecretAdminStates.add_publisher_id)
+    await call.message.answer("➕ Введите <b>Telegram ID</b> пользователя, которому хотите выдать доступ к секреткам:", parse_mode="HTML")
+    await call.answer()
+
+@router.message(SecretAdminStates.add_publisher_id)
+async def sec_add_pub_proc(message: Message, state: FSMContext):
+    if not await is_main_admin(message.from_user.id): return
+    try:
+        t_id = int(message.text.strip())
+        def _q():
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("INSERT INTO secret_publishers (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING", (t_id,))
+        await asyncio.to_thread(_q)
+        await state.clear()
+        kb = await main_keyboard(message.from_user.id)
+        await message.answer(f"✅ Пользователь <code>{t_id}</code> добавлен в публикаторы! У него появится кнопка '🔮 Секретки'.", reply_markup=kb, parse_mode="HTML")
+    except ValueError:
+        await message.answer("❌ Введите корректный числовой ID.")
+
+@router.callback_query(F.data == "sec_del_pub")
+async def sec_del_pub_prompt(call: CallbackQuery, state: FSMContext):
+    if not await is_main_admin(call.from_user.id): return
+    await state.set_state(SecretAdminStates.del_publisher_id)
+    await call.message.answer("➖ Введите <b>Telegram ID</b> пользователя для отзыва прав публикатора:", parse_mode="HTML")
+    await call.answer()
+
+@router.message(SecretAdminStates.del_publisher_id)
+async def sec_del_pub_proc(message: Message, state: FSMContext):
+    if not await is_main_admin(message.from_user.id): return
+    try:
+        t_id = int(message.text.strip())
+        def _q():
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("DELETE FROM secret_publishers WHERE user_id = %s", (t_id,))
+        await asyncio.to_thread(_q)
+        await state.clear()
+        kb = await main_keyboard(message.from_user.id)
+        await message.answer(f"✅ Пользователь <code>{t_id}</code> удален из публикаторов.", reply_markup=kb, parse_mode="HTML")
+    except ValueError:
+        await message.answer("❌ Введите корректный числовой ID.")
+
+@router.callback_query(F.data == "sec_stats")
+async def sec_stats(call: CallbackQuery):
+    if not await is_main_admin(call.from_user.id): return
+    def _query():
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT user_id, COUNT(*) FROM secret_posts
+                    WHERE created_at >= CURRENT_TIMESTAMP - INTERVAL '24 hours'
+                    GROUP BY user_id
+                """)
+                return cur.fetchall()
+    stats = await asyncio.to_thread(_query)
+    text = "📊 <b>Статистика публикаций за последние 24 часа:</b>\n\n"
+    if stats:
+        for u_id, cnt in stats:
+            text += f"• <code>{u_id}</code>: <b>{cnt}</b> постов\n"
+    else:
+        text += "<i>За последние 24 часа постов не публиковалось.</i>"
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="adm_secret_panel")]])
+    await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    await call.answer()
+
+@router.callback_query(F.data == "sec_set_timer")
+async def sec_set_timer(call: CallbackQuery, state: FSMContext):
+    if not await is_main_admin(call.from_user.id): return
+    await state.set_state(SecretAdminStates.set_timer)
+    await call.message.answer("⏱ Введите новое время таймера <b>в секундах</b> (например, <code>510</code> для 8.5 минут):", parse_mode="HTML")
+    await call.answer()
+
+@router.message(SecretAdminStates.set_timer)
+async def sec_set_timer_proc(message: Message, state: FSMContext):
+    if not await is_main_admin(message.from_user.id): return
+    if not message.text.isdigit():
+        await message.answer("❌ Введите число секунд:")
+        return
+    await set_setting("timer_seconds", message.text.strip())
+    await state.clear()
+    kb = await main_keyboard(message.from_user.id)
+    await message.answer(f"✅ Время таймера установлено на <code>{message.text.strip()}</code> сек!", reply_markup=kb, parse_mode="HTML")
+
+@router.callback_query(F.data == "sec_templates")
+async def sec_templates(call: CallbackQuery):
+    if not await is_main_admin(call.from_user.id): return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Активный пост", callback_data="sec_tmpl_act")],
+        [InlineKeyboardButton(text="✏️ Истекший пост", callback_data="sec_tmpl_exp")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="adm_secret_panel")]
+    ])
+    await call.message.edit_text("📝 <b>Редактирование шаблонов:</b>\n\nВыберите нужный шаблон:", reply_markup=kb, parse_mode="HTML")
+    await call.answer()
+
+@router.callback_query(F.data == "sec_tmpl_act")
+async def sec_tmpl_act(call: CallbackQuery, state: FSMContext):
+    if not await is_main_admin(call.from_user.id): return
+    tmpl = await get_setting("template_active")
+    await state.set_state(SecretAdminStates.template_active)
+    await call.message.answer(f"📝 <b>Текущий шаблон активного поста:</b>\n\n<pre>{html.escape(tmpl)}</pre>\n\nОтправьте новый текст (доступны теги <code>[Тип_Секретки]</code>, <code>[Склоненный_Тип]</code>, <code>[Ссылка]</code>):", parse_mode="HTML")
+    await call.answer()
+
+@router.message(SecretAdminStates.template_active)
+async def sec_tmpl_act_proc(message: Message, state: FSMContext):
+    if not await is_main_admin(message.from_user.id): return
+    await set_setting("template_active", message.text)
+    await state.clear()
+    kb = await main_keyboard(message.from_user.id)
+    await message.answer("✅ Шаблон активного поста обновлен!", reply_markup=kb)
+
+@router.callback_query(F.data == "sec_tmpl_exp")
+async def sec_tmpl_exp(call: CallbackQuery, state: FSMContext):
+    if not await is_main_admin(call.from_user.id): return
+    tmpl = await get_setting("template_expired")
+    await state.set_state(SecretAdminStates.template_expired)
+    await call.message.answer(f"📝 <b>Текущий шаблон истекшего поста:</b>\n\n<pre>{html.escape(tmpl)}</pre>\n\nОтправьте новый текст (доступен тег <code>[Тип_Секретки]</code>):", parse_mode="HTML")
+    await call.answer()
+
+@router.message(SecretAdminStates.template_expired)
+async def sec_tmpl_exp_proc(message: Message, state: FSMContext):
+    if not await is_main_admin(message.from_user.id): return
+    await set_setting("template_expired", message.text)
+    await state.clear()
+    kb = await main_keyboard(message.from_user.id)
+    await message.answer("✅ Шаблон истекшего поста обновлен!", reply_markup=kb)
+
+@router.callback_query(F.data == "sec_add_type")
+async def sec_add_type(call: CallbackQuery, state: FSMContext):
+    if not await is_main_admin(call.from_user.id): return
+    await state.set_state(SecretAdminStates.add_type_name)
+    await call.message.answer("➕ Введите название нового типа (например, <code>Звезда</code>):", parse_mode="HTML")
+    await call.answer()
+
+@router.message(SecretAdminStates.add_type_name)
+async def sec_add_type_name_proc(message: Message, state: FSMContext):
+    if not await is_main_admin(message.from_user.id): return
+    await state.update_data(new_t_name=message.text.strip())
+    await state.set_state(SecretAdminStates.add_type_declined)
+    await message.answer("Введите форму родительного падежа (например, <code>звезды</code>):", parse_mode="HTML")
+
+@router.message(SecretAdminStates.add_type_declined)
+async def sec_add_type_dec_proc(message: Message, state: FSMContext):
+    if not await is_main_admin(message.from_user.id): return
+    data = await state.get_data()
+    t_name = data["new_t_name"]
+    t_dec = message.text.strip()
+    def _q():
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO secret_types (name, declined) VALUES (%s, %s) ON CONFLICT (name) DO UPDATE SET declined = EXCLUDED.declined", (t_name, t_dec))
+    await asyncio.to_thread(_q)
+    await state.clear()
+    kb = await main_keyboard(message.from_user.id)
+    await message.answer(f"✅ Тип секретки <b>{t_name}</b> успешно добавлен!", reply_markup=kb, parse_mode="HTML")
+
+@router.callback_query(F.data == "sec_del_type")
+async def sec_del_type(call: CallbackQuery):
+    if not await is_main_admin(call.from_user.id): return
+    types_d = await get_secret_types_dict()
+    buttons = []
+    for k in types_d.keys():
+        buttons.append([InlineKeyboardButton(text=f"🗑 {k}", callback_data=f"sec_rmtype_{k}")])
+    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="adm_secret_panel")])
+    await call.message.edit_text("🗑 Выберите тип секретки для удаления:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await call.answer()
+
+@router.callback_query(F.data.startswith("sec_rmtype_"))
+async def sec_rmtype_proc(call: CallbackQuery):
+    if not await is_main_admin(call.from_user.id): return
+    t_name = call.data.split("_", 2)[2]
+    def _q():
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM secret_types WHERE name = %s", (t_name,))
+    await asyncio.to_thread(_q)
+    await call.message.edit_text(f"✅ Тип секретки <b>{t_name}</b> удален.", parse_mode="HTML")
+    await call.answer()
+
+# ----------------------------------------------------------------------
+# ПУБЛИКАЦИЯ СЕКРЕТОК (МЕНЮ И FSM)
+# ----------------------------------------------------------------------
+@router.message(F.text == BTN_SECRETS, F.chat.type == "private")
+async def open_secrets_menu(message: Message, state: FSMContext):
+    if not await is_secret_publisher(message.from_user.id):
+        return
+    await state.clear()
+    await message.answer(
+        "🔮 <b>Панель публикации секреток</b>\n\nВыберите нужное действие:",
+        reply_markup=publisher_menu_kb(),
+        parse_mode="HTML"
+    )
+
+@router.callback_query(F.data == "pub_bind_channel")
+async def pub_bind_channel_prompt(call: CallbackQuery, state: FSMContext):
+    if not await is_secret_publisher(call.from_user.id): return
+    await state.set_state(SecretPublisherStates.waiting_for_channel)
+    await call.message.answer(
+        "📢 Отправьте <b>@username</b> канала (например, <code>@my_channel</code>).\n"
+        "<i>Убедитесь, что бот добавлен туда администратором с правом публикации!</i>",
+        parse_mode="HTML"
+    )
+    await call.answer()
+
+@router.message(SecretPublisherStates.waiting_for_channel)
+async def pub_bind_channel_proc(message: Message, state: FSMContext):
+    if not await is_secret_publisher(message.from_user.id): return
+    ch_input = message.text.strip()
+    user_id = message.from_user.id
+    try:
+        b_mem = await bot.get_chat_member(chat_id=ch_input, user_id=bot.id)
+        if b_mem.status not in ["administrator", "creator"]:
+            await message.answer("❌ Бот не является админом в этом канале!")
+            return
+        u_mem = await bot.get_chat_member(chat_id=ch_input, user_id=user_id)
+        if u_mem.status not in ["administrator", "creator"]:
+            await message.answer("❌ Вы не админ этого канала!")
+            return
+        def _q():
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO secret_channels (user_id, channel_id) VALUES (%s, %s) "
+                        "ON CONFLICT (user_id) DO UPDATE SET channel_id = EXCLUDED.channel_id",
+                        (user_id, ch_input)
+                    )
+        await asyncio.to_thread(_q)
+        await state.clear()
+        kb = await main_keyboard(user_id)
+        await message.answer(f"✅ Канал <b>{ch_input}</b> успешно привязан!", reply_markup=kb, parse_mode="HTML")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка проверки канала: {e}")
+
+@router.callback_query(F.data == "pub_my_posts")
+async def pub_my_posts(call: CallbackQuery):
+    if not await is_secret_publisher(call.from_user.id): return
+    def _q():
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, secret_type, message_id FROM secret_posts "
+                    "WHERE user_id = %s AND is_expired = FALSE ORDER BY id DESC",
+                    (call.from_user.id,)
+                )
+                return cur.fetchall()
+    posts = await asyncio.to_thread(_q)
+    if not posts:
+        await call.message.answer("📭 У вас нет активных опубликованных постов.")
+        await call.answer()
+        return
+    kb_bts = []
+    for pid, stype, mid in posts:
+        kb_bts.append([InlineKeyboardButton(text=f"📌 {stype} (ID: {mid}) — Завершить", callback_data=f"pub_close_{pid}")])
+    await call.message.answer("📋 Ваши активные посты:\nНажмите, чтобы досрочно удалить ссылку в канале:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_bts))
+    await call.answer()
+
+@router.callback_query(F.data.startswith("pub_close_"))
+async def pub_close_post(call: CallbackQuery):
+    if not await is_secret_publisher(call.from_user.id): return
+    pid = int(call.data.split("_")[2])
+    def _q():
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT channel_id, message_id, secret_type, is_expired FROM secret_posts WHERE id = %s", (pid,))
+                return cur.fetchone()
+    row = await asyncio.to_thread(_q)
+    if not row or row[3]:
+        await call.answer("⚠️ Пост уже завершен или не найден!", show_alert=True)
+        return
+    await expire_secret_post(bot, pid, row[0], row[1], row[2])
+    await call.message.edit_text("✅ Пост закрыт досрочно (ссылка стёрта).")
+    await call.answer()
+
+@router.callback_query(F.data == "pub_send_secret")
+async def pub_send_secret(call: CallbackQuery, state: FSMContext):
+    if not await is_secret_publisher(call.from_user.id): return
+    ch_id = await check_channel_rights(bot, call.from_user.id)
+    if not ch_id:
+        await call.message.answer("❌ Сначала привяжите канал через меню секреток!", reply_markup=publisher_menu_kb())
+        await call.answer()
+        return
+    types_d = await get_secret_types_dict()
+    if not types_d:
+        await call.message.answer("❌ В базе нет типов секреток. Обратитесь к создателю.")
+        await call.answer()
+        return
+    buttons = []
+    for s_name in types_d.keys():
+        buttons.append([InlineKeyboardButton(text=f"🔹 {s_name}", callback_data=f"pub_settype_{s_name}")])
+    await call.message.edit_text("Выберите тип секретки:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await state.set_state(SecretPublisherStates.waiting_for_type)
+    await call.answer()
+
+@router.callback_query(SecretPublisherStates.waiting_for_type, F.data.startswith("pub_settype_"))
+async def pub_settype(call: CallbackQuery, state: FSMContext):
+    stype = call.data.split("_", 2)[2]
+    await state.update_data(secret_type=stype)
+    await call.message.edit_text(f"Выбрано: <b>{stype}</b>\n\nТеперь отправьте <b>фотографию</b> секретки:", parse_mode="HTML")
+    await state.set_state(SecretPublisherStates.waiting_for_photo)
+    await call.answer()
+
+@router.message(SecretPublisherStates.waiting_for_photo, F.photo)
+async def pub_photo(message: Message, state: FSMContext):
+    await state.update_data(photo_id=message.photo[-1].file_id)
+    await message.answer("Отлично! Теперь отправьте **ссылку на VIP-сервер** Roblox:")
+    await state.set_state(SecretPublisherStates.waiting_for_link)
+
+@router.message(SecretPublisherStates.waiting_for_link, F.text)
+async def pub_link(message: Message, state: FSMContext):
+    raw = message.text.strip()
+    clean = re.sub(r'\s+', '', raw)
+    if "roblox.com/share?code=" not in clean or not clean.endswith("type=Server"):
+        await message.answer("❌ Отправьте корректную ссылку именно на VIP-сервер Roblox.")
+        return
+    await state.update_data(link=clean)
+    data = await state.get_data()
+    stype = data["secret_type"]
+    types_d = await get_secret_types_dict()
+    dec = types_d.get(stype, stype)
+    tmpl = await get_setting("template_active")
+    preview = (
+        tmpl.replace("[Тип_Секретки]", stype)
+            .replace("[Склоненный_Тип]", dec)
+            .replace("[Ссылка]", clean)
+    )
+    conf_kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Опубликовать", callback_data="pub_conf_yes"),
+        InlineKeyboardButton(text="❌ Отмена", callback_data="pub_conf_no")
+    ]])
+    await message.answer("Предпросмотр поста:")
+    await message.answer_photo(photo=data["photo_id"], caption=preview, reply_markup=conf_kb, parse_mode="HTML")
+    await state.set_state(SecretPublisherStates.waiting_for_confirm)
+
+@router.callback_query(SecretPublisherStates.waiting_for_confirm, F.data.startswith("pub_conf_"))
+async def pub_confirm(call: CallbackQuery, state: FSMContext):
+    action = call.data.split("_")[2]
+    if action == "yes":
+        ch_id = await check_channel_rights(bot, call.from_user.id)
+        if not ch_id:
+            await call.message.edit_caption(caption="❌ Ошибка: нет доступа к привязанному каналу!", reply_markup=None)
+            await state.clear()
+            await call.answer()
+            return
+        data = await state.get_data()
+        stype = data["secret_type"]
+        types_d = await get_secret_types_dict()
+        dec = types_d.get(stype, stype)
+        tmpl = await get_setting("template_active")
+        final_txt = (
+            tmpl.replace("[Тип_Секретки]", stype)
+                .replace("[Склоненный_Тип]", dec)
+                .replace("[Ссылка]", data["link"])
+        )
+        try:
+            sent = await bot.send_photo(chat_id=ch_id, photo=data["photo_id"], caption=final_txt, parse_mode="HTML")
+            def _save():
+                with get_db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "INSERT INTO secret_posts (user_id, channel_id, message_id, secret_type, base_text) "
+                            "VALUES (%s, %s, %s, %s, %s) RETURNING id",
+                            (call.from_user.id, ch_id, sent.message_id, stype, final_txt)
+                        )
+                        return cur.fetchone()[0]
+            await asyncio.to_thread(_save)
+            await call.message.edit_caption(caption="✅ Пост успешно опубликован в канале!", reply_markup=None)
+        except Exception as e:
+            await call.message.edit_caption(caption=f"❌ Ошибка публикации: {e}", reply_markup=None)
+    else:
+        await call.message.edit_caption(caption="❌ Публикация отменена.", reply_markup=None)
+    await state.clear()
+    await call.answer()
 
 # ----------------------------------------------------------------------
 # СИСТЕМА НАБОРА В ХЕЛПЕРЫ И ИСКАТЕЛИ СЕКРЕТОВ
@@ -1564,8 +2144,36 @@ async def admin_reply_in_group(message: Message):
                 await message.answer(f"❌ Ошибка отправки: {e}")
 
 # ----------------------------------------------------------------------
-# ФОНОВЫЙ ВОРКЕР НАПОМИНАНИЙ (ТАЙМАУТЫ НА ОБРАБОТКУ)
+# ФОНОВЫЕ ВОРКЕРЫ: НАПОМИНАНИЯ И ИСТЕЧЕНИЕ СЕКРЕТОК
 # ----------------------------------------------------------------------
+async def secret_timer_worker():
+    """Фоновый воркер: автоматически истекает посты секреток через timer_seconds"""
+    logging.info("Фоновый воркер секреток запущен.")
+    while True:
+        try:
+            timer_sec = await get_setting("timer_seconds", "510")
+            dur = int(timer_sec) if timer_sec.isdigit() else 510
+
+            def _get_expired_posts():
+                with get_db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            SELECT id, channel_id, message_id, secret_type
+                            FROM secret_posts
+                            WHERE is_expired = FALSE
+                              AND created_at <= CURRENT_TIMESTAMP - (%s * INTERVAL '1 second')
+                        """, (dur,))
+                        return cur.fetchall()
+
+            expired_rows = await asyncio.to_thread(_get_expired_posts)
+            for pid, ch_id, mid, stype in expired_rows:
+                await expire_secret_post(bot, pid, ch_id, mid, stype)
+
+        except Exception as err:
+            logging.error(f"Ошибка в secret_timer_worker: {err}")
+
+        await asyncio.sleep(15)
+
 async def reminder_worker():
     """Фоновая проверка тикетов на зависание и отсутствие ответа"""
     logging.info("Фоновый воркер напоминаний запущен.")
@@ -1668,6 +2276,7 @@ async def web_server():
 async def main():
     await web_server()
     asyncio.create_task(reminder_worker())
+    asyncio.create_task(secret_timer_worker())
     logging.info("Бот успешно запущен и готов к работе!")
     await dp.start_polling(bot)
 
