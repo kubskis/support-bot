@@ -1202,7 +1202,6 @@ async def cmd_ban_reply(message: Message):
                 if active:
                     ticket_id = active[0]
 
-    # Если ID не найден через реплай, проверяем аргумент команды (например, /ban 123456789 причина)
     if not user_id:
         args = message.text.split(maxsplit=2)
         if len(args) > 1 and args[1].isdigit():
@@ -1215,15 +1214,9 @@ async def cmd_ban_reply(message: Message):
         await message.answer("❌ Не удалось определить пользователя. Ответьте командой `/ban [причина]` на сообщение пользователя или карточку тикета, либо используйте `/ban ID причина`.", parse_mode="HTML")
         return
 
-    args = message.text.split(maxsplit=2)
-    # Определяем индекс для причины в зависимости от способа вызова
-    reason_idx = 2 if (message.reply_to_message and not message.text.split(maxsplit=1)[1].startswith(str(user_id))) else 2
-    
-    # Более надежный срез текста для причины
     parts = message.text.split(maxsplit=1)
     reason = "Нарушение правил"
     if len(parts) > 1:
-        # Если передан ID первым словом
         sub_parts = parts[1].split(maxsplit=1)
         if sub_parts[0].isdigit() and not message.reply_to_message:
             reason = sub_parts[1] if len(sub_parts) > 1 else "Нарушение правил"
@@ -1284,4 +1277,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
+        
