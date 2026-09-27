@@ -8,6 +8,7 @@ import psycopg2
 from psycopg2 import pool
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -1076,7 +1077,7 @@ async def process_rating(call: CallbackQuery):
     await call.answer("Оценка сохранена!")
 
 # ----------------------------------------------------------------------
-# ДИАЛОГ И БАНЫ
+# ДИАЛОГ И РАБОТА В АДМИН-ЧАТЕ
 # ----------------------------------------------------------------------
 @router.message(F.chat.type == "private")
 async def user_private_message(message: Message, state: FSMContext):
@@ -1130,9 +1131,7 @@ async def admin_reply_in_group(message: Message):
             # Редактируем саму карточку тикета и убираем кнопки
             try:
                 if card_message_id:
-                    status_text = f"\n\n❌ <b>Отклонено:</b> {reason} (Админ: {message.from_user.mention_html()})"
-                    card_chat = ADMIN_CHAT_ID
-                    await bot.edit_message_reply_markup(chat_id=card_chat, message_id=card_message_id, reply_markup=None)
+                    await bot.edit_message_reply_markup(chat_id=ADMIN_CHAT_ID, message_id=card_message_id, reply_markup=None)
             except Exception as e:
                 logging.error(f"Не удалось обновить карточку тикета: {e}")
 
@@ -1161,65 +1160,156 @@ async def admin_reply_in_group(message: Message):
             except Exception as e:
                 await message.answer(f"❌ Ошибка отправки: {e}")
 
+# ----------------------------------------------------------------------
+# КОМАНДЫ МОДЕРАЦИИ И РАССЫЛКИ
+# ----------------------------------------------------------------------
+@router.message(Command("news"), F.chat.id == ADMIN_CHAT_ID)
+async def cmd_news_broadcast(message: Message):
+    if not await is_main_admin(message.from_user.id):
+        await message.answer("❌ Рассылку могут запускать только главные администраторы!")
+        return
+
+    target_msg = message.reply_to_message if message.reply_to_message else None
+    broadcast_text = None
+
+    if not target_msg:
+        args = message.text.split(maxsplit=1)
+        if len(args) < 2:
+            await message.answer(
+                "❌ <b>Использование команды:</b>\n"
+                "1. <code>/news Текст вашей новости</code>\n"
+                "2. Или ответьте (Reply) командой <code>/news</code> на готовый пост/фото/видео.",
+                parse_mode="HTML"
+            )
+            return
+        broadcast_text = args[1]
+
+    def _get_all_users():
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT user_id FROM users")
+                return [row[0] for row in cur.fetchall()]
+
+    try:
+        users = await asyncio.to_thread(_get_all_users)
+    except Exception as e:
+        await message.answer(f"❌ Ошибка получения пользователей из БД: {e}")
+        return
+
+    if not users:
+        await message.answer("📭 В базе данных пока нет пользователей для рассылки.")
+        return
+
+    status_msg = await message.answer(f"📢 <b>Рассылка запущена...</b>\nВсего получателей: <code>{len(users)}</code>", parse_mode="HTML")
+
+    success = 0
+    blocked = 0
+    errors = 0
+
+    for user_id in users:
+        try:
+            if target_msg:
+                await target_msg.copy_to(chat_id=user_id)
+            else:
+                await bot.send_message(chat_id=user_id, text=broadcast_text, parse_mode="HTML")
+            
+            success += 1
+            await asyncio.sleep(0.05)
+        except TelegramForbiddenError:
+            blocked += 1
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after)
+            try:
+                if target_msg:
+                    await target_msg.copy_to(chat_id=user_id)
+                else:
+                    await bot.send_message(chat_id=user_id, text=broadcast_text, parse_mode="HTML")
+                success += 1
+            except Exception:
+                errors += 1
+        except Exception:
+            errors += 1
+
+    await status_msg.edit_text(
+        "📊 <b>Рассылка завершена!</b>\n\n"
+        f"✅ Успешно доставлено: <code>{success}</code>\n"
+        f"🚫 Заблокировали бота: <code>{blocked}</code>\n"
+        f"⚠️ Ошибок отправки: <code>{errors}</code>\n"
+        f"👥 Всего в базе: <code>{len(users)}</code>",
+        parse_mode="HTML"
+    )
+
 @router.message(Command("ban"), F.chat.id == ADMIN_CHAT_ID)
 async def cmd_ban_reply(message: Message):
     if not await is_support_member(message.from_user.id) and not await is_main_admin(message.from_user.id):
         return
-    
+
     user_id = None
     ticket_id = None
+    reason = "Нарушение правил"
 
     if message.reply_to_message:
         replied_msg = message.reply_to_message
         mapping = await get_user_by_group_msg(replied_msg.message_id)
         if mapping:
             user_id, ticket_id = mapping[0], mapping[1]
-        
-        if not user_id and (replied_msg.text or replied_msg.caption):
-            full_text = replied_msg.text or replied_msg.caption
-            match = re.search(r"ID:\s*<code>(\d+)</code>", full_text)
+
+        if not user_id:
+            raw_text = replied_msg.text or replied_msg.caption or ""
+            match = re.search(r"ID:?\s*<[^>]+>?(\d+)<[^>]+>?", raw_text, re.IGNORECASE)
+            if not match:
+                match = re.search(r"ID:?\s*(\d+)", raw_text, re.IGNORECASE)
             if match:
                 user_id = int(match.group(1))
-                active = await get_active_ticket(user_id)
-                if active:
-                    ticket_id = active[0]
 
-    if not user_id:
-        args = message.text.split(maxsplit=2)
-        if len(args) > 1 and args[1].isdigit():
-            user_id = int(args[1])
-            active = await get_active_ticket(user_id)
-            if active:
-                ticket_id = active[0]
+        args = message.text.split(maxsplit=1)
+        if len(args) > 1:
+            reason = args[1].strip()
+    else:
+        parts = message.text.split(maxsplit=2)
+        if len(parts) > 1 and parts[1].isdigit():
+            user_id = int(parts[1])
+            if len(parts) > 2:
+                reason = parts[2].strip()
 
     if not user_id:
         await message.answer(
-            "❌ Не удалось определить пользователя.\n"
-            "Ответьте командой <code>/ban причина</code> на сообщение пользователя или карточку тикета, либо используйте <code>/ban ID причина</code>.",
+            "❌ <b>Не удалось определить пользователя.</b>\n\n"
+            "• Ответьте командой <code>/ban [причина]</code> на карточку тикета или сообщение пользователя.\n"
+            "• Либо используйте прямой формат: <code>/ban [ID] [причина]</code>",
             parse_mode="HTML"
         )
         return
 
-    parts = message.text.split(maxsplit=1)
-    reason = "Нарушение правил"
-    if len(parts) > 1:
-        sub_parts = parts[1].split(maxsplit=1)
-        if sub_parts[0].isdigit() and not message.reply_to_message:
-            reason = sub_parts[1] if len(sub_parts) > 1 else "Нарушение правил"
-        else:
-            reason = parts[1]
+    if await is_main_admin(user_id):
+        await message.answer("❌ Нельзя заблокировать главного администратора!")
+        return
+
+    if not ticket_id:
+        active = await get_active_ticket(user_id)
+        if active:
+            ticket_id = active[0]
 
     await ban_user_db(user_id, reason)
-    
+
     if ticket_id:
         await close_ticket_db(ticket_id, 'rejected')
 
     try:
-        await bot.send_message(user_id, f"❌ Ваш доступ к поддержке заблокирован.\n<b>Причина:</b> {html.escape(reason)}", parse_mode="HTML")
+        await bot.send_message(
+            user_id,
+            f"❌ <b>Ваш доступ к поддержке заблокирован.</b>\n<b>Причина:</b> {html.escape(reason)}",
+            parse_mode="HTML"
+        )
     except Exception:
         pass
 
-    await message.answer(f"✅ Пользователь с ID <code>{user_id}</code> успешно заблокирован, тикет закрыт.", parse_mode="HTML")
+    ticket_note = f" (тикет №{ticket_id} закрыт)" if ticket_id else ""
+    await message.answer(
+        f"✅ Пользователь с ID <code>{user_id}</code> успешно заблокирован{ticket_note}.\n"
+        f"<b>Причина:</b> {html.escape(reason)}",
+        parse_mode="HTML"
+    )
 
 @router.message(Command("unban"), F.chat.id == ADMIN_CHAT_ID)
 async def cmd_unban(message: Message):
