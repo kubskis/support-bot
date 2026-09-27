@@ -3,11 +3,15 @@ import logging
 import os
 import html
 import re
+import time
+from datetime import datetime, timezone
 from contextlib import contextmanager
+from typing import Any, Callable, Dict, Awaitable
+
 import psycopg2
 from psycopg2 import pool
 from aiohttp import web
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import Bot, Dispatcher, F, Router, BaseMiddleware
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
@@ -15,7 +19,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton,
-    InlineKeyboardMarkup, InlineKeyboardButton, ForceReply
+    InlineKeyboardMarkup, InlineKeyboardButton, ForceReply, TelegramObject
 )
 
 # ----------------------------------------------------------------------
@@ -35,11 +39,46 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 router = Router()
-dp.include_router(router)
 
 def get_user_mention(user):
     safe_name = html.escape(user.full_name)
     return f'<a href="tg://user?id={user.id}">{safe_name}</a>'
+
+# ----------------------------------------------------------------------
+# АНТИФЛУД МИДЛВАРЬ (THROTTLING MIDDLEWARE)
+# ----------------------------------------------------------------------
+class ThrottlingMiddleware(BaseMiddleware):
+    def __init__(self, limit: float = 1.0):
+        self.limit = limit
+        self.users: Dict[int, float] = {}
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: Dict[str, Any]
+    ) -> Any:
+        user = data.get("event_from_user")
+        if user:
+            user_id = user.id
+            current_time = time.time()
+            last_time = self.users.get(user_id, 0.0)
+
+            if current_time - last_time < self.limit:
+                if isinstance(event, CallbackQuery):
+                    try:
+                        await event.answer("⚠️ Не спамьте кнопками! Подождите секунду.", show_alert=False)
+                    except Exception:
+                        pass
+                return
+
+            self.users[user_id] = current_time
+
+        return await handler(event, data)
+
+dp.message.middleware(ThrottlingMiddleware(limit=0.8))
+dp.callback_query.middleware(ThrottlingMiddleware(limit=0.8))
+dp.include_router(router)
 
 # ----------------------------------------------------------------------
 # БАЗА ДАННЫХ (Supabase / PostgreSQL с пулом соединений)
@@ -75,7 +114,11 @@ def _init_db_sync():
                     user_id BIGINT,
                     admin_id BIGINT DEFAULT NULL,
                     status TEXT DEFAULT 'pending',
-                    category TEXT DEFAULT 'general'
+                    category TEXT DEFAULT 'general',
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                    reminded_unassigned BOOLEAN DEFAULT FALSE,
+                    reminded_idle BOOLEAN DEFAULT FALSE
                 );
                 CREATE TABLE IF NOT EXISTS message_map (
                     group_message_id BIGINT PRIMARY KEY,
@@ -108,6 +151,10 @@ def _init_db_sync():
             """)
             cursor.execute("""
                 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS category TEXT DEFAULT 'general';
+                ALTER TABLE tickets ADD COLUMN IF NOT EXISTS created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP;
+                ALTER TABLE tickets ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP;
+                ALTER TABLE tickets ADD COLUMN IF NOT EXISTS reminded_unassigned BOOLEAN DEFAULT FALSE;
+                ALTER TABLE tickets ADD COLUMN IF NOT EXISTS reminded_idle BOOLEAN DEFAULT FALSE;
                 ALTER TABLE pending_rejections ADD COLUMN IF NOT EXISTS card_message_id BIGINT;
             """)
             if OWNER_ID:
@@ -228,11 +275,23 @@ async def create_ticket(user_id: int, category: str = 'general') -> int:
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO tickets (user_id, status, category) VALUES (%s, 'pending', %s) RETURNING ticket_id",
+                    "INSERT INTO tickets (user_id, status, category, created_at, updated_at) "
+                    "VALUES (%s, 'pending', %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) RETURNING ticket_id",
                     (user_id, category)
                 )
                 return cur.fetchone()[0]
     return await asyncio.to_thread(_query)
+
+async def touch_ticket(ticket_id: int):
+    """Обновляет updated_at и сбрасывает флаг напоминания о простое при новых сообщениях"""
+    def _query():
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE tickets SET updated_at = CURRENT_TIMESTAMP, reminded_idle = FALSE WHERE ticket_id = %s",
+                    (ticket_id,)
+                )
+    await asyncio.to_thread(_query)
 
 async def map_message(group_msg_id: int, user_id: int, ticket_id: int):
     def _query():
@@ -279,7 +338,7 @@ async def activate_ticket(ticket_id: int, admin_id: int):
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "UPDATE tickets SET status = 'active', admin_id = %s WHERE ticket_id = %s",
+                    "UPDATE tickets SET status = 'active', admin_id = %s, updated_at = CURRENT_TIMESTAMP, reminded_idle = FALSE WHERE ticket_id = %s",
                     (admin_id, ticket_id)
                 )
     await asyncio.to_thread(_query)
@@ -288,7 +347,7 @@ async def close_ticket_db(ticket_id: int, status: str = 'closed'):
     def _query():
         with get_db() as conn:
             with conn.cursor() as cur:
-                cur.execute("UPDATE tickets SET status = %s WHERE ticket_id = %s", (status, ticket_id))
+                cur.execute("UPDATE tickets SET status = %s, updated_at = CURRENT_TIMESTAMP WHERE ticket_id = %s", (status, ticket_id))
     await asyncio.to_thread(_query)
 
 async def is_banned(user_id: int):
@@ -311,6 +370,13 @@ async def ban_user_db(user_id: int, reason: str):
                     "ON CONFLICT (user_id) DO UPDATE SET reason = EXCLUDED.reason",
                     (user_id, reason)
                 )
+    await asyncio.to_thread(_query)
+
+async def unban_user_db(user_id: int):
+    def _query():
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM banned_users WHERE user_id = %s", (user_id,))
     await asyncio.to_thread(_query)
 
 async def save_rating_db(ticket_id: int, user_id: int, admin_id: int, score: int, review: str = None):
@@ -363,7 +429,7 @@ class Form(StatesGroup):
     appeal_nickname = State()
     appeal_reason = State()
     friends_nickname = State()
-    question_text = State()
+    question_content = State()
     set_friend_nick = State()
     
     helper_age = State()
@@ -730,7 +796,8 @@ async def process_helper_experience(message: Message, state: FSMContext):
         f"💼 <b>Опыт:</b> {html.escape(message.text or '')}"
     )
 
-    await bot.send_message(ADMIN_CHAT_ID, admin_text, reply_markup=helper_decision_kb(user.id), parse_mode="HTML")
+    sent = await bot.send_message(ADMIN_CHAT_ID, admin_text, reply_markup=helper_decision_kb(user.id), parse_mode="HTML")
+    await map_message(sent.message_id, user.id, 0)
     kb = await main_keyboard(user.id)
     await message.answer("✅ Ваша анкета успешно отправлена администрации! Ожидайте ответа.", reply_markup=kb, parse_mode="HTML")
     await state.clear()
@@ -800,7 +867,8 @@ async def process_secret_activity(message: Message, state: FSMContext):
         f"⏱ <b>Онлайн:</b> {html.escape(message.text or '')}"
     )
 
-    await bot.send_message(ADMIN_CHAT_ID, admin_text, reply_markup=secret_decision_kb(user.id), parse_mode="HTML")
+    sent = await bot.send_message(ADMIN_CHAT_ID, admin_text, reply_markup=secret_decision_kb(user.id), parse_mode="HTML")
+    await map_message(sent.message_id, user.id, 0)
     kb = await main_keyboard(user.id)
     await message.answer("✅ Ваша заявка в искатели секреток успешно отправлена! Ожидайте ответа.", reply_markup=kb, parse_mode="HTML")
     await state.clear()
@@ -877,8 +945,8 @@ async def start_question(message: Message, state: FSMContext):
     await register_user(message.from_user.id)
     if await is_banned(message.from_user.id) or await check_active_ticket(message): return
     await state.clear()
-    await state.set_state(Form.question_text)
-    await message.answer("❓ Задайте ваш вопрос одним сообщением:", parse_mode="HTML")
+    await state.set_state(Form.question_content)
+    await message.answer("❓ Задайте ваш вопрос (можно отправить текст или фото с описанием):", parse_mode="HTML")
 
 @router.message(Form.friends_nickname)
 async def process_friends_nickname(message: Message, state: FSMContext):
@@ -891,13 +959,31 @@ async def process_friends_nickname(message: Message, state: FSMContext):
     await message.answer(f"✅ Заявка №{ticket_id} создана!", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
     await state.clear()
 
-@router.message(Form.question_text)
+# Поддержка как чистого текста, так и фото с текстом для вопроса
+@router.message(Form.question_content, F.photo | F.text)
 async def process_question(message: Message, state: FSMContext):
     if await check_active_ticket(message): return
     ticket_id = await create_ticket(message.from_user.id, "question")
     user_mention = get_user_mention(message.from_user)
-    admin_text = f"❓ <b>#Вопрос | Заявка №{ticket_id}</b>\n👤 От: {user_mention} | ID: <code>{message.from_user.id}</code>\n\n{html.escape(message.text or '')}"
-    sent = await bot.send_message(ADMIN_CHAT_ID, admin_text, reply_markup=take_ticket_kb(ticket_id), parse_mode="HTML")
+    text_content = html.escape(message.text or message.caption or "Без описания")
+    admin_text = f"❓ <b>#Вопрос | Заявка №{ticket_id}</b>\n👤 От: {user_mention} | ID: <code>{message.from_user.id}</code>\n\n{text_content}"
+
+    if message.photo:
+        sent = await bot.send_photo(
+            ADMIN_CHAT_ID,
+            photo=message.photo[-1].file_id,
+            caption=admin_text,
+            reply_markup=take_ticket_kb(ticket_id),
+            parse_mode="HTML"
+        )
+    else:
+        sent = await bot.send_message(
+            ADMIN_CHAT_ID,
+            admin_text,
+            reply_markup=take_ticket_kb(ticket_id),
+            parse_mode="HTML"
+        )
+
     await map_message(sent.message_id, message.from_user.id, ticket_id)
     await message.answer(f"✅ Вопрос №{ticket_id} отправлен!", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
     await state.clear()
@@ -1006,7 +1092,6 @@ async def reject_ticket_handler(call: CallbackQuery):
         reply_markup=ForceReply(selective=True),
         parse_mode="HTML"
     )
-    # Сохраняем ID карточки, чтобы отредактировать именно её
     await add_pending_rejection(prompt_msg.message_id, ticket_id, call.message.message_id)
     await call.answer("Напишите причину отказа в ответ на сообщение бота!")
 
@@ -1090,6 +1175,7 @@ async def user_private_message(message: Message, state: FSMContext):
 
     active_ticket = await get_active_ticket(message.from_user.id)
     if active_ticket and active_ticket[2] == 'active':
+        await touch_ticket(active_ticket[0])
         user_mention = get_user_mention(message.from_user)
         text_to_group = f"📩 <b>Сообщение по заявке №{active_ticket[0]} от {user_mention} | ID: <code>{message.from_user.id}</code>:</b>\n\n{html.escape(message.text or message.caption or '')}"
         
@@ -1191,16 +1277,13 @@ async def cmd_ban_reply(message: Message):
     ticket_id = None
     reason = "Нарушение правил"
 
-    # 1. Если ответили Reply на карточку или сообщение
     if message.reply_to_message:
         replied_msg = message.reply_to_message
         
-        # А) Ищем по message_map
         mapping = await get_user_by_group_msg(replied_msg.message_id)
         if mapping:
             user_id, ticket_id = mapping[0], mapping[1]
 
-        # Б) Ищем по тексту карточки
         raw_text = replied_msg.text or replied_msg.caption or ""
         
         if not user_id and raw_text:
@@ -1210,7 +1293,6 @@ async def cmd_ban_reply(message: Message):
             if match_id:
                 user_id = int(match_id.group(1))
 
-        # В) Если ID не найден, пробуем найти по номеру тикета "Заявка №..."
         if not user_id and raw_text:
             match_ticket = re.search(r"№(\d+)", raw_text)
             if match_ticket:
@@ -1222,8 +1304,6 @@ async def cmd_ban_reply(message: Message):
         args = message.text.split(maxsplit=1)
         if len(args) > 1:
             reason = args[1].strip()
-
-    # 2. Если написали без Reply: /ban ID [причина]
     else:
         parts = message.text.split(maxsplit=2)
         if len(parts) > 1 and parts[1].isdigit():
@@ -1231,7 +1311,6 @@ async def cmd_ban_reply(message: Message):
             if len(parts) > 2:
                 reason = parts[2].strip()
 
-    # 3. Если пользователя определить не удалось
     if not user_id:
         await message.answer(
             "❌ <b>Не удалось определить пользователя.</b>\n\n"
@@ -1241,7 +1320,6 @@ async def cmd_ban_reply(message: Message):
         )
         return
 
-    # Защита создателя (себя самого банить для теста разрешено)
     is_owner_target = (OWNER_ID and user_id == OWNER_ID)
     if is_owner_target and user_id != message.from_user.id:
         await message.answer("❌ Нельзя заблокировать создателя бота!")
@@ -1260,8 +1338,7 @@ async def cmd_ban_reply(message: Message):
     try:
         await bot.send_message(
             user_id,
-            f"❌ <b>Ваш доступ к поддержке заблокирован.</b>\n"
-            f"<b>Причина:</b> {html.escape(reason)}",
+            f"❌ <b>Ваш доступ к поддержке заблокирован.</b>\n<b>Причина:</b> {html.escape(reason)}",
             parse_mode="HTML"
         )
     except Exception:
@@ -1279,20 +1356,46 @@ async def cmd_ban_reply(message: Message):
 async def cmd_unban(message: Message):
     if not await is_support_member(message.from_user.id) and not await is_main_admin(message.from_user.id): 
         return
-    args = message.text.split(maxsplit=1)
-    if len(args) < 2:
-        await message.answer("Использование: <code>/unban [user_id]</code>", parse_mode="HTML")
+
+    user_id = None
+
+    if message.reply_to_message:
+        replied_msg = message.reply_to_message
+        mapping = await get_user_by_group_msg(replied_msg.message_id)
+        if mapping:
+            user_id = mapping[0]
+
+        raw_text = replied_msg.text or replied_msg.caption or ""
+        if not user_id and raw_text:
+            match_id = re.search(r"ID:?\s*<[^>]+>?(\d+)<[^>]+>?", raw_text, re.IGNORECASE)
+            if not match_id:
+                match_id = re.search(r"ID:?\s*(\d+)", raw_text, re.IGNORECASE)
+            if match_id:
+                user_id = int(match_id.group(1))
+
+        if not user_id and raw_text:
+            match_ticket = re.search(r"№(\d+)", raw_text)
+            if match_ticket:
+                t_id = int(match_ticket.group(1))
+                t_info = await get_ticket_info(t_id)
+                if t_info:
+                    user_id = t_info[0]
+    else:
+        args = message.text.split(maxsplit=1)
+        if len(args) > 1 and args[1].isdigit():
+            user_id = int(args[1])
+
+    if not user_id:
+        await message.answer(
+            "❌ <b>Не удалось определить пользователя.</b>\n\n"
+            "• Ответьте командой <code>/unban</code> на карточку тикета или сообщение игрока.\n"
+            "• Либо введите напрямую: <code>/unban [user_id]</code>",
+            parse_mode="HTML"
+        )
         return
-    try:
-        user_id = int(args[1])
-        def _query():
-            with get_db() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("DELETE FROM banned_users WHERE user_id = %s", (user_id,))
-        await asyncio.to_thread(_query)
-        await message.answer(f"✅ Пользователь <code>{user_id}</code> разблокирован.", parse_mode="HTML")
-    except ValueError:
-        await message.answer("❌ Неверный формат ID.")
+
+    await unban_user_db(user_id)
+    await message.answer(f"✅ Пользователь с ID <code>{user_id}</code> успешно разблокирован.", parse_mode="HTML")
 
 # ----------------------------------------------------------------------
 # ОТВЕТ ХЕЛПЕРА В ГРУППЕ (ДОЛЖЕН ИДТИ СТРОГО ПОСЛЕ СЛУЖЕБНЫХ КОМАНД!)
@@ -1342,6 +1445,7 @@ async def admin_reply_in_group(message: Message):
                 await message.answer("❌ Этот тикет ведет другой администратор. Вы не можете в него отвечать!")
                 return
 
+            await touch_ticket(ticket_id)
             admin_name = html.escape(message.from_user.full_name)
             client_text = f"👨‍💻 <b>Ответ поддержки ({admin_name}):</b>\n\n{html.escape(message.text or message.caption or '')}"
             try:
@@ -1352,6 +1456,92 @@ async def admin_reply_in_group(message: Message):
                 await message.react([{"type": "emoji", "emoji": "👍"}])
             except Exception as e:
                 await message.answer(f"❌ Ошибка отправки: {e}")
+
+# ----------------------------------------------------------------------
+# ФОНОВЫЙ ВОРКЕР НАПОМИНАНИЙ (ТАЙМАУТЫ НА ОБРАБОТКУ)
+# ----------------------------------------------------------------------
+async def reminder_worker():
+    """Фоновая проверка тикетов на зависание и отсутствие ответа"""
+    logging.info("Фоновый воркер напоминаний запущен.")
+    while True:
+        try:
+            def _check():
+                with get_db() as conn:
+                    with conn.cursor() as cur:
+                        # 1. Заявки, которые висят pending более 2 часов
+                        cur.execute("""
+                            SELECT ticket_id, category, user_id, 
+                                   EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - created_at))/3600 as hours_passed
+                            FROM tickets
+                            WHERE status = 'pending' 
+                              AND reminded_unassigned = FALSE
+                              AND created_at <= CURRENT_TIMESTAMP - INTERVAL '2 hours'
+                        """)
+                        unassigned = cur.fetchall()
+
+                        # 2. Заявки, взятые в работу (active), без ответа > 20 минут
+                        cur.execute("""
+                            SELECT ticket_id, admin_id, user_id,
+                                   EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - updated_at))/60 as mins_passed
+                            FROM tickets
+                            WHERE status = 'active'
+                              AND reminded_idle = FALSE
+                              AND updated_at <= CURRENT_TIMESTAMP - INTERVAL '20 minutes'
+                        """)
+                        idle = cur.fetchall()
+
+                        return unassigned, idle
+
+            unassigned_tickets, idle_tickets = await asyncio.to_thread(_check)
+
+            # Напоминаем о не взятых в работу заявках (>2 часов)
+            for t_id, cat, u_id, hrs in unassigned_tickets:
+                hours_str = f"{int(hrs)} ч." if hrs else "2+ ч."
+                alert_text = (
+                    f"⏰ <b>Внимание! Необработанная заявка!</b>\n\n"
+                    f"Заявка <b>№{t_id}</b> ({cat}) ожидает ответа уже более <b>{hours_str}</b>!\n"
+                    f"👤 ID пользователя: <code>{u_id}</code>\n\n"
+                    f"Пожалуйста, возьмите тикет в работу!"
+                )
+                try:
+                    await bot.send_message(ADMIN_CHAT_ID, alert_text, parse_mode="HTML")
+                    def _mark():
+                        with get_db() as conn:
+                            with conn.cursor() as cur:
+                                cur.execute("UPDATE tickets SET reminded_unassigned = TRUE WHERE ticket_id = %s", (t_id,))
+                    await asyncio.to_thread(_mark)
+                except Exception as e:
+                    logging.error(f"Ошибка отправки напоминания о заявке №{t_id}: {e}")
+
+            # Напоминаем о зависших в работе заявках (>20 минут бездействия)
+            for t_id, adm_id, u_id, mins in idle_tickets:
+                admin_mention = f"ID: <code>{adm_id}</code>"
+                try:
+                    chat_member = await bot.get_chat(adm_id)
+                    admin_mention = f'<a href="tg://user?id={adm_id}">{html.escape(chat_member.full_name)}</a>'
+                except Exception:
+                    pass
+
+                alert_text = (
+                    f"⏳ <b>Напоминание по активному тикету!</b>\n\n"
+                    f"Тикет <b>№{t_id}</b> находится в работе у {admin_mention}, но диалог простаивает уже более <b>{int(mins)} минут</b>.\n"
+                    f"Не забудьте ответить пользователю или закрыть заявку!"
+                )
+                try:
+                    await bot.send_message(ADMIN_CHAT_ID, alert_text, parse_mode="HTML")
+                    def _mark_idle():
+                        with get_db() as conn:
+                            with conn.cursor() as cur:
+                                cur.execute("UPDATE tickets SET reminded_idle = TRUE WHERE ticket_id = %s", (t_id,))
+                    await asyncio.to_thread(_mark_idle)
+                except Exception as e:
+                    logging.error(f"Ошибка отправки напоминания о простое тикета №{t_id}: {e}")
+
+        except Exception as err:
+            logging.error(f"Ошибка в цикле reminder_worker: {err}")
+
+        # Проверяем каждые 60 секунд
+        await asyncio.sleep(60)
 
 # ----------------------------------------------------------------------
 # ВЕБ-СЕРВЕР И ЗАПУСК
@@ -1371,6 +1561,8 @@ async def web_server():
 
 async def main():
     await web_server()
+    # Запуск фонового воркера напоминаний
+    asyncio.create_task(reminder_worker())
     logging.info("Бот успешно запущен и готов к работе!")
     await dp.start_polling(bot)
 
