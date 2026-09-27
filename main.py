@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import html
+import re
 import psycopg2
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
@@ -20,7 +21,7 @@ from aiogram.types import (
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 ADMIN_CHAT_ID = -1003945292994  # ID группы поддержки
-OWNER_ID = int(os.getenv("ADMIN_ID", "0"))  # Главный создатель бота (из переменных окружения)
+OWNER_ID = int(os.getenv("ADMIN_ID", "0"))  # Главный создатель бота
 
 if not BOT_TOKEN:
     raise ValueError("ОШИБКА: Токен бота не найден! Укажите BOT_TOKEN в Environment Variables.")
@@ -44,6 +45,8 @@ def get_db_connection():
     return psycopg2.connect(DATABASE_URL, sslmode="require")
 
 def init_db():
+    conn = None
+    cursor = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -91,32 +94,35 @@ def init_db():
         """)
         conn.commit()
         
-        # Добавляем владельца в главные админы по умолчанию, если таблица пуста
         if OWNER_ID:
             cursor.execute("INSERT INTO main_admins (admin_id) VALUES (%s) ON CONFLICT (admin_id) DO NOTHING", (OWNER_ID,))
             conn.commit()
 
-        cursor.close()
-        conn.close()
         print("База данных успешно инициализирована.")
     except Exception as e:
         print(f"Внимание: ошибка при инициализации БД: {e}")
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
 
 init_db()
 
 def is_main_admin(user_id: int) -> bool:
     if OWNER_ID and user_id == OWNER_ID:
         return True
+    conn = None
+    cursor = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT admin_id FROM main_admins WHERE admin_id = %s", (user_id,))
         row = cursor.fetchone()
-        cursor.close()
-        conn.close()
         return row is not None
     except Exception:
         return False
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
 
 async def is_support_member(user_id: int) -> bool:
     if is_main_admin(user_id):
@@ -130,18 +136,23 @@ async def is_support_member(user_id: int) -> bool:
     return False
 
 def get_setting(key, default="false"):
+    conn = None
+    cursor = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT value FROM settings WHERE key = %s", (key,))
         row = cursor.fetchone()
-        cursor.close()
-        conn.close()
         return row[0] if row else default
     except Exception:
         return default
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
 
 def set_setting(key, value):
+    conn = None
+    cursor = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -150,35 +161,44 @@ def set_setting(key, value):
             (key, value)
         )
         conn.commit()
-        cursor.close()
-        conn.close()
     except Exception as e:
         print(f"Ошибка сохранения настройки {key}: {e}")
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
 
 def register_user(user_id):
+    conn = None
+    cursor = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("INSERT INTO users (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING", (user_id,))
         conn.commit()
-        cursor.close()
-        conn.close()
     except Exception as e:
         print(f"Ошибка регистрации пользователя: {e}")
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
 
 def get_all_users_count():
+    conn = None
+    cursor = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM users")
         res = cursor.fetchone()[0]
-        cursor.close()
-        conn.close()
         return res
     except Exception:
         return 0
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
 
 def get_tickets_stats():
+    conn = None
+    cursor = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -192,13 +212,16 @@ def get_tickets_stats():
         cursor.execute("SELECT COALESCE(AVG(score), 0) FROM ratings WHERE user_id != %s", (OWNER_ID,))
         avg_rating = cursor.fetchone()[0]
         
-        cursor.close()
-        conn.close()
         return total, closed, rejected, round(float(avg_rating), 2)
     except Exception:
         return 0, 0, 0, 0.0
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
 
 def get_admin_list_stats():
+    conn = None
+    cursor = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -210,141 +233,193 @@ def get_admin_list_stats():
             GROUP BY t.admin_id
         """)
         rows = cursor.fetchall()
-        cursor.close()
-        conn.close()
         return rows
     except Exception:
         return []
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
 
 def create_ticket(user_id, category='general'):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("INSERT INTO tickets (user_id, status, category) VALUES (%s, 'pending', %s) RETURNING ticket_id", (user_id, category))
-    ticket_id = cursor.fetchone()[0]
-    conn.commit()
-    cursor.close()
-    conn.close()
-    return ticket_id
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO tickets (user_id, status, category) VALUES (%s, 'pending', %s) RETURNING ticket_id", (user_id, category))
+        ticket_id = cursor.fetchone()[0]
+        conn.commit()
+        return ticket_id
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
 
 def map_message(group_msg_id, user_id, ticket_id):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO message_map (group_message_id, user_id, ticket_id) VALUES (%s, %s, %s) "
-        "ON CONFLICT (group_message_id) DO UPDATE SET user_id = EXCLUDED.user_id, ticket_id = EXCLUDED.ticket_id",
-        (group_msg_id, user_id, ticket_id)
-    )
-    conn.commit()
-    cursor.close()
-    conn.close()
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO message_map (group_message_id, user_id, ticket_id) VALUES (%s, %s, %s) "
+            "ON CONFLICT (group_message_id) DO UPDATE SET user_id = EXCLUDED.user_id, ticket_id = EXCLUDED.ticket_id",
+            (group_msg_id, user_id, ticket_id)
+        )
+        conn.commit()
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
 
 def get_user_by_group_msg(group_msg_id):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_id, ticket_id FROM message_map WHERE group_message_id = %s", (group_msg_id,))
-    row = cursor.fetchone()
-    cursor.close()
-    conn.close()
-    return row
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id, ticket_id FROM message_map WHERE group_message_id = %s", (group_msg_id,))
+        row = cursor.fetchone()
+        return row
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
 
 def get_ticket_info(ticket_id):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_id, admin_id, status FROM tickets WHERE ticket_id = %s", (ticket_id,))
-    row = cursor.fetchone()
-    cursor.close()
-    conn.close()
-    return row
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id, admin_id, status FROM tickets WHERE ticket_id = %s", (ticket_id,))
+        row = cursor.fetchone()
+        return row
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
 
 def get_active_ticket(user_id):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT ticket_id, admin_id, status FROM tickets WHERE user_id = %s AND status IN ('pending', 'active') ORDER BY ticket_id DESC LIMIT 1", (user_id,))
-    row = cursor.fetchone()
-    cursor.close()
-    conn.close()
-    return row
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT ticket_id, admin_id, status FROM tickets WHERE user_id = %s AND status IN ('pending', 'active') ORDER BY ticket_id DESC LIMIT 1", (user_id,))
+        row = cursor.fetchone()
+        return row
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
 
 def activate_ticket(ticket_id, admin_id):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("UPDATE tickets SET status = 'active', admin_id = %s WHERE ticket_id = %s", (admin_id, ticket_id))
-    conn.commit()
-    cursor.close()
-    conn.close()
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("UPDATE tickets SET status = 'active', admin_id = %s WHERE ticket_id = %s", (admin_id, ticket_id))
+        conn.commit()
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
 
 def close_ticket_db(ticket_id, status='closed'):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("UPDATE tickets SET status = %s WHERE ticket_id = %s", (status, ticket_id))
-    conn.commit()
-    cursor.close()
-    conn.close()
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("UPDATE tickets SET status = %s WHERE ticket_id = %s", (status, ticket_id))
+        conn.commit()
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
 
 def is_banned(user_id):
+    conn = None
+    cursor = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT reason FROM banned_users WHERE user_id = %s", (user_id,))
         row = cursor.fetchone()
-        cursor.close()
-        conn.close()
         return row
     except Exception:
         return None
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
 
 def ban_user_db(user_id, reason):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO banned_users (user_id, reason) VALUES (%s, %s) "
-        "ON CONFLICT (user_id) DO UPDATE SET reason = EXCLUDED.reason",
-        (user_id, reason)
-    )
-    conn.commit()
-    cursor.close()
-    conn.close()
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO banned_users (user_id, reason) VALUES (%s, %s) "
+            "ON CONFLICT (user_id) DO UPDATE SET reason = EXCLUDED.reason",
+            (user_id, reason)
+        )
+        conn.commit()
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
 
 def save_rating_db(ticket_id, user_id, admin_id, score, review=None):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO ratings (ticket_id, user_id, admin_id, score, review) VALUES (%s, %s, %s, %s, %s) "
-        "ON CONFLICT (ticket_id) DO UPDATE SET score = EXCLUDED.score, review = EXCLUDED.review",
-        (ticket_id, user_id, admin_id, score, review)
-    )
-    conn.commit()
-    cursor.close()
-    conn.close()
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO ratings (ticket_id, user_id, admin_id, score, review) VALUES (%s, %s, %s, %s, %s) "
+            "ON CONFLICT (ticket_id) DO UPDATE SET score = EXCLUDED.score, review = EXCLUDED.review",
+            (ticket_id, user_id, admin_id, score, review)
+        )
+        conn.commit()
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
 
 def add_pending_rejection(prompt_message_id, ticket_id):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO pending_rejections (prompt_message_id, ticket_id) VALUES (%s, %s) "
-        "ON CONFLICT (prompt_message_id) DO UPDATE SET ticket_id = EXCLUDED.ticket_id",
-        (prompt_message_id, ticket_id)
-    )
-    conn.commit()
-    cursor.close()
-    conn.close()
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO pending_rejections (prompt_message_id, ticket_id) VALUES (%s, %s) "
+            "ON CONFLICT (prompt_message_id) DO UPDATE SET ticket_id = EXCLUDED.ticket_id",
+            (prompt_message_id, ticket_id)
+        )
+        conn.commit()
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
 
 def get_pending_rejection(prompt_message_id):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT ticket_id FROM pending_rejections WHERE prompt_message_id = %s", (prompt_message_id,))
-    row = cursor.fetchone()
-    cursor.close()
-    conn.close()
-    return row[0] if row else None
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT ticket_id FROM pending_rejections WHERE prompt_message_id = %s", (prompt_message_id,))
+        row = cursor.fetchone()
+        return row[0] if row else None
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
 
 def delete_pending_rejection(prompt_message_id):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM pending_rejections WHERE prompt_message_id = %s", (prompt_message_id,))
-    conn.commit()
-    cursor.close()
-    conn.close()
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM pending_rejections WHERE prompt_message_id = %s", (prompt_message_id,))
+        conn.commit()
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
 
 # ----------------------------------------------------------------------
 # СОСТОЯНИЯ (FSM)
@@ -359,17 +434,14 @@ class Form(StatesGroup):
     question_text = State()
     set_friend_nick = State()
     
-    # Набор в хелперы
     helper_age = State()
     helper_timezone = State()
     helper_experience = State()
 
-    # Набор в искатели секреток
     secret_age = State()
     secret_experience = State()
     secret_activity = State()
 
-    # Управление главными админами (через ЛС)
     add_main_admin_id = State()
     del_main_admin_id = State()
 
@@ -536,15 +608,18 @@ async def manage_main_admins_callback(call: CallbackQuery):
         await call.answer("❌ Только создатель бота может управлять главными админами!", show_alert=True)
         return
     
+    conn = None
+    cursor = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT admin_id FROM main_admins")
         res = cursor.fetchall()
-        cursor.close()
-        conn.close()
     except Exception:
         res = []
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
 
     text = "👑 <b>Главные администраторы бота:</b>\n\n"
     for r in res:
@@ -727,7 +802,6 @@ async def helper_reject_callback(call: CallbackQuery):
     await call.message.edit_text(call.message.text + "\n\n🔴 <b>Статус:</b> Отклонено ❌", parse_mode="HTML")
     await call.answer("Заявка отклонена!")
 
-# --- Набор в искатели секреток ---
 @router.message(F.text == BTN_SECRET_APPLY, F.chat.type == "private")
 async def start_secret_apply(message: Message, state: FSMContext):
     register_user(message.from_user.id)
@@ -887,7 +961,7 @@ async def process_c_photo(message: Message, state: FSMContext):
     ticket_id = create_ticket(message.from_user.id, "complaint")
     data = await state.get_data()
     user_mention = get_user_mention(message.from_user)
-    admin_text = f"🚨 <b>#Жалоба | Заявка №{ticket_id}</b>\n👤 От: {user_mention}\nСуть: {html.escape(data.get('c_reason'))}\nНарушитель: <code>{html.escape(data.get('c_nickname'))}</code>"
+    admin_text = f"🚨 <b>#Жалоба | Заявка №{ticket_id}</b>\n👤 От: {user_mention} | ID: <code>{message.from_user.id}</code>\nСуть: {html.escape(data.get('c_reason'))}\nНарушитель: <code>{html.escape(data.get('c_nickname'))}</code>"
     sent = await bot.send_photo(ADMIN_CHAT_ID, photo=data['c_photo'], caption=admin_text, reply_markup=take_ticket_kb(ticket_id), parse_mode="HTML")
     map_message(sent.message_id, message.from_user.id, ticket_id)
     await message.answer(f"✅ Жалоба №{ticket_id} отправлена!", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
@@ -905,7 +979,7 @@ async def process_a_reason(message: Message, state: FSMContext):
     data = await state.get_data()
     ticket_id = create_ticket(message.from_user.id, "appeal")
     user_mention = get_user_mention(message.from_user)
-    admin_text = f"😡 <b>#Обжалование | Заявка №{ticket_id}</b>\n👤 От: {user_mention}\nНик: <code>{html.escape(data.get('a_nickname'))}</code>\nПричина: {html.escape(message.text)}"
+    admin_text = f"😡 <b>#Обжалование | Заявка №{ticket_id}</b>\n👤 От: {user_mention} | ID: <code>{message.from_user.id}</code>\nНик: <code>{html.escape(data.get('a_nickname'))}</code>\nПричина: {html.escape(message.text)}"
     sent = await bot.send_message(ADMIN_CHAT_ID, admin_text, reply_markup=take_ticket_kb(ticket_id), parse_mode="HTML")
     map_message(sent.message_id, message.from_user.id, ticket_id)
     await message.answer(f"✅ Обжалование №{ticket_id} отправлено!", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
@@ -1046,7 +1120,7 @@ async def user_private_message(message: Message, state: FSMContext):
     active_ticket = get_active_ticket(message.from_user.id)
     if active_ticket and active_ticket[2] == 'active':
         user_mention = get_user_mention(message.from_user)
-        text_to_group = f"📩 <b>Сообщение по заявке №{active_ticket[0]} от {user_mention} | ID: <code>{message.from_user.id}</code>:</b>\n\n{html.escape(message.text or '')}"
+        text_to_group = f"📩 <b>Сообщение по заявке №{active_ticket[0]} от {user_mention} | ID: <code>{message.from_user.id}</code>:</b>\n\n{html.escape(message.text or message.caption or '')}"
         
         if message.photo:
             sent = await bot.send_photo(ADMIN_CHAT_ID, photo=message.photo[-1].file_id, caption=text_to_group, parse_mode="HTML")
@@ -1068,7 +1142,7 @@ async def admin_reply_in_group(message: Message):
     if pending_ticket_id:
         ticket_info = get_ticket_info(pending_ticket_id)
         if ticket_info:
-            reason = html.escape(message.text or "Без причины")
+            reason = html.escape(message.text or message.caption or "Без причины")
             close_ticket_db(pending_ticket_id, 'rejected')
             try:
                 await bot.send_message(ticket_info[0], f"❌ Заявка <b>№{pending_ticket_id}</b> отклонена.\n<b>Причина:</b> {reason}", parse_mode="HTML", reply_markup=main_keyboard(ticket_info[0]))
@@ -1105,21 +1179,61 @@ async def admin_reply_in_group(message: Message):
             except Exception as e:
                 await message.answer(f"❌ Ошибка отправки: {e}")
 
-@router.message(Command("ban"), F.chat.id == ADMIN_CHAT_ID, F.reply_to_message)
+@router.message(Command("ban"), F.chat.id == ADMIN_CHAT_ID)
 async def cmd_ban_reply(message: Message):
-    if not await is_support_member(message.from_user.id): return
+    if not await is_support_member(message.from_user.id) and not is_main_admin(message.from_user.id):
+        return
     
-    mapping = get_user_by_group_msg(message.reply_to_message.message_id)
-    if not mapping:
-        await message.answer("❌ Не удалось определить пользователя по этому сообщению.")
+    user_id = None
+    ticket_id = None
+
+    if message.reply_to_message:
+        replied_msg = message.reply_to_message
+        mapping = get_user_by_group_msg(replied_msg.message_id)
+        if mapping:
+            user_id, ticket_id = mapping[0], mapping[1]
+        
+        if not user_id and (replied_msg.text or replied_msg.caption):
+            full_text = replied_msg.text or replied_msg.caption
+            match = re.search(r"ID:\s*<code>(\d+)</code>", full_text)
+            if match:
+                user_id = int(match.group(1))
+                active = get_active_ticket(user_id)
+                if active:
+                    ticket_id = active[0]
+
+    # Если ID не найден через реплай, проверяем аргумент команды (например, /ban 123456789 причина)
+    if not user_id:
+        args = message.text.split(maxsplit=2)
+        if len(args) > 1 and args[1].isdigit():
+            user_id = int(args[1])
+            active = get_active_ticket(user_id)
+            if active:
+                ticket_id = active[0]
+
+    if not user_id:
+        await message.answer("❌ Не удалось определить пользователя. Ответьте командой `/ban [причина]` на сообщение пользователя или карточку тикета, либо используйте `/ban ID причина`.", parse_mode="HTML")
         return
 
-    user_id, ticket_id = mapping[0], mapping[1]
-    args = message.text.split(maxsplit=1)
-    reason = args[1] if len(args) > 1 else "Нарушение правил"
+    args = message.text.split(maxsplit=2)
+    # Определяем индекс для причины в зависимости от способа вызова
+    reason_idx = 2 if (message.reply_to_message and not message.text.split(maxsplit=1)[1].startswith(str(user_id))) else 2
+    
+    # Более надежный срез текста для причины
+    parts = message.text.split(maxsplit=1)
+    reason = "Нарушение правил"
+    if len(parts) > 1:
+        # Если передан ID первым словом
+        sub_parts = parts[1].split(maxsplit=1)
+        if sub_parts[0].isdigit() and not message.reply_to_message:
+            reason = sub_parts[1] if len(sub_parts) > 1 else "Нарушение правил"
+        else:
+            reason = parts[1]
 
     ban_user_db(user_id, reason)
-    close_ticket_db(ticket_id, 'rejected')
+    
+    if ticket_id:
+        close_ticket_db(ticket_id, 'rejected')
 
     try:
         await bot.send_message(user_id, f"❌ Ваш доступ к поддержке заблокирован.\n<b>Причина:</b> {html.escape(reason)}", parse_mode="HTML")
@@ -1130,7 +1244,8 @@ async def cmd_ban_reply(message: Message):
 
 @router.message(Command("unban"), F.chat.id == ADMIN_CHAT_ID)
 async def cmd_unban(message: Message):
-    if not await is_support_member(message.from_user.id): return
+    if not await is_support_member(message.from_user.id) and not is_main_admin(message.from_user.id): 
+        return
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
         await message.answer("Использование: <code>/unban [user_id]</code>", parse_mode="HTML")
@@ -1169,4 +1284,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-        
+    
