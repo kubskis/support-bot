@@ -1363,9 +1363,22 @@ async def pub_photo(message: Message, state: FSMContext):
 async def pub_link(message: Message, state: FSMContext):
     raw = message.text.strip()
     clean = re.sub(r'\s+', '', raw)
-    if "roblox.com/share?code=" not in clean or not clean.endswith("type=Server"):
-        await message.answer("❌ Отправьте корректную ссылку именно на VIP-сервер Roblox.")
+    clean_lower = clean.lower()
+
+    # Проверяем домен Roblox и наличие маркера приватного сервера (ПК или мобильного шеринга)
+    is_roblox = "roblox.com" in clean_lower
+    is_vip = ("privateserverlinkcode=" in clean_lower) or ("share?code=" in clean_lower)
+
+    if not (is_roblox and is_vip):
+        await message.answer(
+            f"{ICON_CROSS} <b>Некорректная ссылка на VIP-сервер!</b>\n\n"
+            "Бот принимает ссылки на VIP-сервера Roblox:\n"
+            "• С ПК: <code>...roblox.com/games/...?privateServerLinkCode=...</code>\n"
+            "• С телефона: <code>...roblox.com/share?code=...</code>",
+            parse_mode="HTML"
+        )
         return
+
     await state.update_data(link=clean)
     data = await state.get_data()
     stype = data["secret_type"]
@@ -2288,3 +2301,4 @@ if __name__ == "__main__":
     finally:
         if not db_pool.closed:
             db_pool.closeall()
+        
