@@ -64,7 +64,7 @@ def is_night_time() -> bool:
 
 def get_night_notice() -> str:
     if is_night_time():
-        return "\n\n🌙 <i>Обратите внимание: сейчас ночное время (с 22:00 до 10:00 МСК). Ваша заявка принята, но ответ модераторов может поступить утром!</i>"
+        return "\n\n<tg-emoji emoji-id='5348110675891731556'>🔥</tg-emoji> <i>Обратите внимание: сейчас ночное время (с 22:00 до 10:00 МСК). Ваша заявка принята, но ответ модераторов может поступить утром!</i>"
     return ""
 
 # ----------------------------------------------------------------------
@@ -90,6 +90,7 @@ class ThrottlingMiddleware(BaseMiddleware):
             if current_time - last_time < self.limit:
                 if isinstance(event, CallbackQuery):
                     try:
+                        # Всплывающее системное окно не поддерживает HTML-теги
                         await event.answer("⚠️ Не спамьте кнопками! Подождите секунду.", show_alert=False)
                     except Exception:
                         pass
@@ -660,7 +661,7 @@ async def open_admin_panel(message: Message, state: FSMContext):
 @router.callback_query(F.data == "adm_stats")
 async def callback_stats(call: CallbackQuery):
     if not await is_main_admin(call.from_user.id):
-        await call.answer("Нет доступа", show_alert=True)
+        await call.answer("❌ Нет доступа", show_alert=True)
         return
     users_count = await get_all_users_count()
     total, closed, rejected, avg_rating = await get_tickets_stats()
@@ -680,7 +681,7 @@ async def callback_stats(call: CallbackQuery):
 @router.callback_query(F.data == "adm_list_stats")
 async def callback_admin_list_stats(call: CallbackQuery):
     if not await is_main_admin(call.from_user.id):
-        await call.answer("Нет доступа", show_alert=True)
+        await call.answer("❌ Нет доступа", show_alert=True)
         return
     
     rows = await get_admin_list_stats()
@@ -713,7 +714,7 @@ async def back_to_admin_panel(call: CallbackQuery):
 @router.callback_query(F.data == "manage_main_admins")
 async def manage_main_admins_callback(call: CallbackQuery):
     if OWNER_ID and call.from_user.id != OWNER_ID:
-        await call.answer("<tg-emoji emoji-id='5348362704572664028'>🔥</tg-emoji> Только создатель бота может управлять главными админами!", show_alert=True)
+        await call.answer("❌ Только создатель бота может управлять главными админами!", show_alert=True)
         return
     
     def _query():
@@ -744,7 +745,7 @@ async def add_main_admin_start(call: CallbackQuery, state: FSMContext):
         await call.answer("❌ Доступно только создателю бота!", show_alert=True)
         return
     await state.set_state(Form.add_main_admin_id)
-    await call.message.answer("➕ Введите <b>Telegram ID</b> пользователя, которого хотите сделать главным администратором:", parse_mode="HTML")
+    await call.message.answer("<tg-emoji emoji-id='5346004239246183111'>🔥</tg-emoji> Введите <b>Telegram ID</b> пользователя, которого хотите сделать главным администратором:", parse_mode="HTML")
     await call.answer()
 
 @router.message(Form.add_main_admin_id, F.chat.type == "private")
@@ -760,9 +761,9 @@ async def process_add_main_admin(message: Message, state: FSMContext):
         await asyncio.to_thread(_query)
         await state.clear()
         kb = await main_keyboard(message.from_user.id)
-        await message.answer(f"✅ Пользователь <code>{new_id}</code> успешно назначен главным администратором!", reply_markup=kb, parse_mode="HTML")
+        await message.answer(f"<tg-emoji emoji-id='5346300789558101141'>🔥</tg-emoji> Пользователь <code>{new_id}</code> успешно назначен главным администратором!", reply_markup=kb, parse_mode="HTML")
     except ValueError:
-        await message.answer("❌ Неверный формат ID. Введите числовой Telegram ID:")
+        await message.answer("<tg-emoji emoji-id='5348362704572664028'>🔥</tg-emoji> Неверный формат ID. Введите числовой Telegram ID:")
 
 @router.callback_query(F.data == "del_main_admin_start")
 async def del_main_admin_start(call: CallbackQuery, state: FSMContext):
@@ -770,7 +771,7 @@ async def del_main_admin_start(call: CallbackQuery, state: FSMContext):
         await call.answer("❌ Доступно только создателю бота!", show_alert=True)
         return
     await state.set_state(Form.del_main_admin_id)
-    await call.message.answer("➖ Введите <b>Telegram ID</b> главного администратора, которого хотите снять:", parse_mode="HTML")
+    await call.message.answer("<tg-emoji emoji-id='5346176879751612829'>🔥</tg-emoji> Введите <b>Telegram ID</b> главного администратора, которого хотите снять:", parse_mode="HTML")
     await call.answer()
 
 @router.message(Form.del_main_admin_id, F.chat.type == "private")
@@ -780,7 +781,7 @@ async def process_del_main_admin(message: Message, state: FSMContext):
     try:
         del_id = int(message.text.strip())
         if OWNER_ID and del_id == OWNER_ID:
-            await message.answer("❌ Нельзя удалить создателя бота!")
+            await message.answer("<tg-emoji emoji-id='5348362704572664028'>🔥</tg-emoji> Нельзя удалить создателя бота!")
             return
         def _query():
             with get_db() as conn:
@@ -789,9 +790,9 @@ async def process_del_main_admin(message: Message, state: FSMContext):
         await asyncio.to_thread(_query)
         await state.clear()
         kb = await main_keyboard(message.from_user.id)
-        await message.answer(f"✅ Пользователь <code>{del_id}</code> снят с поста главного администратора.", reply_markup=kb, parse_mode="HTML")
+        await message.answer(f"<tg-emoji emoji-id='5346300789558101141'>🔥</tg-emoji> Пользователь <code>{del_id}</code> снят с поста главного администратора.", reply_markup=kb, parse_mode="HTML")
     except ValueError:
-        await message.answer("❌ Неверный формат ID. Введите числовой Telegram ID:")
+        await message.answer("<tg-emoji emoji-id='5348362704572664028'>🔥</tg-emoji> Неверный формат ID. Введите числовой Telegram ID:")
 
 @router.callback_query(F.data == "toggle_friend")
 async def toggle_friend_callback(call: CallbackQuery):
@@ -828,7 +829,7 @@ async def change_friend_nick_callback(call: CallbackQuery, state: FSMContext):
     if not await is_main_admin(call.from_user.id): return
     await state.set_state(Form.set_friend_nick)
     current_nick = await get_setting("friend_nickname", "Не задан")
-    await call.message.answer(f"✏️ Введите новый ник для друзей. Текущий: <code>{html.escape(current_nick)}</code>", parse_mode="HTML")
+    await call.message.answer(f"<tg-emoji emoji-id='5348224471050238603'>🔥</tg-emoji> Введите новый ник для друзей. Текущий: <code>{html.escape(current_nick)}</code>", parse_mode="HTML")
     await call.answer()
 
 @router.message(Form.set_friend_nick)
@@ -837,7 +838,7 @@ async def save_friend_nick(message: Message, state: FSMContext):
     await set_setting("friend_nickname", message.text.strip())
     await state.clear()
     kb = await main_keyboard(message.from_user.id)
-    await message.answer("✅ Ник успешно изменен!", reply_markup=kb)
+    await message.answer("<tg-emoji emoji-id='5346300789558101141'>🔥</tg-emoji> Ник успешно изменен!", reply_markup=kb)
 
 # ----------------------------------------------------------------------
 # СИСТЕМА НАБОРА В ХЕЛПЕРЫ И ИСКАТЕЛИ СЕКРЕТОВ
@@ -847,11 +848,11 @@ async def start_helper_apply(message: Message, state: FSMContext):
     await register_user(message.from_user.id)
     if await is_banned(message.from_user.id): return
     if await get_setting("helper_recruitment", "true") != "true":
-        await message.answer("🛠 Набор в команду поддержки в данный момент закрыт.")
+        await message.answer("<tg-emoji emoji-id='5346273864408120989'>🔥</tg-emoji> Набор в команду поддержки в данный момент закрыт.")
         return
     await state.clear()
     await state.set_state(Form.helper_age)
-    await message.answer(f"📝 <b>Заявка в команду поддержки (Хелперы)</b>\n\n{NUM_1} Укажите ваш возраст:", parse_mode="HTML")
+    await message.answer(f"<tg-emoji emoji-id='5346192285799302524'>🔥</tg-emoji> <b>Заявка в команду поддержки (Хелперы)</b>\n\n{NUM_1} Укажите ваш возраст:", parse_mode="HTML")
 
 @router.message(Form.helper_age)
 async def process_helper_age(message: Message, state: FSMContext):
@@ -885,7 +886,7 @@ async def process_helper_experience(message: Message, state: FSMContext):
     await map_message(sent.message_id, user.id, 0)
     kb = await main_keyboard(user.id)
     night_txt = get_night_notice()
-    await message.answer(f"✅ Ваша анкета успешно отправлена администрации! Ожидайте ответа.{night_txt}", reply_markup=kb, parse_mode="HTML")
+    await message.answer(f"<tg-emoji emoji-id='5346300789558101141'>🔥</tg-emoji> Ваша анкета успешно отправлена администрации! Ожидайте ответа.{night_txt}", reply_markup=kb, parse_mode="HTML")
     await state.clear()
 
 @router.callback_query(F.data.startswith("helper_accept_"))
@@ -895,7 +896,7 @@ async def helper_accept_callback(call: CallbackQuery):
         return
     user_id = int(call.data.split("_")[2])
     try:
-        await bot.send_message(user_id, "🎉 <b>Поздравляем! Ваша заявка на хелпера принята!</b> Админы свяжутся с вами в ближайшее время.", parse_mode="HTML")
+        await bot.send_message(user_id, "<tg-emoji emoji-id='5346038654819123712'>🔥</tg-emoji> <b>Поздравляем! Ваша заявка на хелпера принята!</b> Админы свяжутся с вами в ближайшее время.", parse_mode="HTML")
     except Exception:
         pass
     await call.message.edit_text(call.message.text + "\n\n🟢 <b>Статус:</b> Одобрено ✅", parse_mode="HTML")
@@ -908,7 +909,7 @@ async def helper_reject_callback(call: CallbackQuery):
         return
     user_id = int(call.data.split("_")[2])
     try:
-        await bot.send_message(user_id, "❌ К сожалению, ваша заявка на хелпера была отклонена.", parse_mode="HTML")
+        await bot.send_message(user_id, "<tg-emoji emoji-id='5346038654819123712'>🔥</tg-emoji> К сожалению, ваша заявка на хелпера была отклонена.", parse_mode="HTML")
     except Exception:
         pass
     await call.message.edit_text(call.message.text + "\n\n🔴 <b>Статус:</b> Отклонено ❌", parse_mode="HTML")
@@ -919,11 +920,11 @@ async def start_secret_apply(message: Message, state: FSMContext):
     await register_user(message.from_user.id)
     if await is_banned(message.from_user.id): return
     if await get_setting("secret_recruitment", "true") != "true":
-        await message.answer("🛠 Набор в искатели секреток в данный момент закрыт.")
+        await message.answer("<tg-emoji emoji-id='5346273864408120989'>🔥</tg-emoji> Набор в искатели секреток в данный момент закрыт.")
         return
     await state.clear()
     await state.set_state(Form.secret_age)
-    await message.answer(f"🔍 <b>Заявка в искатели секреток</b>\n\n{NUM_1} Укажите ваш возраст:", parse_mode="HTML")
+    await message.answer(f"<tg-emoji emoji-id='5345840270279724328'>🔥</tg-emoji> <b>Заявка в искатели секреток</b>\n\n{NUM_1} Укажите ваш возраст:", parse_mode="HTML")
 
 @router.message(Form.secret_age)
 async def process_secret_age(message: Message, state: FSMContext):
@@ -957,7 +958,7 @@ async def process_secret_activity(message: Message, state: FSMContext):
     await map_message(sent.message_id, user.id, 0)
     kb = await main_keyboard(user.id)
     night_txt = get_night_notice()
-    await message.answer(f"✅ Ваша заявка в искатели секреток успешно отправлена! Ожидайте ответа.{night_txt}", reply_markup=kb, parse_mode="HTML")
+    await message.answer(f"<tg-emoji emoji-id='5346300789558101141'>🔥</tg-emoji> Ваша заявка в искатели секреток успешно отправлена! Ожидайте ответа.{night_txt}", reply_markup=kb, parse_mode="HTML")
     await state.clear()
 
 @router.callback_query(F.data.startswith("secret_accept_"))
@@ -967,7 +968,7 @@ async def secret_accept_callback(call: CallbackQuery):
         return
     user_id = int(call.data.split("_")[2])
     try:
-        await bot.send_message(user_id, "🎉 <b>Поздравляем! Ваша заявка в искатели секреток принята!</b>", parse_mode="HTML")
+        await bot.send_message(user_id, "<tg-emoji emoji-id='5346038654819123712'>🔥</tg-emoji> <b>Поздравляем! Ваша заявка в искатели секреток принята!</b>", parse_mode="HTML")
     except Exception:
         pass
     await call.message.edit_text(call.message.text + "\n\n🟢 <b>Статус:</b> Одобрено ✅", parse_mode="HTML")
@@ -980,7 +981,7 @@ async def secret_reject_callback(call: CallbackQuery):
         return
     user_id = int(call.data.split("_")[2])
     try:
-        await bot.send_message(user_id, "❌ К сожалению, ваша заявка в искатели секреток была отклонена.", parse_mode="HTML")
+        await bot.send_message(user_id, "<tg-emoji emoji-id='5348362704572664028'>🔥</tg-emoji> К сожалению, ваша заявка в искатели секреток была отклонена.", parse_mode="HTML")
     except Exception:
         pass
     await call.message.edit_text(call.message.text + "\n\n🔴 <b>Статус:</b> Отклонено ❌", parse_mode="HTML")
@@ -1020,12 +1021,12 @@ async def start_friends(message: Message, state: FSMContext):
     await register_user(message.from_user.id)
     if await is_banned(message.from_user.id) or await check_active_ticket(message): return
     if await get_setting("friend_active", "false") != "true":
-        await message.answer("🛠 Раздел добавления в друзья временно закрыт на технические работы.")
+        await message.answer("<tg-emoji emoji-id='5346273864408120989'>🔥</tg-emoji> Раздел добавления в друзья временно закрыт на технические работы.")
         return
     await state.clear()
     friend_nick = await get_setting("friend_nickname", "Администратор")
     await state.set_state(Form.friends_nickname)
-    await message.answer(f"👯‍♀️ Добавьтесь в друзья к игроку: <code>{html.escape(friend_nick)}</code>\n\n{NUM_1} Укажите ваш ник в игре:", parse_mode="HTML")
+    await message.answer(f"<tg-emoji emoji-id='5346136537123801643'>🔥</tg-emoji> Добавьтесь в друзья к игроку: <code>{html.escape(friend_nick)}</code>\n\n{NUM_1} Укажите ваш ник в игре:", parse_mode="HTML")
 
 @router.message(F.text == BTN_QUESTION, F.chat.type == "private")
 async def start_question(message: Message, state: FSMContext):
@@ -1044,7 +1045,7 @@ async def process_friends_nickname(message: Message, state: FSMContext):
     sent = await bot.send_message(ADMIN_CHAT_ID, admin_text, reply_markup=take_ticket_kb(ticket_id), parse_mode="HTML")
     await map_message(sent.message_id, message.from_user.id, ticket_id)
     night_txt = get_night_notice()
-    await message.answer(f"✅ Заявка №{ticket_id} создана!{night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
+    await message.answer(f"<tg-emoji emoji-id='5346300789558101141'>🔥</tg-emoji> Заявка №{ticket_id} создана!{night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
     await state.clear()
 
 @router.message(Form.question_content, F.photo | F.text)
@@ -1073,7 +1074,7 @@ async def process_question(message: Message, state: FSMContext):
 
     await map_message(sent.message_id, message.from_user.id, ticket_id)
     night_txt = get_night_notice()
-    await message.answer(f"✅ Вопрос №{ticket_id} отправлен!{night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
+    await message.answer(f"<tg-emoji emoji-id='5346300789558101141'>🔥</tg-emoji> Вопрос №{ticket_id} отправлен!{night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
     await state.clear()
 
 @router.message(Form.complaint_reason)
@@ -1104,7 +1105,7 @@ async def process_c_photo(message: Message, state: FSMContext):
     sent = await bot.send_photo(ADMIN_CHAT_ID, photo=photo_id, caption=admin_text, reply_markup=take_ticket_kb(ticket_id), parse_mode="HTML")
     await map_message(sent.message_id, message.from_user.id, ticket_id)
     night_txt = get_night_notice()
-    await message.answer(f"✅ Жалоба №{ticket_id} отправлена!{night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
+    await message.answer(f"<tg-emoji emoji-id='5346300789558101141'>🔥</tg-emoji> Жалоба №{ticket_id} отправлена!{night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
     await state.clear()
 
 @router.message(Form.appeal_nickname)
@@ -1128,7 +1129,7 @@ async def process_a_reason(message: Message, state: FSMContext):
     sent = await bot.send_message(ADMIN_CHAT_ID, admin_text, reply_markup=take_ticket_kb(ticket_id), parse_mode="HTML")
     await map_message(sent.message_id, message.from_user.id, ticket_id)
     night_txt = get_night_notice()
-    await message.answer(f"✅ Обжалование №{ticket_id} отправлено!{night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
+    await message.answer(f"<tg-emoji emoji-id='5346300789558101141'>🔥</tg-emoji> Обжалование №{ticket_id} отправлено!{night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
     await state.clear()
 
 # ----------------------------------------------------------------------
