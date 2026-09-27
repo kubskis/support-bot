@@ -459,18 +459,33 @@ def secret_decision_kb(user_id: int):
 # ----------------------------------------------------------------------
 # СТАРТ И МЕНЮ
 # ----------------------------------------------------------------------
+WELCOME_PHOTO_ID = "AgACAgEAAxkBAAEvN2dquXGC1nw3HqPjB8OP9hp-L17WGwACrwxrG6FryEX933FL88L6GwEAAwIAA3kAAz0E"
+
 @router.message(CommandStart(), F.chat.type == "private")
 async def start_cmd(message: Message, state: FSMContext):
     await register_user(message.from_user.id)
     banned = await is_banned(message.from_user.id)
     if banned:
-        await message.answer(f"❌ Вы заблокированы в поддержке.\n<b>Причина:</b> {html.escape(banned[0])}", parse_mode="HTML")
+        await message.answer(
+            f"❌ Вы заблокированы в поддержке.\n<b>Причина:</b> {html.escape(banned[0])}",
+            parse_mode="HTML"
+        )
         return
+
     await state.clear()
     kb = await main_keyboard(message.from_user.id)
-    await message.answer(
-        "🤍 <b>Добро пожаловать в поддержку Tower Of Hell Secrets (@ToHSecretss)!</b> 🤍\n\n"
-        "Выберите нужный раздел на клавиатуре ниже:",
+
+    welcome_caption = (
+        '<tg-emoji emoji-id="5206693654990717395">🔥</tg-emoji>'
+        '<b>Добро пожаловать в поддержку Tower Of Hell Secrets (@ToHSecretss)!</b>'
+        '<tg-emoji emoji-id="5206693654990717395">🔥</tg-emoji>\n\n'
+        '<tg-emoji emoji-id="5208629654449064934">🔥</tg-emoji>'
+        '<i>Выберите нужный раздел на клавиатуре ниже</i>'
+    )
+
+    await message.answer_photo(
+        photo=WELCOME_PHOTO_ID,
+        caption=welcome_caption,
         reply_markup=kb,
         parse_mode="HTML"
     )
