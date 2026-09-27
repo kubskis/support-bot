@@ -4,7 +4,7 @@ import os
 import html
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from contextlib import contextmanager
 from typing import Any, Callable, Dict, Awaitable
 
@@ -12,7 +12,7 @@ import psycopg2
 from psycopg2 import pool
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router, BaseMiddleware
-from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
+from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter, TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -29,6 +29,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 ADMIN_CHAT_ID = -1003945292994  # ID группы поддержки
 OWNER_ID = int(os.getenv("ADMIN_ID", "0"))  # Главный создатель бота
+MSK_TZ = timezone(timedelta(hours=3))
 
 if not BOT_TOKEN:
     raise ValueError("ОШИБКА: Токен бота не найден! Укажите BOT_TOKEN в Environment Variables.")
@@ -43,6 +44,17 @@ router = Router()
 def get_user_mention(user):
     safe_name = html.escape(user.full_name)
     return f'<a href="tg://user?id={user.id}">{safe_name}</a>'
+
+def is_night_time() -> bool:
+    """Проверяет, попадает ли текущее время в диапазон 22:00 - 10:00 по МСК"""
+    now_msk = datetime.now(MSK_TZ)
+    hour = now_msk.hour
+    return hour >= 22 or hour < 10
+
+def get_night_notice() -> str:
+    if is_night_time():
+        return "\n\n🌙 <i>Обратите внимание: сейчас ночное время (с 22:00 до 10:00 МСК). Ваша заявка принята, но ответ модераторов может поступить утром!</i>"
+    return ""
 
 # ----------------------------------------------------------------------
 # АНТИФЛУД МИДЛВАРЬ (THROTTLING MIDDLEWARE)
@@ -148,6 +160,10 @@ def _init_db_sync():
                 CREATE TABLE IF NOT EXISTS main_admins (
                     admin_id BIGINT PRIMARY KEY
                 );
+                CREATE TABLE IF NOT EXISTS admin_agents (
+                    admin_id BIGINT PRIMARY KEY,
+                    agent_number INTEGER UNIQUE
+                );
             """)
             cursor.execute("""
                 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS category TEXT DEFAULT 'general';
@@ -160,6 +176,10 @@ def _init_db_sync():
             if OWNER_ID:
                 cursor.execute(
                     "INSERT INTO main_admins (admin_id) VALUES (%s) ON CONFLICT (admin_id) DO NOTHING",
+                    (OWNER_ID,)
+                )
+                cursor.execute(
+                    "INSERT INTO admin_agents (admin_id, agent_number) VALUES (%s, 1) ON CONFLICT (admin_id) DO NOTHING",
                     (OWNER_ID,)
                 )
     logging.info("База данных успешно инициализирована.")
@@ -190,6 +210,31 @@ async def is_support_member(user_id: int) -> bool:
     except Exception:
         pass
     return False
+
+async def get_or_create_agent_number(admin_id: int) -> int:
+    """Выдаёт владельцу #1, остальным по порядку: #2, #3 и т.д."""
+    if OWNER_ID and admin_id == OWNER_ID:
+        return 1
+
+    def _query():
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT agent_number FROM admin_agents WHERE admin_id = %s", (admin_id,))
+                row = cur.fetchone()
+                if row:
+                    return row[0]
+                
+                # Получаем следующий свободный порядковый номер
+                cur.execute("SELECT COALESCE(MAX(agent_number), 1) + 1 FROM admin_agents")
+                next_number = cur.fetchone()[0]
+                cur.execute(
+                    "INSERT INTO admin_agents (admin_id, agent_number) VALUES (%s, %s) ON CONFLICT (admin_id) DO NOTHING RETURNING agent_number",
+                    (admin_id, next_number)
+                )
+                res = cur.fetchone()
+                return res[0] if res else next_number
+
+    return await asyncio.to_thread(_query)
 
 async def get_setting(key: str, default: str = "false") -> str:
     def _query():
@@ -258,11 +303,12 @@ async def get_admin_list_stats():
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
-                    SELECT admin_id, COUNT(*) as closed_count, COALESCE(AVG(score), 0) as avg_score
+                    SELECT t.admin_id, COUNT(*) as closed_count, COALESCE(AVG(r.score), 0) as avg_score, a.agent_number
                     FROM tickets t
                     LEFT JOIN ratings r ON t.ticket_id = r.ticket_id
+                    LEFT JOIN admin_agents a ON t.admin_id = a.admin_id
                     WHERE t.admin_id IS NOT NULL AND t.status = 'closed'
-                    GROUP BY t.admin_id
+                    GROUP BY t.admin_id, a.agent_number
                 """)
                 return cur.fetchall()
     try:
@@ -283,7 +329,6 @@ async def create_ticket(user_id: int, category: str = 'general') -> int:
     return await asyncio.to_thread(_query)
 
 async def touch_ticket(ticket_id: int):
-    """Обновляет updated_at и сбрасывает флаг напоминания о простое при новых сообщениях"""
     def _query():
         with get_db() as conn:
             with conn.cursor() as cur:
@@ -310,6 +355,15 @@ async def get_user_by_group_msg(group_msg_id: int):
             with conn.cursor() as cur:
                 cur.execute("SELECT user_id, ticket_id FROM message_map WHERE group_message_id = %s", (group_msg_id,))
                 return cur.fetchone()
+    return await asyncio.to_thread(_query)
+
+async def get_ticket_messages(ticket_id: int) -> list:
+    """Получает все ID сообщений в чате группы по тикету для последующей очистки"""
+    def _query():
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT group_message_id FROM message_map WHERE ticket_id = %s", (ticket_id,))
+                return [row[0] for row in cur.fetchall()]
     return await asyncio.to_thread(_query)
 
 async def get_ticket_info(ticket_id: int):
@@ -418,6 +472,29 @@ async def delete_pending_rejection(prompt_message_id: int):
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM pending_rejections WHERE prompt_message_id = %s", (prompt_message_id,))
     await asyncio.to_thread(_query)
+
+# ----------------------------------------------------------------------
+# АВТООЧИСТКА ЗАКРЫТЫХ ТИКЕТОВ ЧЕРЕЗ 1 ЧАС
+# ----------------------------------------------------------------------
+async def schedule_ticket_cleanup(ticket_id: int, card_message_id: int = None):
+    """Ждёт ровно 1 час (3600 сек) и удаляет всю переписку по тикету из админ-чата"""
+    await asyncio.sleep(3600)
+    try:
+        msg_ids = await get_ticket_messages(ticket_id)
+        if card_message_id and card_message_id not in msg_ids:
+            msg_ids.append(card_message_id)
+
+        for m_id in msg_ids:
+            try:
+                await bot.delete_message(chat_id=ADMIN_CHAT_ID, message_id=m_id)
+            except TelegramBadRequest:
+                pass
+            except Exception:
+                pass
+            await asyncio.sleep(0.05)
+        logging.info(f"Тикет №{ticket_id} успешно очищен из чата поддержки через 1 час.")
+    except Exception as e:
+        logging.error(f"Ошибка при очистке тикета №{ticket_id}: {e}")
 
 # ----------------------------------------------------------------------
 # СОСТОЯНИЯ (FSM)
@@ -604,13 +681,14 @@ async def callback_admin_list_stats(call: CallbackQuery):
         text = "👥 <b>Статистика по администраторам:</b>\n\nПока нет закрытых тикетов у админов."
     else:
         text = "👥 <b>Статистика по администраторам:</b>\n\n"
-        for admin_id, closed_cnt, avg_score in rows:
+        for admin_id, closed_cnt, avg_score, agent_no in rows:
             try:
                 chat_member = await bot.get_chat(admin_id)
                 name = chat_member.full_name
             except Exception:
                 name = f"ID: {admin_id}"
-            text += f"👤 <b>{html.escape(name)}</b> (<code>{admin_id}</code>)\n"
+            agent_str = f" [Агент #{agent_no}]" if agent_no else ""
+            text += f"👤 <b>{html.escape(name)}</b>{agent_str} (<code>{admin_id}</code>)\n"
             text += f"   • Закрыто тикетов: <code>{closed_cnt}</code>\n"
             text += f"   • Средняя оценка: <code>{round(float(avg_score), 2)} / 5.0</code>\n\n"
 
@@ -799,7 +877,8 @@ async def process_helper_experience(message: Message, state: FSMContext):
     sent = await bot.send_message(ADMIN_CHAT_ID, admin_text, reply_markup=helper_decision_kb(user.id), parse_mode="HTML")
     await map_message(sent.message_id, user.id, 0)
     kb = await main_keyboard(user.id)
-    await message.answer("✅ Ваша анкета успешно отправлена администрации! Ожидайте ответа.", reply_markup=kb, parse_mode="HTML")
+    night_txt = get_night_notice()
+    await message.answer(f"✅ Ваша анкета успешно отправлена администрации! Ожидайте ответа.{night_txt}", reply_markup=kb, parse_mode="HTML")
     await state.clear()
 
 @router.callback_query(F.data.startswith("helper_accept_"))
@@ -870,7 +949,8 @@ async def process_secret_activity(message: Message, state: FSMContext):
     sent = await bot.send_message(ADMIN_CHAT_ID, admin_text, reply_markup=secret_decision_kb(user.id), parse_mode="HTML")
     await map_message(sent.message_id, user.id, 0)
     kb = await main_keyboard(user.id)
-    await message.answer("✅ Ваша заявка в искатели секреток успешно отправлена! Ожидайте ответа.", reply_markup=kb, parse_mode="HTML")
+    night_txt = get_night_notice()
+    await message.answer(f"✅ Ваша заявка в искатели секреток успешно отправлена! Ожидайте ответа.{night_txt}", reply_markup=kb, parse_mode="HTML")
     await state.clear()
 
 @router.callback_query(F.data.startswith("secret_accept_"))
@@ -956,10 +1036,10 @@ async def process_friends_nickname(message: Message, state: FSMContext):
     admin_text = f"👯‍♀️ <b>#Друзья | Заявка №{ticket_id}</b>\n👤 От: {user_mention} | ID: <code>{message.from_user.id}</code>\n\nНик: <code>{html.escape(message.text or '')}</code>"
     sent = await bot.send_message(ADMIN_CHAT_ID, admin_text, reply_markup=take_ticket_kb(ticket_id), parse_mode="HTML")
     await map_message(sent.message_id, message.from_user.id, ticket_id)
-    await message.answer(f"✅ Заявка №{ticket_id} создана!", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
+    night_txt = get_night_notice()
+    await message.answer(f"✅ Заявка №{ticket_id} создана!{night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
     await state.clear()
 
-# Поддержка как чистого текста, так и фото с текстом для вопроса
 @router.message(Form.question_content, F.photo | F.text)
 async def process_question(message: Message, state: FSMContext):
     if await check_active_ticket(message): return
@@ -985,7 +1065,8 @@ async def process_question(message: Message, state: FSMContext):
         )
 
     await map_message(sent.message_id, message.from_user.id, ticket_id)
-    await message.answer(f"✅ Вопрос №{ticket_id} отправлен!", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
+    night_txt = get_night_notice()
+    await message.answer(f"✅ Вопрос №{ticket_id} отправлен!{night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
     await state.clear()
 
 @router.message(Form.complaint_reason)
@@ -1015,7 +1096,8 @@ async def process_c_photo(message: Message, state: FSMContext):
     )
     sent = await bot.send_photo(ADMIN_CHAT_ID, photo=photo_id, caption=admin_text, reply_markup=take_ticket_kb(ticket_id), parse_mode="HTML")
     await map_message(sent.message_id, message.from_user.id, ticket_id)
-    await message.answer(f"✅ Жалоба №{ticket_id} отправлена!", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
+    night_txt = get_night_notice()
+    await message.answer(f"✅ Жалоба №{ticket_id} отправлена!{night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
     await state.clear()
 
 @router.message(Form.appeal_nickname)
@@ -1038,7 +1120,8 @@ async def process_a_reason(message: Message, state: FSMContext):
     )
     sent = await bot.send_message(ADMIN_CHAT_ID, admin_text, reply_markup=take_ticket_kb(ticket_id), parse_mode="HTML")
     await map_message(sent.message_id, message.from_user.id, ticket_id)
-    await message.answer(f"✅ Обжалование №{ticket_id} отправлено!", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
+    night_txt = get_night_notice()
+    await message.answer(f"✅ Обжалование №{ticket_id} отправлено!{night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
     await state.clear()
 
 # ----------------------------------------------------------------------
@@ -1056,23 +1139,27 @@ async def take_ticket_handler(call: CallbackQuery):
         await call.answer("❌ Заявка уже занята или обработана!", show_alert=True)
         return
 
+    # Получаем или выдаём порядковый номер агента
+    agent_number = await get_or_create_agent_number(call.from_user.id)
     await activate_ticket(ticket_id, call.from_user.id)
+
     if ticket_info:
         try:
             await bot.send_message(
                 ticket_info[0],
-                f"👨‍💻 Администратор <b>{html.escape(call.from_user.full_name)}</b> взял вашу заявку <b>№{ticket_id}</b> в работу!\nТеперь вы можете писать сюда сообщения.",
+                f"👨‍💻 <b>Агент #{agent_number}</b> взял вашу заявку <b>№{ticket_id}</b> в работу!\nТеперь вы можете писать сюда сообщения.",
                 parse_mode="HTML"
             )
         except Exception:
             pass
 
-    new_text = (call.message.caption or call.message.text or "") + f"\n\n🟢 <b>В работе у:</b> {call.from_user.mention_html()}"
+    # В админ-чате видно и реальное имя, и номер агента
+    new_text = (call.message.caption or call.message.text or "") + f"\n\n🟢 <b>В работе у:</b> {call.from_user.mention_html()} (Агент #{agent_number})"
     if call.message.photo:
         await call.message.edit_caption(caption=new_text, reply_markup=close_ticket_kb(ticket_id, call.from_user.id), parse_mode="HTML")
     else:
         await call.message.edit_text(text=new_text, reply_markup=close_ticket_kb(ticket_id, call.from_user.id), parse_mode="HTML")
-    await call.answer(f"Заявка №{ticket_id} принята!")
+    await call.answer(f"Заявка №{ticket_id} принята (Вы Агент #{agent_number})!")
 
 @router.callback_query(F.data.startswith("reject_"))
 async def reject_ticket_handler(call: CallbackQuery):
@@ -1093,6 +1180,7 @@ async def reject_ticket_handler(call: CallbackQuery):
         parse_mode="HTML"
     )
     await add_pending_rejection(prompt_msg.message_id, ticket_id, call.message.message_id)
+    await map_message(prompt_msg.message_id, 0, ticket_id)
     await call.answer("Напишите причину отказа в ответ на сообщение бота!")
 
 @router.callback_query(F.data.startswith("close_"))
@@ -1114,7 +1202,7 @@ async def close_ticket_handler(call: CallbackQuery):
         try:
             await bot.send_message(
                 ticket_info[0],
-                f"🔒 Ваша заявка <b>№{ticket_id}</b> закрыта администрацией.\nОцените качество поддержки:",
+                f"🔒 Ваша заявка <b>№{ticket_id}</b> закрыта поддержкой.\nОцените качество обслуживания:",
                 parse_mode="HTML",
                 reply_markup=rating_kb(ticket_id)
             )
@@ -1128,6 +1216,9 @@ async def close_ticket_handler(call: CallbackQuery):
         await call.message.edit_text(text=(call.message.text or "") + status_text, parse_mode="HTML")
     await call.answer("Заявка закрыта!")
 
+    # Запускаем фоновую очистку чата через 1 час
+    asyncio.create_task(schedule_ticket_cleanup(ticket_id, call.message.message_id))
+
 @router.callback_query(F.data.startswith("user_cancel_"))
 async def user_cancel_ticket(call: CallbackQuery):
     ticket_id = int(call.data.split("_")[2])
@@ -1136,6 +1227,7 @@ async def user_cancel_ticket(call: CallbackQuery):
         await close_ticket_db(ticket_id, 'closed')
         await call.message.edit_text(f"❌ Заявка <b>№{ticket_id}</b> отменена вами.", parse_mode="HTML")
         await call.answer("Заявка отменена")
+        asyncio.create_task(schedule_ticket_cleanup(ticket_id, None))
     else:
         await call.answer("❌ Заявка уже взята в работу или закрыта, отмена недоступна.", show_alert=True)
 
@@ -1334,6 +1426,7 @@ async def cmd_ban_reply(message: Message):
 
     if ticket_id:
         await close_ticket_db(ticket_id, 'rejected')
+        asyncio.create_task(schedule_ticket_cleanup(ticket_id, None))
 
     try:
         await bot.send_message(
@@ -1398,7 +1491,7 @@ async def cmd_unban(message: Message):
     await message.answer(f"✅ Пользователь с ID <code>{user_id}</code> успешно разблокирован.", parse_mode="HTML")
 
 # ----------------------------------------------------------------------
-# ОТВЕТ ХЕЛПЕРА В ГРУППЕ (ДОЛЖЕН ИДТИ СТРОГО ПОСЛЕ СЛУЖЕБНЫХ КОМАНД!)
+# ОТВЕТ ХЕЛПЕРА В ГРУППЕ (СТРОГО ПОСЛЕ СЛУЖЕБНЫХ КОМАНД!)
 # ----------------------------------------------------------------------
 @router.message(F.chat.id == ADMIN_CHAT_ID, F.reply_to_message)
 async def admin_reply_in_group(message: Message):
@@ -1433,6 +1526,7 @@ async def admin_reply_in_group(message: Message):
 
         await delete_pending_rejection(replied_msg_id)
         await message.answer(f"✅ Отказ по заявке №{pending_ticket_id} отправлен.")
+        asyncio.create_task(schedule_ticket_cleanup(pending_ticket_id, card_message_id))
         return
 
     mapping = await get_user_by_group_msg(replied_msg_id)
@@ -1446,14 +1540,17 @@ async def admin_reply_in_group(message: Message):
                 return
 
             await touch_ticket(ticket_id)
-            admin_name = html.escape(message.from_user.full_name)
-            client_text = f"👨‍💻 <b>Ответ поддержки ({admin_name}):</b>\n\n{html.escape(message.text or message.caption or '')}"
+            agent_no = await get_or_create_agent_number(message.from_user.id)
+            
+            # Анонимный ответ для пользователя:
+            client_text = f"👨‍💻 <b>Ответ поддержки (Агент #{agent_no}):</b>\n\n{html.escape(message.text or message.caption or '')}"
             try:
                 if message.photo:
                     await bot.send_photo(user_id, photo=message.photo[-1].file_id, caption=client_text, parse_mode="HTML")
                 else:
                     await bot.send_message(user_id, client_text, parse_mode="HTML")
                 await message.react([{"type": "emoji", "emoji": "👍"}])
+                await map_message(message.message_id, user_id, ticket_id)
             except Exception as e:
                 await message.answer(f"❌ Ошибка отправки: {e}")
 
@@ -1481,12 +1578,14 @@ async def reminder_worker():
 
                         # 2. Заявки, взятые в работу (active), без ответа > 20 минут
                         cur.execute("""
-                            SELECT ticket_id, admin_id, user_id,
-                                   EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - updated_at))/60 as mins_passed
-                            FROM tickets
-                            WHERE status = 'active'
-                              AND reminded_idle = FALSE
-                              AND updated_at <= CURRENT_TIMESTAMP - INTERVAL '20 minutes'
+                            SELECT t.ticket_id, t.admin_id, t.user_id,
+                                   EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - t.updated_at))/60 as mins_passed,
+                                   a.agent_number
+                            FROM tickets t
+                            LEFT JOIN admin_agents a ON t.admin_id = a.admin_id
+                            WHERE t.status = 'active' 
+                              AND t.reminded_idle = FALSE
+                              AND t.updated_at <= CURRENT_TIMESTAMP - INTERVAL '20 minutes'
                         """)
                         idle = cur.fetchall()
 
@@ -1504,7 +1603,8 @@ async def reminder_worker():
                     f"Пожалуйста, возьмите тикет в работу!"
                 )
                 try:
-                    await bot.send_message(ADMIN_CHAT_ID, alert_text, parse_mode="HTML")
+                    sent = await bot.send_message(ADMIN_CHAT_ID, alert_text, parse_mode="HTML")
+                    await map_message(sent.message_id, u_id, t_id)
                     def _mark():
                         with get_db() as conn:
                             with conn.cursor() as cur:
@@ -1514,11 +1614,12 @@ async def reminder_worker():
                     logging.error(f"Ошибка отправки напоминания о заявке №{t_id}: {e}")
 
             # Напоминаем о зависших в работе заявках (>20 минут бездействия)
-            for t_id, adm_id, u_id, mins in idle_tickets:
-                admin_mention = f"ID: <code>{adm_id}</code>"
+            for t_id, adm_id, u_id, mins, agent_no in idle_tickets:
+                agent_str = f"Агент #{agent_no}" if agent_no else f"ID {adm_id}"
+                admin_mention = agent_str
                 try:
                     chat_member = await bot.get_chat(adm_id)
-                    admin_mention = f'<a href="tg://user?id={adm_id}">{html.escape(chat_member.full_name)}</a>'
+                    admin_mention = f'<a href="tg://user?id={adm_id}">{html.escape(chat_member.full_name)}</a> ({agent_str})'
                 except Exception:
                     pass
 
@@ -1528,7 +1629,8 @@ async def reminder_worker():
                     f"Не забудьте ответить пользователю или закрыть заявку!"
                 )
                 try:
-                    await bot.send_message(ADMIN_CHAT_ID, alert_text, parse_mode="HTML")
+                    sent = await bot.send_message(ADMIN_CHAT_ID, alert_text, parse_mode="HTML")
+                    await map_message(sent.message_id, u_id, t_id)
                     def _mark_idle():
                         with get_db() as conn:
                             with conn.cursor() as cur:
@@ -1540,7 +1642,6 @@ async def reminder_worker():
         except Exception as err:
             logging.error(f"Ошибка в цикле reminder_worker: {err}")
 
-        # Проверяем каждые 60 секунд
         await asyncio.sleep(60)
 
 # ----------------------------------------------------------------------
@@ -1561,7 +1662,6 @@ async def web_server():
 
 async def main():
     await web_server()
-    # Запуск фонового воркера напоминаний
     asyncio.create_task(reminder_worker())
     logging.info("Бот успешно запущен и готов к работе!")
     await dp.start_polling(bot)
