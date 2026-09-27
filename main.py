@@ -1077,7 +1077,7 @@ async def process_rating(call: CallbackQuery):
     await call.answer("Оценка сохранена!")
 
 # ----------------------------------------------------------------------
-# ДИАЛОГ И РАБОТА В АДМИН-ЧАТЕ
+# ДИАЛОГ В ЛС С ПОЛЬЗОВАТЕЛЕМ
 # ----------------------------------------------------------------------
 @router.message(F.chat.type == "private")
 async def user_private_message(message: Message, state: FSMContext):
@@ -1103,65 +1103,8 @@ async def user_private_message(message: Message, state: FSMContext):
     kb = await main_keyboard(message.from_user.id)
     await message.answer("⚠️ Пожалуйста, выберите нужный пункт меню для обращения.", reply_markup=kb)
 
-@router.message(F.chat.id == ADMIN_CHAT_ID, F.reply_to_message)
-async def admin_reply_in_group(message: Message):
-    if message.text and message.text.startswith("/"):
-        return
-
-    replied_msg_id = message.reply_to_message.message_id
-    pending_data = await get_pending_rejection(replied_msg_id)
-
-    if pending_data:
-        pending_ticket_id, card_message_id = pending_data
-        ticket_info = await get_ticket_info(pending_ticket_id)
-        if ticket_info:
-            reason = html.escape(message.text or message.caption or "Без причины")
-            await close_ticket_db(pending_ticket_id, 'rejected')
-            try:
-                user_kb = await main_keyboard(ticket_info[0])
-                await bot.send_message(
-                    ticket_info[0],
-                    f"❌ Заявка <b>№{pending_ticket_id}</b> отклонена.\n<b>Причина:</b> {reason}",
-                    parse_mode="HTML",
-                    reply_markup=user_kb
-                )
-            except Exception:
-                pass
-            
-            # Редактируем саму карточку тикета и убираем кнопки
-            try:
-                if card_message_id:
-                    await bot.edit_message_reply_markup(chat_id=ADMIN_CHAT_ID, message_id=card_message_id, reply_markup=None)
-            except Exception as e:
-                logging.error(f"Не удалось обновить карточку тикета: {e}")
-
-        await delete_pending_rejection(replied_msg_id)
-        await message.answer(f"✅ Отказ по заявке №{pending_ticket_id} отправлен.")
-        return
-
-    mapping = await get_user_by_group_msg(replied_msg_id)
-    if mapping:
-        user_id, ticket_id = mapping[0], mapping[1]
-        ticket_info = await get_ticket_info(ticket_id)
-
-        if ticket_info and ticket_info[2] == 'active':
-            if ticket_info[1] != message.from_user.id and not await is_main_admin(message.from_user.id):
-                await message.answer("❌ Этот тикет ведет другой администратор. Вы не можете в него отвечать!")
-                return
-
-            admin_name = html.escape(message.from_user.full_name)
-            client_text = f"👨‍💻 <b>Ответ поддержки ({admin_name}):</b>\n\n{html.escape(message.text or message.caption or '')}"
-            try:
-                if message.photo:
-                    await bot.send_photo(user_id, photo=message.photo[-1].file_id, caption=client_text, parse_mode="HTML")
-                else:
-                    await bot.send_message(user_id, client_text, parse_mode="HTML")
-                await message.react([{"type": "emoji", "emoji": "👍"}])
-            except Exception as e:
-                await message.answer(f"❌ Ошибка отправки: {e}")
-
 # ----------------------------------------------------------------------
-# КОМАНДЫ МОДЕРАЦИИ И РАССЫЛКИ
+# КОМАНДЫ В АДМИН-ЧАТЕ (ДОЛЖНЫ ИДТИ СТРОГО ВЫШЕ ПЕРЕСЫЛЬЩИКА СООБЩЕНИЙ!)
 # ----------------------------------------------------------------------
 @router.message(Command("news"), F.chat.id == ADMIN_CHAT_ID)
 async def cmd_news_broadcast(message: Message):
@@ -1248,23 +1191,39 @@ async def cmd_ban_reply(message: Message):
     ticket_id = None
     reason = "Нарушение правил"
 
+    # 1. Если ответили Reply на карточку или сообщение
     if message.reply_to_message:
         replied_msg = message.reply_to_message
+        
+        # А) Ищем по message_map
         mapping = await get_user_by_group_msg(replied_msg.message_id)
         if mapping:
             user_id, ticket_id = mapping[0], mapping[1]
 
-        if not user_id:
-            raw_text = replied_msg.text or replied_msg.caption or ""
-            match = re.search(r"ID:?\s*<[^>]+>?(\d+)<[^>]+>?", raw_text, re.IGNORECASE)
-            if not match:
-                match = re.search(r"ID:?\s*(\d+)", raw_text, re.IGNORECASE)
-            if match:
-                user_id = int(match.group(1))
+        # Б) Ищем по тексту карточки
+        raw_text = replied_msg.text or replied_msg.caption or ""
+        
+        if not user_id and raw_text:
+            match_id = re.search(r"ID:?\s*<[^>]+>?(\d+)<[^>]+>?", raw_text, re.IGNORECASE)
+            if not match_id:
+                match_id = re.search(r"ID:?\s*(\d+)", raw_text, re.IGNORECASE)
+            if match_id:
+                user_id = int(match_id.group(1))
+
+        # В) Если ID не найден, пробуем найти по номеру тикета "Заявка №..."
+        if not user_id and raw_text:
+            match_ticket = re.search(r"№(\d+)", raw_text)
+            if match_ticket:
+                t_id = int(match_ticket.group(1))
+                t_info = await get_ticket_info(t_id)
+                if t_info:
+                    user_id, ticket_id = t_info[0], t_id
 
         args = message.text.split(maxsplit=1)
         if len(args) > 1:
             reason = args[1].strip()
+
+    # 2. Если написали без Reply: /ban ID [причина]
     else:
         parts = message.text.split(maxsplit=2)
         if len(parts) > 1 and parts[1].isdigit():
@@ -1272,17 +1231,20 @@ async def cmd_ban_reply(message: Message):
             if len(parts) > 2:
                 reason = parts[2].strip()
 
+    # 3. Если пользователя определить не удалось
     if not user_id:
         await message.answer(
             "❌ <b>Не удалось определить пользователя.</b>\n\n"
-            "• Ответьте командой <code>/ban [причина]</code> на карточку тикета или сообщение пользователя.\n"
-            "• Либо используйте прямой формат: <code>/ban [ID] [причина]</code>",
+            "• Ответьте командой <code>/ban [причина]</code> на карточку тикета или сообщение игрока.\n"
+            "• Либо введите напрямую: <code>/ban [ID] [причина]</code>",
             parse_mode="HTML"
         )
         return
 
-    if await is_main_admin(user_id):
-        await message.answer("❌ Нельзя заблокировать главного администратора!")
+    # Защита создателя (себя самого банить для теста разрешено)
+    is_owner_target = (OWNER_ID and user_id == OWNER_ID)
+    if is_owner_target and user_id != message.from_user.id:
+        await message.answer("❌ Нельзя заблокировать создателя бота!")
         return
 
     if not ticket_id:
@@ -1298,15 +1260,17 @@ async def cmd_ban_reply(message: Message):
     try:
         await bot.send_message(
             user_id,
-            f"❌ <b>Ваш доступ к поддержке заблокирован.</b>\n<b>Причина:</b> {html.escape(reason)}",
+            f"❌ <b>Ваш доступ к поддержке заблокирован.</b>\n"
+            f"<b>Причина:</b> {html.escape(reason)}",
             parse_mode="HTML"
         )
     except Exception:
         pass
 
     ticket_note = f" (тикет №{ticket_id} закрыт)" if ticket_id else ""
+    test_note = " <i>[Тест создателя]</i>" if is_owner_target else ""
     await message.answer(
-        f"✅ Пользователь с ID <code>{user_id}</code> успешно заблокирован{ticket_note}.\n"
+        f"✅ Пользователь с ID <code>{user_id}</code> успешно заблокирован{ticket_note}.{test_note}\n"
         f"<b>Причина:</b> {html.escape(reason)}",
         parse_mode="HTML"
     )
@@ -1329,6 +1293,65 @@ async def cmd_unban(message: Message):
         await message.answer(f"✅ Пользователь <code>{user_id}</code> разблокирован.", parse_mode="HTML")
     except ValueError:
         await message.answer("❌ Неверный формат ID.")
+
+# ----------------------------------------------------------------------
+# ОТВЕТ ХЕЛПЕРА В ГРУППЕ (ДОЛЖЕН ИДТИ СТРОГО ПОСЛЕ СЛУЖЕБНЫХ КОМАНД!)
+# ----------------------------------------------------------------------
+@router.message(F.chat.id == ADMIN_CHAT_ID, F.reply_to_message)
+async def admin_reply_in_group(message: Message):
+    if message.text and message.text.startswith("/"):
+        return
+
+    replied_msg_id = message.reply_to_message.message_id
+    pending_data = await get_pending_rejection(replied_msg_id)
+
+    if pending_data:
+        pending_ticket_id, card_message_id = pending_data
+        ticket_info = await get_ticket_info(pending_ticket_id)
+        if ticket_info:
+            reason = html.escape(message.text or message.caption or "Без причины")
+            await close_ticket_db(pending_ticket_id, 'rejected')
+            try:
+                user_kb = await main_keyboard(ticket_info[0])
+                await bot.send_message(
+                    ticket_info[0],
+                    f"❌ Заявка <b>№{pending_ticket_id}</b> отклонена.\n<b>Причина:</b> {reason}",
+                    parse_mode="HTML",
+                    reply_markup=user_kb
+                )
+            except Exception:
+                pass
+            
+            try:
+                if card_message_id:
+                    await bot.edit_message_reply_markup(chat_id=ADMIN_CHAT_ID, message_id=card_message_id, reply_markup=None)
+            except Exception as e:
+                logging.error(f"Не удалось обновить карточку тикета: {e}")
+
+        await delete_pending_rejection(replied_msg_id)
+        await message.answer(f"✅ Отказ по заявке №{pending_ticket_id} отправлен.")
+        return
+
+    mapping = await get_user_by_group_msg(replied_msg_id)
+    if mapping:
+        user_id, ticket_id = mapping[0], mapping[1]
+        ticket_info = await get_ticket_info(ticket_id)
+
+        if ticket_info and ticket_info[2] == 'active':
+            if ticket_info[1] != message.from_user.id and not await is_main_admin(message.from_user.id):
+                await message.answer("❌ Этот тикет ведет другой администратор. Вы не можете в него отвечать!")
+                return
+
+            admin_name = html.escape(message.from_user.full_name)
+            client_text = f"👨‍💻 <b>Ответ поддержки ({admin_name}):</b>\n\n{html.escape(message.text or message.caption or '')}"
+            try:
+                if message.photo:
+                    await bot.send_photo(user_id, photo=message.photo[-1].file_id, caption=client_text, parse_mode="HTML")
+                else:
+                    await bot.send_message(user_id, client_text, parse_mode="HTML")
+                await message.react([{"type": "emoji", "emoji": "👍"}])
+            except Exception as e:
+                await message.answer(f"❌ Ошибка отправки: {e}")
 
 # ----------------------------------------------------------------------
 # ВЕБ-СЕРВЕР И ЗАПУСК
