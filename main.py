@@ -52,6 +52,12 @@ NUM_7 = "<tg-emoji emoji-id='5287334204298773700'>🔥</tg-emoji>"
 NUM_8 = "<tg-emoji emoji-id='5287337962395158575'>🔥</tg-emoji>"
 NUM_9 = "<tg-emoji emoji-id='5287610387875775295'>🔥</tg-emoji>"
 
+# Кастомные TGP иконки
+ICON_CROSS = "<tg-emoji emoji-id='5348362704572664028'>🔥</tg-emoji>"
+ICON_LOCK = "<tg-emoji emoji-id='5348207836641902790'>🔥</tg-emoji>"
+ICON_STAR = "<tg-emoji emoji-id='5348446245981536690'>🔥</tg-emoji>"
+ICON_WARN = "<tg-emoji emoji-id='5348110675891731556'>🔥</tg-emoji>"
+
 def get_user_mention(user):
     safe_name = html.escape(user.full_name)
     return f'<a href="tg://user?id={user.id}">{safe_name}</a>'
@@ -64,7 +70,7 @@ def is_night_time() -> bool:
 
 def get_night_notice() -> str:
     if is_night_time():
-        return "\n\n<tg-emoji emoji-id='5348110675891731556'>🔥</tg-emoji> <i>Обратите внимание: сейчас ночное время (с 22:00 до 10:00 МСК). Ваша заявка принята, но ответ модераторов может поступить утром!</i>"
+        return f"\n\n{ICON_WARN} <i>Обратите внимание: сейчас ночное время (с 22:00 до 10:00 МСК). Ваша заявка принята, но ответ модераторов может поступить утром!</i>"
     return ""
 
 # ----------------------------------------------------------------------
@@ -90,7 +96,6 @@ class ThrottlingMiddleware(BaseMiddleware):
             if current_time - last_time < self.limit:
                 if isinstance(event, CallbackQuery):
                     try:
-                        # Всплывающее системное окно не поддерживает HTML-теги
                         await event.answer("⚠️ Не спамьте кнопками! Подождите секунду.", show_alert=False)
                     except Exception:
                         pass
@@ -619,7 +624,7 @@ async def start_cmd(message: Message, state: FSMContext):
     banned = await is_banned(message.from_user.id)
     if banned:
         await message.answer(
-            f"<tg-emoji emoji-id='5348362704572664028'>🔥</tg-emoji> Вы заблокированы в поддержке.\n<b>Причина:</b> {html.escape(banned[0])}",
+            f"{ICON_CROSS} Вы заблокированы в поддержке.\n<b>Причина:</b> {html.escape(banned[0])}",
             parse_mode="HTML"
         )
         return
@@ -671,8 +676,8 @@ async def callback_stats(call: CallbackQuery):
         f"<tg-emoji emoji-id='5346136537123801643'>🔥</tg-emoji> Активных пользователей: <code>{users_count}</code>\n"
         f"<tg-emoji emoji-id='5348348681504441752'>🔥</tg-emoji> Всего тикетов: <code>{total}</code>\n"
         f"<tg-emoji emoji-id='5346300789558101141'>🔥</tg-emoji> Успешно закрыто: <code>{closed}</code>\n"
-        f"<tg-emoji emoji-id='5348362704572664028'>🔥</tg-emoji> Отклонено: <code>{rejected}</code>\n"
-        f"<tg-emoji emoji-id='5348446245981536690'>🔥</tg-emoji> Общая оценка саппорта: <code>{avg_rating} / 5.0</code>"
+        f"{ICON_CROSS} Отклонено: <code>{rejected}</code>\n"
+        f"{ICON_STAR} Общая оценка саппорта: <code>{avg_rating} / 5.0</code>"
     )
     kb = await admin_panel_kb()
     await call.message.edit_text(stats_text, reply_markup=kb, parse_mode="HTML")
@@ -763,7 +768,7 @@ async def process_add_main_admin(message: Message, state: FSMContext):
         kb = await main_keyboard(message.from_user.id)
         await message.answer(f"<tg-emoji emoji-id='5346300789558101141'>🔥</tg-emoji> Пользователь <code>{new_id}</code> успешно назначен главным администратором!", reply_markup=kb, parse_mode="HTML")
     except ValueError:
-        await message.answer("<tg-emoji emoji-id='5348362704572664028'>🔥</tg-emoji> Неверный формат ID. Введите числовой Telegram ID:")
+        await message.answer(f"{ICON_CROSS} Неверный формат ID. Введите числовой Telegram ID:", parse_mode="HTML")
 
 @router.callback_query(F.data == "del_main_admin_start")
 async def del_main_admin_start(call: CallbackQuery, state: FSMContext):
@@ -781,7 +786,7 @@ async def process_del_main_admin(message: Message, state: FSMContext):
     try:
         del_id = int(message.text.strip())
         if OWNER_ID and del_id == OWNER_ID:
-            await message.answer("<tg-emoji emoji-id='5348362704572664028'>🔥</tg-emoji> Нельзя удалить создателя бота!")
+            await message.answer(f"{ICON_CROSS} Нельзя удалить создателя бота!", parse_mode="HTML")
             return
         def _query():
             with get_db() as conn:
@@ -792,7 +797,7 @@ async def process_del_main_admin(message: Message, state: FSMContext):
         kb = await main_keyboard(message.from_user.id)
         await message.answer(f"<tg-emoji emoji-id='5346300789558101141'>🔥</tg-emoji> Пользователь <code>{del_id}</code> снят с поста главного администратора.", reply_markup=kb, parse_mode="HTML")
     except ValueError:
-        await message.answer("<tg-emoji emoji-id='5348362704572664028'>🔥</tg-emoji> Неверный формат ID. Введите числовой Telegram ID:")
+        await message.answer(f"{ICON_CROSS} Неверный формат ID. Введите числовой Telegram ID:", parse_mode="HTML")
 
 @router.callback_query(F.data == "toggle_friend")
 async def toggle_friend_callback(call: CallbackQuery):
@@ -909,7 +914,7 @@ async def helper_reject_callback(call: CallbackQuery):
         return
     user_id = int(call.data.split("_")[2])
     try:
-        await bot.send_message(user_id, "<tg-emoji emoji-id='5346038654819123712'>🔥</tg-emoji> К сожалению, ваша заявка на хелпера была отклонена.", parse_mode="HTML")
+        await bot.send_message(user_id, f"{ICON_CROSS} К сожалению, ваша заявка на хелпера была отклонена.", parse_mode="HTML")
     except Exception:
         pass
     await call.message.edit_text(call.message.text + "\n\n🔴 <b>Статус:</b> Отклонено ❌", parse_mode="HTML")
@@ -981,7 +986,7 @@ async def secret_reject_callback(call: CallbackQuery):
         return
     user_id = int(call.data.split("_")[2])
     try:
-        await bot.send_message(user_id, "<tg-emoji emoji-id='5348362704572664028'>🔥</tg-emoji> К сожалению, ваша заявка в искатели секреток была отклонена.", parse_mode="HTML")
+        await bot.send_message(user_id, f"{ICON_CROSS} К сожалению, ваша заявка в искатели секреток была отклонена.", parse_mode="HTML")
     except Exception:
         pass
     await call.message.edit_text(call.message.text + "\n\n🔴 <b>Статус:</b> Отклонено ❌", parse_mode="HTML")
@@ -994,7 +999,7 @@ async def check_active_ticket(message: Message) -> bool:
     active = await get_active_ticket(message.from_user.id)
     if active:
         await message.answer(
-            f"<tg-emoji emoji-id='5348110675891731556'>🔥</tg-emoji> У вас уже есть активный тикет <b>№{active[0]}</b>.\nДождитесь ответа или закройте его, прежде чем открывать новый.",
+            f"{ICON_WARN} У вас уже есть активный тикет <b>№{active[0]}</b>.\nДождитесь ответа или закройте его, прежде чем открывать новый.",
             parse_mode="HTML"
         )
         return True
@@ -1208,7 +1213,7 @@ async def close_ticket_handler(call: CallbackQuery):
         try:
             await bot.send_message(
                 ticket_info[0],
-                f"🔒 Ваша заявка <b>№{ticket_id}</b> закрыта поддержкой.\nОцените качество обслуживания:",
+                f"{ICON_LOCK} Ваша заявка <b>№{ticket_id}</b> закрыта поддержкой.\nОцените качество обслуживания:",
                 parse_mode="HTML",
                 reply_markup=rating_kb(ticket_id)
             )
@@ -1230,7 +1235,7 @@ async def user_cancel_ticket(call: CallbackQuery):
     ticket_info = await get_ticket_info(ticket_id)
     if ticket_info and ticket_info[2] == 'pending':
         await close_ticket_db(ticket_id, 'closed')
-        await call.message.edit_text(f"❌ Заявка <b>№{ticket_id}</b> отменена вами.", parse_mode="HTML")
+        await call.message.edit_text(f"{ICON_CROSS} Заявка <b>№{ticket_id}</b> отменена вами.", parse_mode="HTML")
         await call.answer("Заявка отменена")
         asyncio.create_task(schedule_ticket_cleanup(ticket_id, None))
     else:
@@ -1252,9 +1257,9 @@ async def process_rating(call: CallbackQuery):
     await save_rating_db(ticket_id, user_id, admin_id, score)
 
     if await is_main_admin(user_id):
-        await call.message.edit_text(f"⭐ [ТЕСТ АДМИНА] Оценка {score}/5 сохранена, но в общую статистику не пошла.", parse_mode="HTML")
+        await call.message.edit_text(f"{ICON_STAR} [ТЕСТ АДМИНА] Оценка {score}/5 сохранена, но в общую статистику не пошла.", parse_mode="HTML")
     else:
-        await call.message.edit_text(f"⭐ Спасибо за оценку ({score}/5)! Ваше мнение учтено.", parse_mode="HTML")
+        await call.message.edit_text(f"{ICON_STAR} Спасибо за оценку ({score}/5)! Ваше мнение учтено.", parse_mode="HTML")
     
     await call.answer("Оценка сохранена!")
 
@@ -1284,7 +1289,7 @@ async def user_private_message(message: Message, state: FSMContext):
         return
 
     kb = await main_keyboard(message.from_user.id)
-    await message.answer("⚠️ Пожалуйста, выберите нужный пункт меню для обращения.", reply_markup=kb)
+    await message.answer(f"{ICON_WARN} Пожалуйста, выберите нужный пункт меню для обращения.", reply_markup=kb, parse_mode="HTML")
 
 # ----------------------------------------------------------------------
 # КОМАНДЫ В АДМИН-ЧАТЕ (СТРОГО ВЫШЕ ПЕРЕСЫЛЬЩИКА СООБЩЕНИЙ!)
@@ -1292,7 +1297,7 @@ async def user_private_message(message: Message, state: FSMContext):
 @router.message(Command("news"), F.chat.id == ADMIN_CHAT_ID)
 async def cmd_news_broadcast(message: Message):
     if not await is_main_admin(message.from_user.id):
-        await message.answer("❌ Рассылку могут запускать только главные администраторы!")
+        await message.answer(f"{ICON_CROSS} Рассылку могут запускать только главные администраторы!", parse_mode="HTML")
         return
 
     target_msg = message.reply_to_message if message.reply_to_message else None
@@ -1302,7 +1307,7 @@ async def cmd_news_broadcast(message: Message):
         args = message.text.split(maxsplit=1)
         if len(args) < 2:
             await message.answer(
-                f"❌ <b>Использование команды:</b>\n"
+                f"{ICON_CROSS} <b>Использование команды:</b>\n"
                 f"{NUM_1} <code>/news Текст вашей новости</code>\n"
                 f"{NUM_2} Или ответьте (Reply) командой <code>/news</code> на готовый пост/фото/видео.",
                 parse_mode="HTML"
@@ -1410,7 +1415,7 @@ async def cmd_ban_reply(message: Message):
 
     if not user_id:
         await message.answer(
-            "❌ <b>Не удалось определить пользователя.</b>\n\n"
+            f"{ICON_CROSS} <b>Не удалось определить пользователя.</b>\n\n"
             "• Ответьте командой <code>/ban [причина]</code> на карточку тикета или сообщение игрока.\n"
             "• Либо введите напрямую: <code>/ban [ID] [причина]</code>",
             parse_mode="HTML"
@@ -1419,7 +1424,7 @@ async def cmd_ban_reply(message: Message):
 
     is_owner_target = (OWNER_ID and user_id == OWNER_ID)
     if is_owner_target and user_id != message.from_user.id:
-        await message.answer("❌ Нельзя заблокировать создателя бота!")
+        await message.answer(f"{ICON_CROSS} Нельзя заблокировать создателя бота!", parse_mode="HTML")
         return
 
     if not ticket_id:
@@ -1436,7 +1441,7 @@ async def cmd_ban_reply(message: Message):
     try:
         await bot.send_message(
             user_id,
-            f"❌ <b>Ваш доступ к поддержке заблокирован.</b>\n<b>Причина:</b> {html.escape(reason)}",
+            f"{ICON_CROSS} <b>Ваш доступ к поддержке заблокирован.</b>\n<b>Причина:</b> {html.escape(reason)}",
             parse_mode="HTML"
         )
     except Exception:
@@ -1485,7 +1490,7 @@ async def cmd_unban(message: Message):
 
     if not user_id:
         await message.answer(
-            "❌ <b>Не удалось определить пользователя.</b>\n\n"
+            f"{ICON_CROSS} <b>Не удалось определить пользователя.</b>\n\n"
             "• Ответьте командой <code>/unban</code> на карточку тикета или сообщение игрока.\n"
             "• Либо введите напрямую: <code>/unban [user_id]</code>",
             parse_mode="HTML"
@@ -1516,7 +1521,7 @@ async def admin_reply_in_group(message: Message):
                 user_kb = await main_keyboard(ticket_info[0])
                 await bot.send_message(
                     ticket_info[0],
-                    f"❌ Заявка <b>№{pending_ticket_id}</b> отклонена.\n<b>Причина:</b> {reason}",
+                    f"{ICON_CROSS} Заявка <b>№{pending_ticket_id}</b> отклонена.\n<b>Причина:</b> {reason}",
                     parse_mode="HTML",
                     reply_markup=user_kb
                 )
