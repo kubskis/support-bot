@@ -41,6 +41,17 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 
+# Кастомные TGP цифры
+NUM_1 = "<tg-emoji emoji-id='5285184495857715032'>🔥</tg-emoji>"
+NUM_2 = "<tg-emoji emoji-id='5287236502382724614'>🔥</tg-emoji>"
+NUM_3 = "<tg-emoji emoji-id='5287361241117911628'>🔥</tg-emoji>"
+NUM_4 = "<tg-emoji emoji-id='5287402803516427365'>🔥</tg-emoji>"
+NUM_5 = "<tg-emoji emoji-id='5285444878250033485'>🔥</tg-emoji>"
+NUM_6 = "<tg-emoji emoji-id='5285078586259161715'>🔥</tg-emoji>"
+NUM_7 = "<tg-emoji emoji-id='5287334204298773700'>🔥</tg-emoji>"
+NUM_8 = "<tg-emoji emoji-id='5287337962395158575'>🔥</tg-emoji>"
+NUM_9 = "<tg-emoji emoji-id='5287610387875775295'>🔥</tg-emoji>"
+
 def get_user_mention(user):
     safe_name = html.escape(user.full_name)
     return f'<a href="tg://user?id={user.id}">{safe_name}</a>'
@@ -212,7 +223,6 @@ async def is_support_member(user_id: int) -> bool:
     return False
 
 async def get_or_create_agent_number(admin_id: int) -> int:
-    """Выдаёт владельцу #1, остальным по порядку: #2, #3 и т.д."""
     if OWNER_ID and admin_id == OWNER_ID:
         return 1
 
@@ -224,7 +234,6 @@ async def get_or_create_agent_number(admin_id: int) -> int:
                 if row:
                     return row[0]
                 
-                # Получаем следующий свободный порядковый номер
                 cur.execute("SELECT COALESCE(MAX(agent_number), 1) + 1 FROM admin_agents")
                 next_number = cur.fetchone()[0]
                 cur.execute(
@@ -358,7 +367,6 @@ async def get_user_by_group_msg(group_msg_id: int):
     return await asyncio.to_thread(_query)
 
 async def get_ticket_messages(ticket_id: int) -> list:
-    """Получает все ID сообщений в чате группы по тикету для последующей очистки"""
     def _query():
         with get_db() as conn:
             with conn.cursor() as cur:
@@ -477,7 +485,6 @@ async def delete_pending_rejection(prompt_message_id: int):
 # АВТООЧИСТКА ЗАКРЫТЫХ ТИКЕТОВ ЧЕРЕЗ 1 ЧАС
 # ----------------------------------------------------------------------
 async def schedule_ticket_cleanup(ticket_id: int, card_message_id: int = None):
-    """Ждёт ровно 1 час (3600 сек) и удаляет всю переписку по тикету из админ-чата"""
     await asyncio.sleep(3600)
     try:
         msg_ids = await get_ticket_messages(ticket_id)
@@ -611,7 +618,7 @@ async def start_cmd(message: Message, state: FSMContext):
     banned = await is_banned(message.from_user.id)
     if banned:
         await message.answer(
-            f"❌ Вы заблокированы в поддержке.\n<b>Причина:</b> {html.escape(banned[0])}",
+            f"<tg-emoji emoji-id='5348362704572664028'>🔥</tg-emoji> Вы заблокированы в поддержке.\n<b>Причина:</b> {html.escape(banned[0])}",
             parse_mode="HTML"
         )
         return
@@ -640,7 +647,7 @@ async def refresh_menu_handler(message: Message, state: FSMContext):
     if await is_banned(message.from_user.id): return
     await state.clear()
     kb = await main_keyboard(message.from_user.id)
-    await message.answer("🔄 <b>Меню обновлено!</b>", reply_markup=kb, parse_mode="HTML")
+    await message.answer("<tg-emoji emoji-id='5346269127059196142'>🔥</tg-emoji> <b>Меню обновлено!</b>", reply_markup=kb, parse_mode="HTML")
 
 @router.message(F.text == BTN_ADMIN_PANEL, F.chat.type == "private")
 async def open_admin_panel(message: Message, state: FSMContext):
@@ -648,7 +655,7 @@ async def open_admin_panel(message: Message, state: FSMContext):
         return
     await state.clear()
     kb = await admin_panel_kb()
-    await message.answer("⚙️ <b>Панель администратора</b>", reply_markup=kb, parse_mode="HTML")
+    await message.answer("<tg-emoji emoji-id='5348292765325212780'>🔥</tg-emoji> <b>Панель администратора</b>", reply_markup=kb, parse_mode="HTML")
 
 @router.callback_query(F.data == "adm_stats")
 async def callback_stats(call: CallbackQuery):
@@ -659,12 +666,12 @@ async def callback_stats(call: CallbackQuery):
     total, closed, rejected, avg_rating = await get_tickets_stats()
 
     stats_text = (
-        "📊 <b>Общая статистика поддержки:</b>\n\n"
-        f"👥 Активных пользователей: <code>{users_count}</code>\n"
-        f"📬 Всего тикетов: <code>{total}</code>\n"
-        f"✅ Успешно закрыто: <code>{closed}</code>\n"
-        f"❌ Отклонено: <code>{rejected}</code>\n"
-        f"⭐ Общая оценка саппорта: <code>{avg_rating} / 5.0</code>"
+        "<tg-emoji emoji-id='5346267671065281783'>🔥</tg-emoji> <b>Общая статистика поддержки:</b>\n\n"
+        f"<tg-emoji emoji-id='5346136537123801643'>🔥</tg-emoji> Активных пользователей: <code>{users_count}</code>\n"
+        f"<tg-emoji emoji-id='5348348681504441752'>🔥</tg-emoji> Всего тикетов: <code>{total}</code>\n"
+        f"<tg-emoji emoji-id='5346300789558101141'>🔥</tg-emoji> Успешно закрыто: <code>{closed}</code>\n"
+        f"<tg-emoji emoji-id='5348362704572664028'>🔥</tg-emoji> Отклонено: <code>{rejected}</code>\n"
+        f"<tg-emoji emoji-id='5348446245981536690'>🔥</tg-emoji> Общая оценка саппорта: <code>{avg_rating} / 5.0</code>"
     )
     kb = await admin_panel_kb()
     await call.message.edit_text(stats_text, reply_markup=kb, parse_mode="HTML")
@@ -678,9 +685,9 @@ async def callback_admin_list_stats(call: CallbackQuery):
     
     rows = await get_admin_list_stats()
     if not rows:
-        text = "👥 <b>Статистика по администраторам:</b>\n\nПока нет закрытых тикетов у админов."
+        text = "<tg-emoji emoji-id='5346136537123801643'>🔥</tg-emoji> <b>Статистика по администраторам:</b>\n\nПока нет закрытых тикетов у админов."
     else:
-        text = "👥 <b>Статистика по администраторам:</b>\n\n"
+        text = "<tg-emoji emoji-id='5346136537123801643'>🔥</tg-emoji> <b>Статистика по администраторам:</b>\n\n"
         for admin_id, closed_cnt, avg_score, agent_no in rows:
             try:
                 chat_member = await bot.get_chat(admin_id)
@@ -688,7 +695,7 @@ async def callback_admin_list_stats(call: CallbackQuery):
             except Exception:
                 name = f"ID: {admin_id}"
             agent_str = f" [Агент #{agent_no}]" if agent_no else ""
-            text += f"👤 <b>{html.escape(name)}</b>{agent_str} (<code>{admin_id}</code>)\n"
+            text += f"<tg-emoji emoji-id='5346136537123801643'>🔥</tg-emoji> <b>{html.escape(name)}</b>{agent_str} (<code>{admin_id}</code>)\n"
             text += f"   • Закрыто тикетов: <code>{closed_cnt}</code>\n"
             text += f"   • Средняя оценка: <code>{round(float(avg_score), 2)} / 5.0</code>\n\n"
 
@@ -700,13 +707,13 @@ async def callback_admin_list_stats(call: CallbackQuery):
 async def back_to_admin_panel(call: CallbackQuery):
     if not await is_main_admin(call.from_user.id): return
     kb = await admin_panel_kb()
-    await call.message.edit_text("⚙️ <b>Панель администратора</b>", reply_markup=kb, parse_mode="HTML")
+    await call.message.edit_text("<tg-emoji emoji-id='5348292765325212780'>🔥</tg-emoji> <b>Панель администратора</b>", reply_markup=kb, parse_mode="HTML")
     await call.answer()
 
 @router.callback_query(F.data == "manage_main_admins")
 async def manage_main_admins_callback(call: CallbackQuery):
     if OWNER_ID and call.from_user.id != OWNER_ID:
-        await call.answer("❌ Только создатель бота может управлять главными админами!", show_alert=True)
+        await call.answer("<tg-emoji emoji-id='5348362704572664028'>🔥</tg-emoji> Только создатель бота может управлять главными админами!", show_alert=True)
         return
     
     def _query():
@@ -719,7 +726,7 @@ async def manage_main_admins_callback(call: CallbackQuery):
     except Exception:
         res = []
 
-    text = "👑 <b>Главные администраторы бота:</b>\n\n"
+    text = "<tg-emoji emoji-id='5345880664447140673'>🔥</tg-emoji> <b>Главные администраторы бота:</b>\n\n"
     for r in res:
         text += f"• <code>{r[0]}</code>\n"
     
@@ -844,19 +851,19 @@ async def start_helper_apply(message: Message, state: FSMContext):
         return
     await state.clear()
     await state.set_state(Form.helper_age)
-    await message.answer("📝 <b>Заявка в команду поддержки (Хелперы)</b>\n\n1️⃣ Укажите ваш возраст:", parse_mode="HTML")
+    await message.answer(f"📝 <b>Заявка в команду поддержки (Хелперы)</b>\n\n{NUM_1} Укажите ваш возраст:", parse_mode="HTML")
 
 @router.message(Form.helper_age)
 async def process_helper_age(message: Message, state: FSMContext):
     await state.update_data(helper_age=message.text)
     await state.set_state(Form.helper_timezone)
-    await message.answer("2️⃣ Укажите ваш часовой пояс (например, МСК, +2 от МСК):", parse_mode="HTML")
+    await message.answer(f"{NUM_2} Укажите ваш часовой пояс (например, МСК, +2 от МСК):", parse_mode="HTML")
 
 @router.message(Form.helper_timezone)
 async def process_helper_timezone(message: Message, state: FSMContext):
     await state.update_data(helper_timezone=message.text)
     await state.set_state(Form.helper_experience)
-    await message.answer("3️⃣ Был ли у вас опыт работы в поддержке или на аналогичных проектах? Опишите кратко:", parse_mode="HTML")
+    await message.answer(f"{NUM_3} Был ли у вас опыт работы в поддержке или на аналогичных проектах? Опишите кратко:", parse_mode="HTML")
 
 @router.message(Form.helper_experience)
 async def process_helper_experience(message: Message, state: FSMContext):
@@ -916,19 +923,19 @@ async def start_secret_apply(message: Message, state: FSMContext):
         return
     await state.clear()
     await state.set_state(Form.secret_age)
-    await message.answer("🔍 <b>Заявка в искатели секреток</b>\n\n1️⃣ Укажите ваш возраст:", parse_mode="HTML")
+    await message.answer(f"🔍 <b>Заявка в искатели секреток</b>\n\n{NUM_1} Укажите ваш возраст:", parse_mode="HTML")
 
 @router.message(Form.secret_age)
 async def process_secret_age(message: Message, state: FSMContext):
     await state.update_data(secret_age=message.text)
     await state.set_state(Form.secret_experience)
-    await message.answer("2️⃣ Есть ли у вас опыт поиска секретов/пасхалок? Расскажите о своих успехах:", parse_mode="HTML")
+    await message.answer(f"{NUM_2} Есть ли у вас опыт поиска секретов/пасхалок? Расскажите о своих успехах:", parse_mode="HTML")
 
 @router.message(Form.secret_experience)
 async def process_secret_experience(message: Message, state: FSMContext):
     await state.update_data(secret_experience=message.text)
     await state.set_state(Form.secret_activity)
-    await message.answer("3️⃣ Сколько времени вы готовы уделять игре и проекту ежедневно?", parse_mode="HTML")
+    await message.answer(f"{NUM_3} Сколько времени вы готовы уделять игре и проекту ежедневно?", parse_mode="HTML")
 
 @router.message(Form.secret_activity)
 async def process_secret_activity(message: Message, state: FSMContext):
@@ -986,7 +993,7 @@ async def check_active_ticket(message: Message) -> bool:
     active = await get_active_ticket(message.from_user.id)
     if active:
         await message.answer(
-            f"⚠️ У вас уже есть активный тикет <b>№{active[0]}</b>.\nДождитесь ответа или закройте его, прежде чем открывать новый.",
+            f"<tg-emoji emoji-id='5348110675891731556'>🔥</tg-emoji> У вас уже есть активный тикет <b>№{active[0]}</b>.\nДождитесь ответа или закройте его, прежде чем открывать новый.",
             parse_mode="HTML"
         )
         return True
@@ -998,7 +1005,7 @@ async def start_complaint(message: Message, state: FSMContext):
     if await is_banned(message.from_user.id) or await check_active_ticket(message): return
     await state.clear()
     await state.set_state(Form.complaint_reason)
-    await message.answer("1️⃣ <b>Суть нарушения:</b>\nОпишите подробно, что именно произошло.", parse_mode="HTML")
+    await message.answer(f"{NUM_1} <b>Суть нарушения:</b>\nОпишите подробно, что именно произошло.", parse_mode="HTML")
 
 @router.message(F.text == BTN_APPEAL, F.chat.type == "private")
 async def start_appeal(message: Message, state: FSMContext):
@@ -1006,7 +1013,7 @@ async def start_appeal(message: Message, state: FSMContext):
     if await is_banned(message.from_user.id) or await check_active_ticket(message): return
     await state.clear()
     await state.set_state(Form.appeal_nickname)
-    await message.answer("1️⃣ <b>Ваш ник в игре:</b>", parse_mode="HTML")
+    await message.answer(f"{NUM_1} <b>Ваш ник в игре:</b>", parse_mode="HTML")
 
 @router.message(F.text == BTN_FRIENDS, F.chat.type == "private")
 async def start_friends(message: Message, state: FSMContext):
@@ -1018,7 +1025,7 @@ async def start_friends(message: Message, state: FSMContext):
     await state.clear()
     friend_nick = await get_setting("friend_nickname", "Администратор")
     await state.set_state(Form.friends_nickname)
-    await message.answer(f"👯‍♀️ Добавьтесь в друзья к игроку: <code>{html.escape(friend_nick)}</code>\n\n1️⃣ Укажите ваш ник в игре:", parse_mode="HTML")
+    await message.answer(f"👯‍♀️ Добавьтесь в друзья к игроку: <code>{html.escape(friend_nick)}</code>\n\n{NUM_1} Укажите ваш ник в игре:", parse_mode="HTML")
 
 @router.message(F.text == BTN_QUESTION, F.chat.type == "private")
 async def start_question(message: Message, state: FSMContext):
@@ -1026,7 +1033,7 @@ async def start_question(message: Message, state: FSMContext):
     if await is_banned(message.from_user.id) or await check_active_ticket(message): return
     await state.clear()
     await state.set_state(Form.question_content)
-    await message.answer("❓ Задайте ваш вопрос (можно отправить текст или фото с описанием):", parse_mode="HTML")
+    await message.answer("<tg-emoji emoji-id='5348435310994802643'>🔥</tg-emoji> Задайте ваш вопрос (можно отправить текст или фото с описанием):", parse_mode="HTML")
 
 @router.message(Form.friends_nickname)
 async def process_friends_nickname(message: Message, state: FSMContext):
@@ -1073,13 +1080,13 @@ async def process_question(message: Message, state: FSMContext):
 async def process_c_reason(message: Message, state: FSMContext):
     await state.update_data(c_reason=message.text)
     await state.set_state(Form.complaint_nickname)
-    await message.answer("2️⃣ Укажите ник нарушителя:", parse_mode="HTML")
+    await message.answer(f"{NUM_2} Укажите ник нарушителя:", parse_mode="HTML")
 
 @router.message(Form.complaint_nickname)
 async def process_c_nickname(message: Message, state: FSMContext):
     await state.update_data(c_nickname=message.text)
     await state.set_state(Form.complaint_photo)
-    await message.answer("3️⃣ Отправьте скриншот-доказательство (плашка уровней должна быть видна):", parse_mode="HTML")
+    await message.answer(f"{NUM_3} Отправьте скриншот-доказательство (плашка уровней должна быть видна):", parse_mode="HTML")
 
 @router.message(Form.complaint_photo, F.photo)
 async def process_c_photo(message: Message, state: FSMContext):
@@ -1104,7 +1111,7 @@ async def process_c_photo(message: Message, state: FSMContext):
 async def process_a_nickname(message: Message, state: FSMContext):
     await state.update_data(a_nickname=message.text)
     await state.set_state(Form.appeal_reason)
-    await message.answer("2️⃣ Опишите, почему вы хотите разблокировку:", parse_mode="HTML")
+    await message.answer(f"{NUM_2} Опишите, почему вы хотите разблокировку:", parse_mode="HTML")
 
 @router.message(Form.appeal_reason)
 async def process_a_reason(message: Message, state: FSMContext):
@@ -1139,7 +1146,6 @@ async def take_ticket_handler(call: CallbackQuery):
         await call.answer("❌ Заявка уже занята или обработана!", show_alert=True)
         return
 
-    # Получаем или выдаём порядковый номер агента
     agent_number = await get_or_create_agent_number(call.from_user.id)
     await activate_ticket(ticket_id, call.from_user.id)
 
@@ -1153,7 +1159,6 @@ async def take_ticket_handler(call: CallbackQuery):
         except Exception:
             pass
 
-    # В админ-чате видно и реальное имя, и номер агента
     new_text = (call.message.caption or call.message.text or "") + f"\n\n🟢 <b>В работе у:</b> {call.from_user.mention_html()} (Агент #{agent_number})"
     if call.message.photo:
         await call.message.edit_caption(caption=new_text, reply_markup=close_ticket_kb(ticket_id, call.from_user.id), parse_mode="HTML")
@@ -1216,7 +1221,6 @@ async def close_ticket_handler(call: CallbackQuery):
         await call.message.edit_text(text=(call.message.text or "") + status_text, parse_mode="HTML")
     await call.answer("Заявка закрыта!")
 
-    # Запускаем фоновую очистку чата через 1 час
     asyncio.create_task(schedule_ticket_cleanup(ticket_id, call.message.message_id))
 
 @router.callback_query(F.data.startswith("user_cancel_"))
@@ -1282,7 +1286,7 @@ async def user_private_message(message: Message, state: FSMContext):
     await message.answer("⚠️ Пожалуйста, выберите нужный пункт меню для обращения.", reply_markup=kb)
 
 # ----------------------------------------------------------------------
-# КОМАНДЫ В АДМИН-ЧАТЕ (ДОЛЖНЫ ИДТИ СТРОГО ВЫШЕ ПЕРЕСЫЛЬЩИКА СООБЩЕНИЙ!)
+# КОМАНДЫ В АДМИН-ЧАТЕ (СТРОГО ВЫШЕ ПЕРЕСЫЛЬЩИКА СООБЩЕНИЙ!)
 # ----------------------------------------------------------------------
 @router.message(Command("news"), F.chat.id == ADMIN_CHAT_ID)
 async def cmd_news_broadcast(message: Message):
@@ -1297,9 +1301,9 @@ async def cmd_news_broadcast(message: Message):
         args = message.text.split(maxsplit=1)
         if len(args) < 2:
             await message.answer(
-                "❌ <b>Использование команды:</b>\n"
-                "1. <code>/news Текст вашей новости</code>\n"
-                "2. Или ответьте (Reply) командой <code>/news</code> на готовый пост/фото/видео.",
+                f"❌ <b>Использование команды:</b>\n"
+                f"{NUM_1} <code>/news Текст вашей новости</code>\n"
+                f"{NUM_2} Или ответьте (Reply) командой <code>/news</code> на готовый пост/фото/видео.",
                 parse_mode="HTML"
             )
             return
@@ -1542,7 +1546,6 @@ async def admin_reply_in_group(message: Message):
             await touch_ticket(ticket_id)
             agent_no = await get_or_create_agent_number(message.from_user.id)
             
-            # Анонимный ответ для пользователя:
             client_text = f"👨‍💻 <b>Ответ поддержки (Агент #{agent_no}):</b>\n\n{html.escape(message.text or message.caption or '')}"
             try:
                 if message.photo:
@@ -1565,7 +1568,6 @@ async def reminder_worker():
             def _check():
                 with get_db() as conn:
                     with conn.cursor() as cur:
-                        # 1. Заявки, которые висят pending более 2 часов
                         cur.execute("""
                             SELECT ticket_id, category, user_id, 
                                    EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - created_at))/3600 as hours_passed
@@ -1576,7 +1578,6 @@ async def reminder_worker():
                         """)
                         unassigned = cur.fetchall()
 
-                        # 2. Заявки, взятые в работу (active), без ответа > 20 минут
                         cur.execute("""
                             SELECT t.ticket_id, t.admin_id, t.user_id,
                                    EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - t.updated_at))/60 as mins_passed,
@@ -1593,7 +1594,6 @@ async def reminder_worker():
 
             unassigned_tickets, idle_tickets = await asyncio.to_thread(_check)
 
-            # Напоминаем о не взятых в работу заявках (>2 часов)
             for t_id, cat, u_id, hrs in unassigned_tickets:
                 hours_str = f"{int(hrs)} ч." if hrs else "2+ ч."
                 alert_text = (
@@ -1613,7 +1613,6 @@ async def reminder_worker():
                 except Exception as e:
                     logging.error(f"Ошибка отправки напоминания о заявке №{t_id}: {e}")
 
-            # Напоминаем о зависших в работе заявках (>20 минут бездействия)
             for t_id, adm_id, u_id, mins, agent_no in idle_tickets:
                 agent_str = f"Агент #{agent_no}" if agent_no else f"ID {adm_id}"
                 admin_mention = agent_str
