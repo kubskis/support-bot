@@ -650,8 +650,9 @@ async def schedule_ticket_cleanup(ticket_id: int, card_message_id: int = None):
 # СОСТОЯНИЯ (FSM)
 # ----------------------------------------------------------------------
 class Form(StatesGroup):
-    complaint_reason = State()
     complaint_nickname = State()
+    complaint_place = State()
+    complaint_reason = State()
     complaint_photos = State()
     
     appeal_nickname = State()
@@ -814,7 +815,7 @@ async def dispatch_ticket_to_admin(user_id: int, user, category: str, text: str,
     }
     title = cat_titles.get(category, "📩 #Заявка")
     
-    # Резервируем тикет в БД сразу с заготовкой текста карточки
+    # Резервируем тикет в БД
     ticket_id = await create_ticket(user_id, category, "")
     admin_card_text = f"{title} | <b>Заявка №{ticket_id}</b>\n👤 От: {user_mention} | ID: <code>{user_id}</code>\n\n{text}"
 
@@ -1744,27 +1745,37 @@ async def collect_media_photos(message: Message, state: FSMContext, key: str = "
         await state.update_data({key: photos})
     return photos
 
-# --- 1. ЖАЛОБА ---
+# --- 1. ЖАЛОБА (С вопросом о месте нарушения) ---
 @router.message(F.text == BTN_COMPLAINT, F.chat.type == "private")
 async def start_complaint(message: Message, state: FSMContext):
     await register_user(message.from_user.id)
     if await is_banned(message.from_user.id) or await check_active_ticket(message): return
     await state.clear()
-    await state.set_state(Form.complaint_reason)
-    await message.answer(f"{NUM_1} <b>Суть нарушения:</b>\nОпишите подробно, что произошло.", parse_mode="HTML")
-
-@router.message(Form.complaint_reason)
-async def process_c_reason(message: Message, state: FSMContext):
-    await state.update_data(c_reason=message.text)
     await state.set_state(Form.complaint_nickname)
-    await message.answer(f"{NUM_2} Укажите ник нарушителя:", parse_mode="HTML")
+    await message.answer(f"{NUM_1} <b>Укажите ник нарушителя:</b>", parse_mode="HTML")
 
 @router.message(Form.complaint_nickname)
 async def process_c_nickname(message: Message, state: FSMContext):
     await state.update_data(c_nickname=message.text)
+    await state.set_state(Form.complaint_place)
+    await message.answer(
+        f"{NUM_2} <b>Где произошло нарушение?</b>\n"
+        "<i>(Саботер | Сервер с секреткой (укажите время поста, если секретка) | Фарм сервер)</i>",
+        parse_mode="HTML"
+    )
+
+@router.message(Form.complaint_place)
+async def process_c_place(message: Message, state: FSMContext):
+    await state.update_data(c_place=message.text)
+    await state.set_state(Form.complaint_reason)
+    await message.answer(f"{NUM_3} <b>Суть нарушения:</b>\nОпишите подробно, что произошло.", parse_mode="HTML")
+
+@router.message(Form.complaint_reason)
+async def process_c_reason(message: Message, state: FSMContext):
+    await state.update_data(c_reason=message.text)
     await state.set_state(Form.complaint_photos)
     await message.answer(
-        f"{NUM_3} {ICON_PHOTO} Отправьте скриншоты-доказательства (<b>до 5 фото</b>, плашка уровней должна быть видна):",
+        f"{NUM_4} {ICON_PHOTO} Отправьте скриншоты-доказательства (<b>до 5 фото</b>, плашка уровней должна быть видна), либо нажмите кнопку ниже:",
         reply_markup=skip_photo_kb("complaint"),
         parse_mode="HTML"
     )
@@ -1777,7 +1788,11 @@ async def skip_c_photos(call: CallbackQuery, state: FSMContext):
             await call.answer()
             return
         data = await state.get_data()
-        text = f"Суть: {html.escape(data.get('c_reason', ''))}\nНарушитель: <code>{html.escape(data.get('c_nickname', ''))}</code>"
+        text = (
+            f"Нарушитель: <code>{html.escape(data.get('c_nickname', ''))}</code>\n"
+            f"Где нарушили: {html.escape(data.get('c_place', ''))}\n"
+            f"Суть: {html.escape(data.get('c_reason', ''))}"
+        )
         ticket_id = await dispatch_ticket_to_admin(call.from_user.id, call.from_user, "complaint", text, [])
         night_txt = get_night_notice()
         await call.message.edit_text(f"{ICON_CHECK} Жалоба №{ticket_id} отправлена!{night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
@@ -1813,7 +1828,11 @@ async def process_c_photo(message: Message, state: FSMContext):
                 await state.clear()
                 return
 
-            text = f"Суть: {html.escape(cur_data.get('c_reason', ''))}\nНарушитель: <code>{html.escape(cur_data.get('c_nickname', ''))}</code>"
+            text = (
+                f"Нарушитель: <code>{html.escape(cur_data.get('c_nickname', ''))}</code>\n"
+                f"Где нарушили: {html.escape(cur_data.get('c_place', ''))}\n"
+                f"Суть: {html.escape(cur_data.get('c_reason', ''))}"
+            )
             ticket_id = await dispatch_ticket_to_admin(message.from_user.id, message.from_user, "complaint", text, photos)
             await state.clear()
             night_txt = get_night_notice()
@@ -1825,7 +1844,11 @@ async def process_c_photo(message: Message, state: FSMContext):
             await state.clear()
             return
         data = await state.get_data()
-        text = f"Суть: {html.escape(data.get('c_reason', ''))}\nНарушитель: <code>{html.escape(data.get('c_nickname', ''))}</code>"
+        text = (
+            f"Нарушитель: <code>{html.escape(data.get('c_nickname', ''))}</code>\n"
+            f"Где нарушили: {html.escape(data.get('c_place', ''))}\n"
+            f"Суть: {html.escape(data.get('c_reason', ''))}"
+        )
         ticket_id = await dispatch_ticket_to_admin(message.from_user.id, message.from_user, "complaint", text, photos)
         await state.clear()
         night_txt = get_night_notice()
@@ -2449,7 +2472,6 @@ async def admin_reply_in_group(message: Message):
                     f"<b>Причина:</b> {reason}"
                 )
                 
-                # Пробуем обновить как текст; если это было фото — обновляем caption
                 try:
                     await bot.edit_message_text(
                         chat_id=ADMIN_CHAT_ID,
