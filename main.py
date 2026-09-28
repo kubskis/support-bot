@@ -66,6 +66,7 @@ ICON_CROSS = "<tg-emoji emoji-id='5348362704572664028'>🔥</tg-emoji>"
 ICON_LOCK = "<tg-emoji emoji-id='5348207836641902790'>🔥</tg-emoji>"
 ICON_STAR = "<tg-emoji emoji-id='5348446245981536690'>🔥</tg-emoji>"
 ICON_WARN = "<tg-emoji emoji-id='5348110675891731556'>🔥</tg-emoji>"
+ICON_TIME = "<tg-emoji emoji-id='5348236797606379943'>🔥</tg-emoji>"
 
 def get_user_mention(user):
     safe_name = html.escape(user.full_name)
@@ -78,7 +79,7 @@ def is_night_time() -> bool:
 
 def get_night_notice() -> str:
     if is_night_time():
-        return f"\n\n{ICON_WARN} <i>Обратите внимание: сейчас ночное время (с 22:00 до 10:00 МСК). Ваша заявка принята, но ответ модераторов может поступить утром!</i>"
+        return f"\n\n{ICON_TIME} <i>Обратите внимание: сейчас ночное время (с 22:00 до 10:00 МСК). Ваша заявка принята, но ответ модераторов может поступить утром!</i>"
     return ""
 
 # ----------------------------------------------------------------------
