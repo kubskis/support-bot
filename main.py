@@ -19,7 +19,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton,
-    InlineKeyboardMarkup, InlineKeyboardButton, ForceReply, TelegramObject,
+    InlineKeyboardMarkup, InlineKeyboardButton, TelegramObject,
     LinkPreviewOptions, InputMediaPhoto
 )
 
@@ -160,7 +160,8 @@ def _init_db_sync():
                     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                     reminded_unassigned BOOLEAN DEFAULT FALSE,
-                    reminded_idle BOOLEAN DEFAULT FALSE
+                    reminded_idle BOOLEAN DEFAULT FALSE,
+                    card_text TEXT DEFAULT NULL
                 );
                 CREATE TABLE IF NOT EXISTS message_map (
                     group_message_id BIGINT PRIMARY KEY,
@@ -174,7 +175,8 @@ def _init_db_sync():
                 CREATE TABLE IF NOT EXISTS pending_rejections (
                     prompt_message_id BIGINT PRIMARY KEY,
                     ticket_id INTEGER,
-                    card_message_id BIGINT
+                    card_message_id BIGINT,
+                    card_text TEXT DEFAULT NULL
                 );
                 CREATE TABLE IF NOT EXISTS settings (
                     key TEXT PRIMARY KEY,
@@ -223,7 +225,9 @@ def _init_db_sync():
                 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP;
                 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS reminded_unassigned BOOLEAN DEFAULT FALSE;
                 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS reminded_idle BOOLEAN DEFAULT FALSE;
+                ALTER TABLE tickets ADD COLUMN IF NOT EXISTS card_text TEXT DEFAULT NULL;
                 ALTER TABLE pending_rejections ADD COLUMN IF NOT EXISTS card_message_id BIGINT;
+                ALTER TABLE pending_rejections ADD COLUMN IF NOT EXISTS card_text TEXT DEFAULT NULL;
             """)
 
             if OWNER_ID:
@@ -409,14 +413,14 @@ async def get_admin_list_stats():
     except Exception:
         return []
 
-async def create_ticket(user_id: int, category: str = 'general') -> int:
+async def create_ticket(user_id: int, category: str = 'general', card_text: str = None) -> int:
     def _query():
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO tickets (user_id, status, category, created_at, updated_at) "
-                    "VALUES (%s, 'pending', %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) RETURNING ticket_id",
-                    (user_id, category)
+                    "INSERT INTO tickets (user_id, status, category, card_text, created_at, updated_at) "
+                    "VALUES (%s, 'pending', %s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) RETURNING ticket_id",
+                    (user_id, category, card_text)
                 )
                 return cur.fetchone()[0]
     return await asyncio.to_thread(_query)
@@ -462,7 +466,7 @@ async def get_ticket_info(ticket_id: int):
     def _query():
         with get_db() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT user_id, admin_id, status FROM tickets WHERE ticket_id = %s", (ticket_id,))
+                cur.execute("SELECT user_id, admin_id, status, card_text FROM tickets WHERE ticket_id = %s", (ticket_id,))
                 return cur.fetchone()
     return await asyncio.to_thread(_query)
 
@@ -545,14 +549,14 @@ async def save_rating_db(ticket_id: int, user_id: int, admin_id: int, score: int
                 )
     await asyncio.to_thread(_query)
 
-async def add_pending_rejection(prompt_message_id: int, ticket_id: int, card_message_id: int):
+async def add_pending_rejection(prompt_message_id: int, ticket_id: int, card_message_id: int, card_text: str = None):
     def _query():
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO pending_rejections (prompt_message_id, ticket_id, card_message_id) VALUES (%s, %s, %s) "
-                    "ON CONFLICT (prompt_message_id) DO UPDATE SET ticket_id = EXCLUDED.ticket_id, card_message_id = EXCLUDED.card_message_id",
-                    (prompt_message_id, ticket_id, card_message_id)
+                    "INSERT INTO pending_rejections (prompt_message_id, ticket_id, card_message_id, card_text) VALUES (%s, %s, %s, %s) "
+                    "ON CONFLICT (prompt_message_id) DO UPDATE SET ticket_id = EXCLUDED.ticket_id, card_message_id = EXCLUDED.card_message_id, card_text = EXCLUDED.card_text",
+                    (prompt_message_id, ticket_id, card_message_id, card_text)
                 )
     await asyncio.to_thread(_query)
 
@@ -561,7 +565,7 @@ async def get_pending_rejection(prompt_message_id: int):
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT ticket_id, card_message_id FROM pending_rejections WHERE prompt_message_id = %s",
+                    "SELECT ticket_id, card_message_id, card_text FROM pending_rejections WHERE prompt_message_id = %s",
                     (prompt_message_id,)
                 )
                 return cur.fetchone()
@@ -800,7 +804,6 @@ def skip_photo_kb(target: str):
 # ОТПРАВКА БИЛЕТА С МЕДИА (ДО 5 ФОТО)
 # ----------------------------------------------------------------------
 async def dispatch_ticket_to_admin(user_id: int, user, category: str, text: str, photos: List[str]):
-    ticket_id = await create_ticket(user_id, category)
     user_mention = get_user_mention(user)
 
     cat_titles = {
@@ -810,7 +813,17 @@ async def dispatch_ticket_to_admin(user_id: int, user, category: str, text: str,
         "friends": "👯‍♀️ #Друзья"
     }
     title = cat_titles.get(category, "📩 #Заявка")
+    
+    # Резервируем тикет в БД сразу с заготовкой текста карточки
+    ticket_id = await create_ticket(user_id, category, "")
     admin_card_text = f"{title} | <b>Заявка №{ticket_id}</b>\n👤 От: {user_mention} | ID: <code>{user_id}</code>\n\n{text}"
+
+    # Сохраняем итоговый текст карточки
+    def _save_card_txt():
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE tickets SET card_text = %s WHERE ticket_id = %s", (admin_card_text, ticket_id))
+    await asyncio.to_thread(_save_card_txt)
 
     if photos:
         if len(photos) == 1:
@@ -2057,7 +2070,9 @@ async def take_ticket_handler(call: CallbackQuery):
         except Exception:
             pass
 
-    new_text = (call.message.caption or call.message.text or "") + f"\n\n🟢 <b>В работе у:</b> {call.from_user.mention_html()} (Агент #{agent_number})"
+    base_text = ticket_info[3] if (ticket_info and ticket_info[3]) else (call.message.caption or call.message.text or "")
+    new_text = base_text + f"\n\n🟢 <b>В работе у:</b> {call.from_user.mention_html()} (Агент #{agent_number})"
+    
     if call.message.photo:
         await call.message.edit_caption(caption=new_text, reply_markup=close_ticket_kb(ticket_id, call.from_user.id), parse_mode="HTML")
     else:
@@ -2076,14 +2091,15 @@ async def reject_ticket_handler(call: CallbackQuery):
         await call.answer("❌ Заявка уже обработана!", show_alert=True)
         return
 
+    base_text = ticket_info[3] if (ticket_info and ticket_info[3]) else (call.message.caption or call.message.text or "")
+
     prompt_msg = await bot.send_message(
         ADMIN_CHAT_ID,
         f"❓ <b>Укажите причину отказа для заявки №{ticket_id}:</b>\n<i>(Ответьте Reply на это сообщение)</i>",
-        reply_markup=ForceReply(selective=True),
         parse_mode="HTML"
     )
-    # Сохраняем ID карточки, на которой нажали "Отклонить"
-    await add_pending_rejection(prompt_msg.message_id, ticket_id, call.message.message_id)
+    # Сохраняем ID карточки и исходный текст
+    await add_pending_rejection(prompt_msg.message_id, ticket_id, call.message.message_id, base_text)
     await map_message(prompt_msg.message_id, 0, ticket_id)
     await call.answer("Напишите причину отказа в ответ на сообщение бота!")
 
@@ -2394,7 +2410,7 @@ async def cmd_unban(message: Message):
     await message.answer(f"✅ Пользователь с ID <code>{user_id}</code> успешно разблокирован.", parse_mode="HTML")
 
 # ----------------------------------------------------------------------
-# ОТВЕТ ХЕЛПЕРА В ГРУППЕ (ОБРАБОТКА ОТКАЗА И ДИАЛОГА)
+# ОТВЕТ ХЕЛПЕРА В ГРУППЕ (ОТКАЗ И ДИАЛОГ)
 # ----------------------------------------------------------------------
 @router.message(F.chat.id == ADMIN_CHAT_ID, F.reply_to_message)
 async def admin_reply_in_group(message: Message):
@@ -2405,7 +2421,7 @@ async def admin_reply_in_group(message: Message):
     pending_data = await get_pending_rejection(replied_msg_id)
 
     if pending_data:
-        pending_ticket_id, card_message_id = pending_data
+        pending_ticket_id, card_message_id, saved_card_text = pending_data
         ticket_info = await get_ticket_info(pending_ticket_id)
         if ticket_info:
             reason = html.escape(message.text or message.caption or "Без причины")
@@ -2423,88 +2439,47 @@ async def admin_reply_in_group(message: Message):
             except Exception:
                 pass
             
-            # Обновляем карточку тикета: дописываем отказ и удаляем кнопки
+            # Обновляем саму карточку заявки
             if card_message_id:
-                status_text = (
-                    f"\n\n🔴 <b>Заявка №{pending_ticket_id} отклонена</b> "
+                base = saved_card_text or ticket_info[3] or f"Заявка <b>№{pending_ticket_id}</b>"
+                new_text = (
+                    f"{base}\n\n"
+                    f"🔴 <b>Заявка №{pending_ticket_id} отклонена</b> "
                     f"администратором {message.from_user.mention_html()} (Агент #{agent_no}).\n"
                     f"<b>Причина:</b> {reason}"
                 )
                 
+                # Пробуем обновить как текст; если это было фото — обновляем caption
                 try:
-                    # Пытаемся отредактировать как текстовое сообщение
-                    def _get_base_text():
-                        # Проверяем, есть ли текст в БД если это секретки или достаем из карточки
-                        return None
-                    
-                    # Пробуем edit_message_text
+                    await bot.edit_message_text(
+                        chat_id=ADMIN_CHAT_ID,
+                        message_id=card_message_id,
+                        text=new_text,
+                        reply_markup=None,
+                        parse_mode="HTML"
+                    )
+                except TelegramBadRequest:
                     try:
-                        # Если сообщение карточки было чисто текстом, переписываем его
-                        # Попробуем прочитать текущий текст сообщения бота
-                        # Так как bot.get_message нет в Bot API, пытаемся сначала edit_message_text
-                        # с добавлением к существующему тексту через fallback
-                        # Либо если было фото - edit_message_caption
-                        pass
-                    except Exception:
-                        pass
-
-                    # Самый надежный способ: пробуем отредактировать подпись фото, если ошибка - редактируем текст
-                    try:
-                        # Если это фото
-                        # Сначала убираем клавиатуру и пытаемся обновить caption
-                        # Чтобы не потерять текст карточки, мы можем отправить status_text обновлением
-                        # Но если бот помнит текст через message_map:
-                        pass
-                    except Exception:
-                        pass
-
-                    # Проверяем карточку: пробуем изменить caption
-                    card_updated = False
-                    try:
-                        # Пытаемся получить текст сообщения бота через callback_query невозможно,
-                        # поэтому пробуем отредактировать caption:
-                        # Для этого сначала пробуем edit_message_reply_markup:
-                        await bot.edit_message_reply_markup(
+                        await bot.edit_message_caption(
                             chat_id=ADMIN_CHAT_ID,
                             message_id=card_message_id,
-                            reply_markup=None
+                            caption=new_text,
+                            reply_markup=None,
+                            parse_mode="HTML"
                         )
-                    except Exception:
-                        pass
-
-                    # Отправляем в чат админов системное подтверждение с цитатой карточки
-                    # И дописываем к карточке статус
-                    try:
-                        # Попытка 1: редактирование подписи (если карточка была фото)
-                        # Чтобы не стереть исходный текст, если мы не знаем старый, 
-                        # мы можем взять текст из сообщения-запроса prompt_msg:
-                        # В prompt_msg написано: "Укажите причину отказа для заявки №..."
-                        # А в карточке тикета в самом начале всегда есть: "Заявка №..."
-                        pass
-                    except Exception:
-                        pass
-
+                    except Exception as e:
+                        logging.error(f"Не удалось обновить подпись карточки: {e}")
                 except Exception as e:
-                    logging.error(f"Не удалось обновить карточку тикета: {e}")
+                    logging.error(f"Не удалось обновить текст карточки: {e}")
 
-            # Редактируем сообщение-запрос на ввод причины ("Укажите причину отказа..."),
-            # чтобы в чате было четко видно статус отказа прямо над ответом админа
-            try:
-                reject_info_text = (
-                    f"🔴 <b>Заявка №{pending_ticket_id} отклонена</b>\n"
-                    f"👤 <b>Администратор:</b> {message.from_user.mention_html()} (Агент #{agent_no})\n"
-                    f"💬 <b>Причина:</b> {reason}"
-                )
-                await bot.edit_message_text(
-                    chat_id=ADMIN_CHAT_ID,
-                    message_id=replied_msg_id,
-                    text=reject_info_text,
-                    parse_mode="HTML"
-                )
-            except Exception as e:
-                logging.error(f"Не удалось обновить текст запроса отказа: {e}")
+        # Удаляем сервисное сообщение бота с вопросом о причине
+        try:
+            await bot.delete_message(chat_id=ADMIN_CHAT_ID, message_id=replied_msg_id)
+        except Exception:
+            pass
 
         await delete_pending_rejection(replied_msg_id)
+        await message.answer(f"✅ Отказ по заявке №{pending_ticket_id} отправлен.")
         asyncio.create_task(schedule_ticket_cleanup(pending_ticket_id, card_message_id))
         return
 
