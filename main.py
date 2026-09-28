@@ -19,7 +19,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton,
-    InlineKeyboardMarkup, InlineKeyboardButton, ForceReply, TelegramObject
+    InlineKeyboardMarkup, InlineKeyboardButton, ForceReply, TelegramObject,
+    LinkPreviewOptions
 )
 
 # ----------------------------------------------------------------------
@@ -1029,13 +1030,24 @@ async def sec_manage_pubs(call: CallbackQuery):
     def _query():
         with get_db() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT user_id FROM secret_publishers")
+                cur.execute("SELECT user_id FROM secret_publishers ORDER BY user_id")
                 return [r[0] for r in cur.fetchall()]
     pubs = await asyncio.to_thread(_query)
     text = "👥 <b>Список публикаторов секреток:</b>\n\n"
     if pubs:
-        for p in pubs:
-            text += f"• <code>{p}</code>\n"
+        for idx, p_id in enumerate(pubs, 1):
+            name_display = "Неизвестно"
+            try:
+                chat_info = await bot.get_chat(p_id)
+                if chat_info.username:
+                    name_display = f"@{chat_info.username}"
+                elif chat_info.full_name:
+                    name_display = html.escape(chat_info.full_name)
+            except Exception:
+                pass
+            
+            # Ссылка на профиль внутри ID и ник через тире
+            text += f"{idx}. <a href='tg://openmessage?user_id={p_id}'>{p_id}</a> - {name_display}\n"
     else:
         text += "<i>Список пуст (кнопка 'Секретки' никому не видна).</i>\n"
 
@@ -1044,7 +1056,7 @@ async def sec_manage_pubs(call: CallbackQuery):
         [InlineKeyboardButton(text="➖ Удалить публикатора", callback_data="sec_del_pub")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="adm_secret_panel")]
     ])
-    await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
     await call.answer()
 
 @router.callback_query(F.data == "sec_add_pub")
@@ -1096,24 +1108,72 @@ async def sec_del_pub_proc(message: Message, state: FSMContext):
 @router.callback_query(F.data == "sec_stats")
 async def sec_stats(call: CallbackQuery):
     if not await is_main_admin(call.from_user.id): return
+    
+    # Получаем все посты за последние 24 часа
     def _query():
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
-                    SELECT user_id, COUNT(*) FROM secret_posts
+                    SELECT user_id, channel_id, message_id, secret_type, created_at
+                    FROM secret_posts
                     WHERE created_at >= CURRENT_TIMESTAMP - INTERVAL '24 hours'
-                    GROUP BY user_id
+                    ORDER BY created_at DESC
                 """)
                 return cur.fetchall()
-    stats = await asyncio.to_thread(_query)
-    text = "📊 <b>Статистика публикаций за последние 24 часа:</b>\n\n"
-    if stats:
-        for u_id, cnt in stats:
-            text += f"• <code>{u_id}</code>: <b>{cnt}</b> постов\n"
-    else:
-        text += "<i>За последние 24 часа постов не публиковалось.</i>"
+                
+    posts = await asyncio.to_thread(_query)
+    
+    if not posts:
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="adm_secret_panel")]])
+        await call.message.edit_text("📊 <b>Статистика публикаций за последние 24 часа:</b>\n\n<i>За последние 24 часа постов не публиковалось.</i>", reply_markup=kb, parse_mode="HTML")
+        await call.answer()
+        return
+
+    # Группируем посты по user_id
+    user_posts_map = {}
+    for u_id, ch_id, mid, stype, c_time in posts:
+        if u_id not in user_posts_map:
+            user_posts_map[u_id] = []
+        user_posts_map[u_id].append((ch_id, mid, stype, c_time))
+
+    text = "📊 <b>Статистика публикаций за последние 24 часа (МСК):</b>\n\n"
+    
+    pub_index = 1
+    for u_id, p_list in user_posts_map.items():
+        name_display = "Неизвестно"
+        try:
+            chat_info = await bot.get_chat(u_id)
+            if chat_info.username:
+                name_display = f"@{chat_info.username}"
+            elif chat_info.full_name:
+                name_display = html.escape(chat_info.full_name)
+        except Exception:
+            pass
+            
+        posts_count = len(p_list)
+        # 1. Id - nick - N поста
+        text += f"{pub_index}. <a href='tg://openmessage?user_id={u_id}'>{u_id}</a> - {name_display} - <b>{posts_count} пост(ов)</b>:\n"
+        
+        for post_idx, (ch_id, mid, stype, c_time) in enumerate(p_list, 1):
+            msk_time = c_time.astimezone(MSK_TZ)
+            time_str = msk_time.strftime("%H:%M:%S %d.%m.%Y")
+            
+            clean_ch = ch_id.replace("@", "")
+            if clean_ch.startswith("https://t.me/"):
+                post_url = f"{clean_ch}/{mid}"
+            else:
+                post_url = f"https://t.me/{clean_ch}/{mid}"
+                
+            text += f"   {post_idx}. {time_str} ({html.escape(stype)}) — <a href='{post_url}'>ссылка</a>\n"
+            
+        text += "\n"
+        pub_index += 1
+
+    if len(text) > 4000:
+        text = text[:3950] + "\n... <i>(список сокращен из-за лимита длины)</i>"
+
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="adm_secret_panel")]])
-    await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
     await call.answer()
 
 @router.callback_query(F.data == "sec_set_timer")
@@ -2298,4 +2358,4 @@ if __name__ == "__main__":
     finally:
         if not db_pool.closed:
             db_pool.closeall()
-            
+    
