@@ -278,7 +278,6 @@ async def is_main_admin(user_id: int) -> bool:
         return False
 
 async def is_secret_publisher(user_id: int) -> bool:
-    """Проверяет, выдан ли пользователю доступ к публикации секреток"""
     def _query():
         with get_db() as conn:
             with conn.cursor() as cur:
@@ -690,7 +689,6 @@ async def main_keyboard(user_id: int):
         [KeyboardButton(text=BTN_HELPER_APPLY), KeyboardButton(text=BTN_SECRET_APPLY)]
     ]
     
-    # Кнопка "Секретки" ТОЛЬКО если человек есть в secret_publishers
     if await is_secret_publisher(user_id):
         keyboard.append([KeyboardButton(text=BTN_SECRETS)])
 
@@ -1006,7 +1004,7 @@ async def save_friend_nick(message: Message, state: FSMContext):
     await set_setting("friend_nickname", message.text.strip())
     await state.clear()
     kb = await main_keyboard(message.from_user.id)
-    await message.answer("<tg-emoji emoji-id='5346300789558101141'>🔥</tg-emoji> Ник успешно изменен!", reply_markup=kb)
+    await message.answer("<tg-emoji emoji-id='5346300789558101141'>🔥</tg-emoji> Ник успешно изменен!", reply_markup=kb, parse_mode="HTML")
 
 # ----------------------------------------------------------------------
 # АДМИН-ПАНЕЛЬ: УПРАВЛЕНИЕ СЕКРЕТКАМИ
@@ -1161,7 +1159,7 @@ async def sec_tmpl_act_proc(message: Message, state: FSMContext):
     await set_setting("template_active", message.text)
     await state.clear()
     kb = await main_keyboard(message.from_user.id)
-    await message.answer("✅ Шаблон активного поста обновлен!", reply_markup=kb)
+    await message.answer("✅ Шаблон активного поста обновлен!", reply_markup=kb, parse_mode="HTML")
 
 @router.callback_query(F.data == "sec_tmpl_exp")
 async def sec_tmpl_exp(call: CallbackQuery, state: FSMContext):
@@ -1177,7 +1175,7 @@ async def sec_tmpl_exp_proc(message: Message, state: FSMContext):
     await set_setting("template_expired", message.text)
     await state.clear()
     kb = await main_keyboard(message.from_user.id)
-    await message.answer("✅ Шаблон истекшего поста обновлен!", reply_markup=kb)
+    await message.answer("✅ Шаблон истекшего поста обновлен!", reply_markup=kb, parse_mode="HTML")
 
 @router.callback_query(F.data == "sec_add_type")
 async def sec_add_type(call: CallbackQuery, state: FSMContext):
@@ -1356,7 +1354,7 @@ async def pub_settype(call: CallbackQuery, state: FSMContext):
 @router.message(SecretPublisherStates.waiting_for_photo, F.photo)
 async def pub_photo(message: Message, state: FSMContext):
     await state.update_data(photo_id=message.photo[-1].file_id)
-    await message.answer("Отлично! Теперь отправьте **ссылку на VIP-сервер** Roblox:")
+    await message.answer("Отлично! Теперь отправьте <b>ссылку на VIP-сервер</b> Roblox:", parse_mode="HTML")
     await state.set_state(SecretPublisherStates.waiting_for_link)
 
 @router.message(SecretPublisherStates.waiting_for_link, F.text)
@@ -1365,7 +1363,6 @@ async def pub_link(message: Message, state: FSMContext):
     clean = re.sub(r'\s+', '', raw)
     clean_lower = clean.lower()
 
-    # Проверяем домен Roblox и наличие маркера приватного сервера (ПК или мобильного шеринга)
     is_roblox = "roblox.com" in clean_lower
     is_vip = ("privateserverlinkcode=" in clean_lower) or ("share?code=" in clean_lower)
 
@@ -1446,7 +1443,7 @@ async def start_helper_apply(message: Message, state: FSMContext):
     await register_user(message.from_user.id)
     if await is_banned(message.from_user.id): return
     if await get_setting("helper_recruitment", "true") != "true":
-        await message.answer("<tg-emoji emoji-id='5346273864408120989'>🔥</tg-emoji> Набор в команду поддержки в данный момент закрыт.")
+        await message.answer("<tg-emoji emoji-id='5346273864408120989'>🔥</tg-emoji> Набор в команду поддержки в данный момент закрыт.", parse_mode="HTML")
         return
     await state.clear()
     await state.set_state(Form.helper_age)
@@ -1518,7 +1515,7 @@ async def start_secret_apply(message: Message, state: FSMContext):
     await register_user(message.from_user.id)
     if await is_banned(message.from_user.id): return
     if await get_setting("secret_recruitment", "true") != "true":
-        await message.answer("<tg-emoji emoji-id='5346273864408120989'>🔥</tg-emoji> Набор в искатели секреток в данный момент закрыт.")
+        await message.answer("<tg-emoji emoji-id='5346273864408120989'>🔥</tg-emoji> Набор в искатели секреток в данный момент закрыт.", parse_mode="HTML")
         return
     await state.clear()
     await state.set_state(Form.secret_age)
@@ -1619,7 +1616,7 @@ async def start_friends(message: Message, state: FSMContext):
     await register_user(message.from_user.id)
     if await is_banned(message.from_user.id) or await check_active_ticket(message): return
     if await get_setting("friend_active", "false") != "true":
-        await message.answer("<tg-emoji emoji-id='5346273864408120989'>🔥</tg-emoji> Раздел добавления в друзья временно закрыт на технические работы.")
+        await message.answer("<tg-emoji emoji-id='5346273864408120989'>🔥</tg-emoji> Раздел добавления в друзья временно закрыт на технические работы.", parse_mode="HTML")
         return
     await state.clear()
     friend_nick = await get_setting("friend_nickname", "Администратор")
@@ -2301,4 +2298,4 @@ if __name__ == "__main__":
     finally:
         if not db_pool.closed:
             db_pool.closeall()
-        
+            
