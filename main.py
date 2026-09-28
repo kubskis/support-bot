@@ -651,6 +651,8 @@ async def schedule_ticket_cleanup(ticket_id: int, card_message_id: int = None):
 # ----------------------------------------------------------------------
 class Form(StatesGroup):
     complaint_nicknames = State()
+    complaint_place = State()
+    complaint_time = State()
     complaint_reason = State()
     complaint_photos = State()
     
@@ -800,6 +802,13 @@ def skip_photo_kb(target: str):
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="⏩ Пропустить прикрепление фото", callback_data=f"skip_photo_{target}")
     ]])
+
+def complaint_servers_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🌐 Сервер с секреткой", callback_data="cmp_srv_secret")],
+        [InlineKeyboardButton(text="🕵️ Поиск саботера", callback_data="cmp_srv_saboteur")],
+        [InlineKeyboardButton(text="🌾 Фарм сервер", callback_data="cmp_srv_farm")]
+    ])
 
 def appeal_servers_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -1802,10 +1811,39 @@ async def process_c_nicks_done(call: CallbackQuery, state: FSMContext):
 
 @router.message(Form.complaint_reason, F.text)
 async def process_c_reason(message: Message, state: FSMContext):
-    await state.update_data(c_reason=message.text)
+    await state.update_data(c_reason=message.text.strip())
+    await state.set_state(Form.complaint_place)
+    await message.answer(
+        f"{NUM_3} <b>Где произошло нарушение?</b>\n"
+        "<i>Выберите нужный вариант на кнопках ниже:</i>",
+        reply_markup=complaint_servers_kb(),
+        parse_mode="HTML"
+    )
+
+@router.callback_query(F.data.startswith("cmp_srv_"), Form.complaint_place)
+async def process_c_server_choice(call: CallbackQuery, state: FSMContext):
+    srv_types = {
+        "cmp_srv_secret": "Сервер с секреткой",
+        "cmp_srv_saboteur": "Поиск саботера",
+        "cmp_srv_farm": "Фарм сервер"
+    }
+    chosen_server = srv_types.get(call.data, "Не указан")
+    await state.update_data(c_place=chosen_server)
+    await state.set_state(Form.complaint_time)
+    await call.message.edit_text(
+        f"Выбран сервер: <b>{chosen_server}</b>\n\n"
+        f"{NUM_4} {ICON_TIMER} <b>Укажите время публикации поста:</b>\n"
+        "<i>(Укажите примерное или точное время публикации поста по МСК, например: <code>18:45</code> или <code>18:45:20 28.09</code>)</i>",
+        parse_mode="HTML"
+    )
+    await call.answer()
+
+@router.message(Form.complaint_time, F.text)
+async def process_c_time(message: Message, state: FSMContext):
+    await state.update_data(c_time=message.text.strip())
     await state.set_state(Form.complaint_photos)
     await message.answer(
-        f"{NUM_3} {ICON_PHOTO} <b>Прикрепите доказательства (до 5 фото):</b>\n\n"
+        f"{NUM_5} {ICON_PHOTO} <b>Прикрепите доказательства (до 5 фото):</b>\n\n"
         "⚠️ <b>Важно:</b> фото строго запрещено обрезать! Плашка уровней и чат сервера должны быть отчётливо видны.",
         reply_markup=skip_photo_kb("complaint"),
         parse_mode="HTML"
@@ -1822,7 +1860,9 @@ async def skip_c_photos(call: CallbackQuery, state: FSMContext):
         nicks_formatted = ", ".join([f"<code>{html.escape(n)}</code>" for n in data.get("nicks_list", [])])
         text = (
             f"Нарушитель(и): {nicks_formatted}\n"
-            f"Суть нарушения: {html.escape(data.get('c_reason', ''))}"
+            f"Суть нарушения: {html.escape(data.get('c_reason', ''))}\n"
+            f"Где произошло нарушение: {html.escape(data.get('c_place', ''))}\n"
+            f"Время публикации поста: {html.escape(data.get('c_time', ''))}"
         )
         ticket_id = await dispatch_ticket_to_admin(call.from_user.id, call.from_user, "complaint", text, [])
         night_txt = get_night_notice()
@@ -1862,7 +1902,9 @@ async def process_c_photo(message: Message, state: FSMContext):
             nicks_formatted = ", ".join([f"<code>{html.escape(n)}</code>" for n in cur_data.get("nicks_list", [])])
             text = (
                 f"Нарушитель(и): {nicks_formatted}\n"
-                f"Суть нарушения: {html.escape(cur_data.get('c_reason', ''))}"
+                f"Суть нарушения: {html.escape(cur_data.get('c_reason', ''))}\n"
+                f"Где произошло нарушение: {html.escape(cur_data.get('c_place', ''))}\n"
+                f"Время публикации поста: {html.escape(cur_data.get('c_time', ''))}"
             )
             ticket_id = await dispatch_ticket_to_admin(message.from_user.id, message.from_user, "complaint", text, photos)
             await state.clear()
@@ -1878,7 +1920,9 @@ async def process_c_photo(message: Message, state: FSMContext):
         nicks_formatted = ", ".join([f"<code>{html.escape(n)}</code>" for n in data.get("nicks_list", [])])
         text = (
             f"Нарушитель(и): {nicks_formatted}\n"
-            f"Суть нарушения: {html.escape(data.get('c_reason', ''))}"
+            f"Суть нарушения: {html.escape(data.get('c_reason', ''))}\n"
+            f"Где произошло нарушение: {html.escape(data.get('c_place', ''))}\n"
+            f"Время публикации поста: {html.escape(data.get('c_time', ''))}"
         )
         ticket_id = await dispatch_ticket_to_admin(message.from_user.id, message.from_user, "complaint", text, photos)
         await state.clear()
@@ -2523,6 +2567,7 @@ async def admin_reply_in_group(message: Message):
             except Exception:
                 pass
             
+            # Обновляем саму карточку заявки
             if card_message_id:
                 base = saved_card_text or ticket_info[3] or f"Заявка <b>№{pending_ticket_id}</b>"
                 new_text = (
