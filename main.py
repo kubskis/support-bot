@@ -489,11 +489,20 @@ async def activate_ticket(ticket_id: int, admin_id: int):
                 )
     await asyncio.to_thread(_query)
 
-async def close_ticket_db(ticket_id: int, status: str = 'closed'):
+async def close_ticket_db(ticket_id: int, status: str = 'closed', admin_id: int = None):
     def _query():
         with get_db() as conn:
             with conn.cursor() as cur:
-                cur.execute("UPDATE tickets SET status = %s, updated_at = CURRENT_TIMESTAMP WHERE ticket_id = %s", (status, ticket_id))
+                if admin_id:
+                    cur.execute(
+                        "UPDATE tickets SET status = %s, admin_id = %s, updated_at = CURRENT_TIMESTAMP WHERE ticket_id = %s",
+                        (status, admin_id, ticket_id)
+                    )
+                else:
+                    cur.execute(
+                        "UPDATE tickets SET status = %s, updated_at = CURRENT_TIMESTAMP WHERE ticket_id = %s",
+                        (status, ticket_id)
+                    )
     await asyncio.to_thread(_query)
 
 async def is_banned(user_id: int):
@@ -2092,7 +2101,7 @@ async def close_ticket_handler(call: CallbackQuery):
 
     ticket_info = await get_ticket_info(ticket_id)
     if ticket_info:
-        await close_ticket_db(ticket_id)
+        await close_ticket_db(ticket_id, status='closed', admin_id=call.from_user.id)
         try:
             await bot.send_message(
                 ticket_info[0],
@@ -2399,7 +2408,9 @@ async def admin_reply_in_group(message: Message):
         ticket_info = await get_ticket_info(pending_ticket_id)
         if ticket_info:
             reason = html.escape(message.text or message.caption or "Без причины")
-            await close_ticket_db(pending_ticket_id, 'rejected')
+            agent_no = await get_or_create_agent_number(message.from_user.id)
+            await close_ticket_db(pending_ticket_id, 'rejected', admin_id=message.from_user.id)
+            
             try:
                 user_kb = await main_keyboard(ticket_info[0])
                 await bot.send_message(
@@ -2411,9 +2422,48 @@ async def admin_reply_in_group(message: Message):
             except Exception:
                 pass
             
+            # Обновляем саму карточку заявки: убираем кнопки и дописываем отказ с причиной
             try:
                 if card_message_id:
-                    await bot.edit_message_reply_markup(chat_id=ADMIN_CHAT_ID, message_id=card_message_id, reply_markup=None)
+                    status_text = (
+                        f"\n\n🔴 <b>Заявка №{pending_ticket_id} отклонена</b> "
+                        f"администратором {message.from_user.mention_html()} (Агент #{agent_no}).\n"
+                        f"<b>Причина:</b> {reason}"
+                    )
+                    
+                    # Пытаемся получить исходный текст карточки или обновляем подпись фото
+                    try:
+                        orig_card = message.reply_to_message.reply_to_message
+                    except Exception:
+                        orig_card = None
+
+                    card_caption = (orig_card.caption or orig_card.text) if orig_card else None
+
+                    if card_caption:
+                        new_content = card_caption + status_text
+                        if orig_card.photo:
+                            await bot.edit_message_caption(
+                                chat_id=ADMIN_CHAT_ID,
+                                message_id=card_message_id,
+                                caption=new_content,
+                                reply_markup=None,
+                                parse_mode="HTML"
+                            )
+                        else:
+                            await bot.edit_message_text(
+                                chat_id=ADMIN_CHAT_ID,
+                                message_id=card_message_id,
+                                text=new_content,
+                                reply_markup=None,
+                                parse_mode="HTML"
+                            )
+                    else:
+                        # Если текст карточки недоступен в цепочке Reply, убираем кнопки
+                        await bot.edit_message_reply_markup(
+                            chat_id=ADMIN_CHAT_ID,
+                            message_id=card_message_id,
+                            reply_markup=None
+                        )
             except Exception as e:
                 logging.error(f"Не удалось обновить карточку тикета: {e}")
 
