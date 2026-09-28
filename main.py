@@ -42,6 +42,10 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 
+# Защита от дубликатов при отправке альбомов
+creation_lock = asyncio.Lock()
+processed_media_groups = set()
+
 # Кастомные TGP цифры
 NUM_1 = "<tg-emoji emoji-id='5285184495857715032'>🔥</tg-emoji>"
 NUM_2 = "<tg-emoji emoji-id='5287236502382724614'>🔥</tg-emoji>"
@@ -267,7 +271,6 @@ def _init_db_sync():
 
 _init_db_sync()
 
-# Асинхронные обёртки для запросов к БД
 async def is_main_admin(user_id: int) -> bool:
     if OWNER_ID and user_id == OWNER_ID:
         return True
@@ -1711,7 +1714,6 @@ async def check_active_ticket(message: Message) -> bool:
         return True
     return False
 
-# Сборщик медиа-группы
 async def collect_media_photos(message: Message, state: FSMContext, key: str = "photos") -> list:
     data = await state.get_data()
     photos = data.get(key, [])
@@ -1747,38 +1749,65 @@ async def process_c_nickname(message: Message, state: FSMContext):
 
 @router.callback_query(F.data == "skip_photo_complaint", Form.complaint_photos)
 async def skip_c_photos(call: CallbackQuery, state: FSMContext):
-    if await check_active_ticket(call.message): return
-    data = await state.get_data()
-    text = f"Суть: {html.escape(data.get('c_reason', ''))}\nНарушитель: <code>{html.escape(data.get('c_nickname', ''))}</code>"
-    ticket_id = await dispatch_ticket_to_admin(call.from_user.id, call.from_user, "complaint", text, [])
-    night_txt = get_night_notice()
-    await call.message.edit_text(f"{ICON_CHECK} Жалоба №{ticket_id} отправлена!{night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
-    await state.clear()
-    await call.answer()
+    async with creation_lock:
+        if await check_active_ticket(call.message):
+            await state.clear()
+            await call.answer()
+            return
+        data = await state.get_data()
+        text = f"Суть: {html.escape(data.get('c_reason', ''))}\nНарушитель: <code>{html.escape(data.get('c_nickname', ''))}</code>"
+        ticket_id = await dispatch_ticket_to_admin(call.from_user.id, call.from_user, "complaint", text, [])
+        night_txt = get_night_notice()
+        await call.message.edit_text(f"{ICON_CHECK} Жалоба №{ticket_id} отправлена!{night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
+        await state.clear()
+        await call.answer()
 
 @router.message(Form.complaint_photos, F.photo)
 async def process_c_photo(message: Message, state: FSMContext):
+    if await check_active_ticket(message):
+        await state.clear()
+        return
+
     photos = await collect_media_photos(message, state, "c_photos")
     if len(photos) > 5:
         await message.answer(f"{ICON_CROSS} Лимит превышен! Прикрепите не более 5 фото.", parse_mode="HTML")
         await state.clear()
         return
 
-    if message.media_group_id:
+    mg_id = message.media_group_id
+    if mg_id:
         await asyncio.sleep(1.2)
-        cur_data = await state.get_data()
-        if cur_data.get("c_processed"):
-            return
-        await state.update_data(c_processed=True)
-        photos = cur_data.get("c_photos", photos)
+        async with creation_lock:
+            if mg_id in processed_media_groups:
+                return
+            processed_media_groups.add(mg_id)
+            if len(processed_media_groups) > 500:
+                processed_media_groups.clear()
 
-    if await check_active_ticket(message): return
-    data = await state.get_data()
-    text = f"Суть: {html.escape(data.get('c_reason', ''))}\nНарушитель: <code>{html.escape(data.get('c_nickname', ''))}</code>"
-    ticket_id = await dispatch_ticket_to_admin(message.from_user.id, message.from_user, "complaint", text, photos)
-    night_txt = get_night_notice()
-    await message.answer(f"{ICON_CHECK} Жалоба №{ticket_id} отправлена! (Прикреплено фото: {len(photos)}){night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
-    await state.clear()
+            cur_data = await state.get_data()
+            photos = cur_data.get("c_photos", photos)
+
+            if await check_active_ticket(message):
+                await state.clear()
+                return
+
+            text = f"Суть: {html.escape(cur_data.get('c_reason', ''))}\nНарушитель: <code>{html.escape(cur_data.get('c_nickname', ''))}</code>"
+            ticket_id = await dispatch_ticket_to_admin(message.from_user.id, message.from_user, "complaint", text, photos)
+            await state.clear()
+            night_txt = get_night_notice()
+            await message.answer(f"{ICON_CHECK} Жалоба №{ticket_id} отправлена! (Прикреплено фото: {len(photos)}){night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
+            return
+
+    async with creation_lock:
+        if await check_active_ticket(message):
+            await state.clear()
+            return
+        data = await state.get_data()
+        text = f"Суть: {html.escape(data.get('c_reason', ''))}\nНарушитель: <code>{html.escape(data.get('c_nickname', ''))}</code>"
+        ticket_id = await dispatch_ticket_to_admin(message.from_user.id, message.from_user, "complaint", text, photos)
+        await state.clear()
+        night_txt = get_night_notice()
+        await message.answer(f"{ICON_CHECK} Жалоба №{ticket_id} отправлена! (Прикреплено фото: {len(photos)}){night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
 
 # --- 2. ОБЖАЛОВАНИЕ ---
 @router.message(F.text == BTN_APPEAL, F.chat.type == "private")
@@ -1817,46 +1846,77 @@ async def process_a_reason(message: Message, state: FSMContext):
 
 @router.callback_query(F.data == "skip_photo_appeal", Form.appeal_photos)
 async def skip_a_photos(call: CallbackQuery, state: FSMContext):
-    if await check_active_ticket(call.message): return
-    data = await state.get_data()
-    text = (
-        f"Ник: <code>{html.escape(data.get('a_nickname', ''))}</code>\n"
-        f"Где забанен: {html.escape(data.get('a_place', ''))}\n"
-        f"Причина разбана: {html.escape(data.get('a_reason', ''))}"
-    )
-    ticket_id = await dispatch_ticket_to_admin(call.from_user.id, call.from_user, "appeal", text, [])
-    night_txt = get_night_notice()
-    await call.message.edit_text(f"{ICON_CHECK} Обжалование №{ticket_id} отправлено!{night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
-    await state.clear()
-    await call.answer()
+    async with creation_lock:
+        if await check_active_ticket(call.message):
+            await state.clear()
+            await call.answer()
+            return
+        data = await state.get_data()
+        text = (
+            f"Ник: <code>{html.escape(data.get('a_nickname', ''))}</code>\n"
+            f"Где забанен: {html.escape(data.get('a_place', ''))}\n"
+            f"Причина разбана: {html.escape(data.get('a_reason', ''))}"
+        )
+        ticket_id = await dispatch_ticket_to_admin(call.from_user.id, call.from_user, "appeal", text, [])
+        night_txt = get_night_notice()
+        await call.message.edit_text(f"{ICON_CHECK} Обжалование №{ticket_id} отправлено!{night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
+        await state.clear()
+        await call.answer()
 
 @router.message(Form.appeal_photos, F.photo)
 async def process_a_photo(message: Message, state: FSMContext):
+    if await check_active_ticket(message):
+        await state.clear()
+        return
+
     photos = await collect_media_photos(message, state, "a_photos")
     if len(photos) > 5:
         await message.answer(f"{ICON_CROSS} Лимит превышен! Прикрепите не более 5 фото.", parse_mode="HTML")
         await state.clear()
         return
 
-    if message.media_group_id:
+    mg_id = message.media_group_id
+    if mg_id:
         await asyncio.sleep(1.2)
-        cur_data = await state.get_data()
-        if cur_data.get("a_processed"):
-            return
-        await state.update_data(a_processed=True)
-        photos = cur_data.get("a_photos", photos)
+        async with creation_lock:
+            if mg_id in processed_media_groups:
+                return
+            processed_media_groups.add(mg_id)
+            if len(processed_media_groups) > 500:
+                processed_media_groups.clear()
 
-    if await check_active_ticket(message): return
-    data = await state.get_data()
-    text = (
-        f"Ник: <code>{html.escape(data.get('a_nickname', ''))}</code>\n"
-        f"Где забанен: {html.escape(data.get('a_place', ''))}\n"
-        f"Причина разбана: {html.escape(data.get('a_reason', ''))}"
-    )
-    ticket_id = await dispatch_ticket_to_admin(message.from_user.id, message.from_user, "appeal", text, photos)
-    night_txt = get_night_notice()
-    await message.answer(f"{ICON_CHECK} Обжалование №{ticket_id} отправлено! (Прикреплено фото: {len(photos)}){night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
-    await state.clear()
+            cur_data = await state.get_data()
+            photos = cur_data.get("a_photos", photos)
+
+            if await check_active_ticket(message):
+                await state.clear()
+                return
+
+            text = (
+                f"Ник: <code>{html.escape(cur_data.get('a_nickname', ''))}</code>\n"
+                f"Где забанен: {html.escape(cur_data.get('a_place', ''))}\n"
+                f"Причина разбана: {html.escape(cur_data.get('a_reason', ''))}"
+            )
+            ticket_id = await dispatch_ticket_to_admin(message.from_user.id, message.from_user, "appeal", text, photos)
+            await state.clear()
+            night_txt = get_night_notice()
+            await message.answer(f"{ICON_CHECK} Обжалование №{ticket_id} отправлено! (Прикреплено фото: {len(photos)}){night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
+            return
+
+    async with creation_lock:
+        if await check_active_ticket(message):
+            await state.clear()
+            return
+        data = await state.get_data()
+        text = (
+            f"Ник: <code>{html.escape(data.get('a_nickname', ''))}</code>\n"
+            f"Где забанен: {html.escape(data.get('a_place', ''))}\n"
+            f"Причина разбана: {html.escape(data.get('a_reason', ''))}"
+        )
+        ticket_id = await dispatch_ticket_to_admin(message.from_user.id, message.from_user, "appeal", text, photos)
+        await state.clear()
+        night_txt = get_night_notice()
+        await message.answer(f"{ICON_CHECK} Обжалование №{ticket_id} отправлено! (Прикреплено фото: {len(photos)}){night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
 
 # --- 3. ВОПРОС ---
 @router.message(F.text == BTN_QUESTION, F.chat.type == "private")
@@ -1869,6 +1929,12 @@ async def start_question(message: Message, state: FSMContext):
 
 @router.message(Form.question_content, F.photo | F.text)
 async def process_question(message: Message, state: FSMContext):
+    if await check_active_ticket(message):
+        await state.clear()
+        return
+
+    mg_id = message.media_group_id
+
     if message.photo:
         photos = await collect_media_photos(message, state, "q_photos")
         if len(photos) > 5:
@@ -1881,24 +1947,53 @@ async def process_question(message: Message, state: FSMContext):
         if "q_text" not in data and message.caption:
             await state.update_data(q_text=caption_text)
 
-        if message.media_group_id:
+        if mg_id:
             await asyncio.sleep(1.2)
-            cur_data = await state.get_data()
-            if cur_data.get("q_processed"):
+            async with creation_lock:
+                if mg_id in processed_media_groups:
+                    return
+                processed_media_groups.add(mg_id)
+                if len(processed_media_groups) > 500:
+                    processed_media_groups.clear()
+
+                cur_data = await state.get_data()
+                photos = cur_data.get("q_photos", photos)
+                caption_text = cur_data.get("q_text", caption_text)
+
+                if await check_active_ticket(message):
+                    await state.clear()
+                    return
+
+                ticket_id = await dispatch_ticket_to_admin(
+                    message.from_user.id, message.from_user, "question", html.escape(caption_text), photos
+                )
+                await state.clear()
+                night_txt = get_night_notice()
+                await message.answer(f"{ICON_CHECK} Вопрос №{ticket_id} отправлен!{night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
                 return
-            await state.update_data(q_processed=True)
-            photos = cur_data.get("q_photos", photos)
-            caption_text = cur_data.get("q_text", caption_text)
 
-        if await check_active_ticket(message): return
-        ticket_id = await dispatch_ticket_to_admin(message.from_user.id, message.from_user, "question", html.escape(caption_text), photos)
+        async with creation_lock:
+            if await check_active_ticket(message):
+                await state.clear()
+                return
+            ticket_id = await dispatch_ticket_to_admin(
+                message.from_user.id, message.from_user, "question", html.escape(caption_text), photos
+            )
+            await state.clear()
+            night_txt = get_night_notice()
+            await message.answer(f"{ICON_CHECK} Вопрос №{ticket_id} отправлен!{night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
+            return
     else:
-        if await check_active_ticket(message): return
-        ticket_id = await dispatch_ticket_to_admin(message.from_user.id, message.from_user, "question", html.escape(message.text or ''), [])
-
-    night_txt = get_night_notice()
-    await message.answer(f"{ICON_CHECK} Вопрос №{ticket_id} отправлен!{night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
-    await state.clear()
+        async with creation_lock:
+            if await check_active_ticket(message):
+                await state.clear()
+                return
+            ticket_id = await dispatch_ticket_to_admin(
+                message.from_user.id, message.from_user, "question", html.escape(message.text or ''), []
+            )
+            await state.clear()
+            night_txt = get_night_notice()
+            await message.answer(f"{ICON_CHECK} Вопрос №{ticket_id} отправлен!{night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
 
 # --- 4. ДРУЗЬЯ ---
 @router.message(F.text == BTN_FRIENDS, F.chat.type == "private")
@@ -1915,12 +2010,15 @@ async def start_friends(message: Message, state: FSMContext):
 
 @router.message(Form.friends_nickname)
 async def process_friends_nickname(message: Message, state: FSMContext):
-    if await check_active_ticket(message): return
-    text = f"Ник: <code>{html.escape(message.text or '')}</code>"
-    ticket_id = await dispatch_ticket_to_admin(message.from_user.id, message.from_user, "friends", text, [])
-    night_txt = get_night_notice()
-    await message.answer(f"{ICON_CHECK} Заявка №{ticket_id} создана!{night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
-    await state.clear()
+    async with creation_lock:
+        if await check_active_ticket(message):
+            await state.clear()
+            return
+        text = f"Ник: <code>{html.escape(message.text or '')}</code>"
+        ticket_id = await dispatch_ticket_to_admin(message.from_user.id, message.from_user, "friends", text, [])
+        night_txt = get_night_notice()
+        await message.answer(f"{ICON_CHECK} Заявка №{ticket_id} создана!{night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
+        await state.clear()
 
 # ----------------------------------------------------------------------
 # КНОПКИ УПРАВЛЕНИЯ ТИКЕТАМИ
