@@ -650,13 +650,13 @@ async def schedule_ticket_cleanup(ticket_id: int, card_message_id: int = None):
 # СОСТОЯНИЯ (FSM)
 # ----------------------------------------------------------------------
 class Form(StatesGroup):
-    complaint_nickname = State()
-    complaint_place = State()
+    complaint_nicknames = State()
     complaint_reason = State()
     complaint_photos = State()
     
     appeal_nickname = State()
     appeal_place = State()
+    appeal_time = State()
     appeal_reason = State()
     appeal_photos = State()
     
@@ -801,6 +801,13 @@ def skip_photo_kb(target: str):
         InlineKeyboardButton(text="⏩ Пропустить прикрепление фото", callback_data=f"skip_photo_{target}")
     ]])
 
+def appeal_servers_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🌐 Сервер с секреткой", callback_data="app_srv_secret")],
+        [InlineKeyboardButton(text="🕵️ Поиск саботера", callback_data="app_srv_saboteur")],
+        [InlineKeyboardButton(text="🌾 Фарм сервер", callback_data="app_srv_farm")]
+    ])
+
 # ----------------------------------------------------------------------
 # ОТПРАВКА БИЛЕТА С МЕДИА (ДО 5 ФОТО)
 # ----------------------------------------------------------------------
@@ -815,11 +822,9 @@ async def dispatch_ticket_to_admin(user_id: int, user, category: str, text: str,
     }
     title = cat_titles.get(category, "📩 #Заявка")
     
-    # Резервируем тикет в БД
     ticket_id = await create_ticket(user_id, category, "")
     admin_card_text = f"{title} | <b>Заявка №{ticket_id}</b>\n👤 От: {user_mention} | ID: <code>{user_id}</code>\n\n{text}"
 
-    # Сохраняем итоговый текст карточки
     def _save_card_txt():
         with get_db() as conn:
             with conn.cursor() as cur:
@@ -1745,37 +1750,63 @@ async def collect_media_photos(message: Message, state: FSMContext, key: str = "
         await state.update_data({key: photos})
     return photos
 
-# --- 1. ЖАЛОБА (С вопросом о месте нарушения) ---
+# --- 1. ЖАЛОБА (Обновленный опрос с добавлением нескольких нарушителей) ---
 @router.message(F.text == BTN_COMPLAINT, F.chat.type == "private")
 async def start_complaint(message: Message, state: FSMContext):
     await register_user(message.from_user.id)
     if await is_banned(message.from_user.id) or await check_active_ticket(message): return
     await state.clear()
-    await state.set_state(Form.complaint_nickname)
-    await message.answer(f"{NUM_1} <b>Укажите ник нарушителя:</b>", parse_mode="HTML")
-
-@router.message(Form.complaint_nickname)
-async def process_c_nickname(message: Message, state: FSMContext):
-    await state.update_data(c_nickname=message.text)
-    await state.set_state(Form.complaint_place)
+    await state.set_state(Form.complaint_nicknames)
+    await state.update_data(nicks_list=[])
     await message.answer(
-        f"{NUM_2} <b>Где произошло нарушение?</b>\n"
-        "<i>(Саботер | Сервер с секреткой (укажите время поста, если секретка) | Фарм сервер)</i>",
+        f"{NUM_1} <b>Укажите ник нарушителя:</b>\n"
+        "<i>(Напишите точный игровой никнейм в Roblox)</i>",
         parse_mode="HTML"
     )
 
-@router.message(Form.complaint_place)
-async def process_c_place(message: Message, state: FSMContext):
-    await state.update_data(c_place=message.text)
-    await state.set_state(Form.complaint_reason)
-    await message.answer(f"{NUM_3} <b>Суть нарушения:</b>\nОпишите подробно, что произошло.", parse_mode="HTML")
+@router.message(Form.complaint_nicknames, F.text)
+async def process_c_nicknames(message: Message, state: FSMContext):
+    new_nick = message.text.strip()
+    data = await state.get_data()
+    nicks = data.get("nicks_list", [])
+    nicks.append(new_nick)
+    await state.update_data(nicks_list=nicks)
 
-@router.message(Form.complaint_reason)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="➡️ Продолжить (перейти к сути)", callback_data="c_nicks_done")
+    ]])
+
+    await message.answer(
+        f"{ICON_CHECK} Добавлен нарушитель: <code>{html.escape(new_nick)}</code>\n\n"
+        f"👤 Всего нарушителей в списке: <b>{len(nicks)}</b>\n\n"
+        "<i>Если нарушителей несколько — отправьте следующий ник сообщением. "
+        "Если нарушитель только один (или вы ввели всех) — нажмите кнопку ниже:</i>",
+        reply_markup=kb,
+        parse_mode="HTML"
+    )
+
+@router.callback_query(F.data == "c_nicks_done", Form.complaint_nicknames)
+async def process_c_nicks_done(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    nicks = data.get("nicks_list", [])
+    if not nicks:
+        await call.answer("Сначала введите хотя бы один ник!", show_alert=True)
+        return
+    await state.set_state(Form.complaint_reason)
+    await call.message.edit_text(
+        f"{NUM_2} <b>Опишите суть нарушения:</b>\n"
+        "<i>(Что именно произошло: ускорение таймера, негативные мутаторы, срыв игры и т.д.)</i>",
+        parse_mode="HTML"
+    )
+    await call.answer()
+
+@router.message(Form.complaint_reason, F.text)
 async def process_c_reason(message: Message, state: FSMContext):
     await state.update_data(c_reason=message.text)
     await state.set_state(Form.complaint_photos)
     await message.answer(
-        f"{NUM_4} {ICON_PHOTO} Отправьте скриншоты-доказательства (<b>до 5 фото</b>, плашка уровней должна быть видна), либо нажмите кнопку ниже:",
+        f"{NUM_3} {ICON_PHOTO} <b>Прикрепите доказательства (до 5 фото):</b>\n\n"
+        "⚠️ <b>Важно:</b> фото строго запрещено обрезать! Плашка уровней и чат сервера должны быть отчётливо видны.",
         reply_markup=skip_photo_kb("complaint"),
         parse_mode="HTML"
     )
@@ -1788,10 +1819,10 @@ async def skip_c_photos(call: CallbackQuery, state: FSMContext):
             await call.answer()
             return
         data = await state.get_data()
+        nicks_formatted = ", ".join([f"<code>{html.escape(n)}</code>" for n in data.get("nicks_list", [])])
         text = (
-            f"Нарушитель: <code>{html.escape(data.get('c_nickname', ''))}</code>\n"
-            f"Где нарушили: {html.escape(data.get('c_place', ''))}\n"
-            f"Суть: {html.escape(data.get('c_reason', ''))}"
+            f"Нарушитель(и): {nicks_formatted}\n"
+            f"Суть нарушения: {html.escape(data.get('c_reason', ''))}"
         )
         ticket_id = await dispatch_ticket_to_admin(call.from_user.id, call.from_user, "complaint", text, [])
         night_txt = get_night_notice()
@@ -1828,10 +1859,10 @@ async def process_c_photo(message: Message, state: FSMContext):
                 await state.clear()
                 return
 
+            nicks_formatted = ", ".join([f"<code>{html.escape(n)}</code>" for n in cur_data.get("nicks_list", [])])
             text = (
-                f"Нарушитель: <code>{html.escape(cur_data.get('c_nickname', ''))}</code>\n"
-                f"Где нарушили: {html.escape(cur_data.get('c_place', ''))}\n"
-                f"Суть: {html.escape(cur_data.get('c_reason', ''))}"
+                f"Нарушитель(и): {nicks_formatted}\n"
+                f"Суть нарушения: {html.escape(cur_data.get('c_reason', ''))}"
             )
             ticket_id = await dispatch_ticket_to_admin(message.from_user.id, message.from_user, "complaint", text, photos)
             await state.clear()
@@ -1844,47 +1875,75 @@ async def process_c_photo(message: Message, state: FSMContext):
             await state.clear()
             return
         data = await state.get_data()
+        nicks_formatted = ", ".join([f"<code>{html.escape(n)}</code>" for n in data.get("nicks_list", [])])
         text = (
-            f"Нарушитель: <code>{html.escape(data.get('c_nickname', ''))}</code>\n"
-            f"Где нарушили: {html.escape(data.get('c_place', ''))}\n"
-            f"Суть: {html.escape(data.get('c_reason', ''))}"
+            f"Нарушитель(и): {nicks_formatted}\n"
+            f"Суть нарушения: {html.escape(data.get('c_reason', ''))}"
         )
         ticket_id = await dispatch_ticket_to_admin(message.from_user.id, message.from_user, "complaint", text, photos)
         await state.clear()
         night_txt = get_night_notice()
         await message.answer(f"{ICON_CHECK} Жалоба №{ticket_id} отправлена! (Прикреплено фото: {len(photos)}){night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
 
-# --- 2. ОБЖАЛОВАНИЕ ---
+# --- 2. ОБЖАЛОВАНИЕ (Обновленные вопросы) ---
 @router.message(F.text == BTN_APPEAL, F.chat.type == "private")
 async def start_appeal(message: Message, state: FSMContext):
     await register_user(message.from_user.id)
     if await is_banned(message.from_user.id) or await check_active_ticket(message): return
     await state.clear()
     await state.set_state(Form.appeal_nickname)
-    await message.answer(f"{NUM_1} <b>Ваш ник в игре:</b>", parse_mode="HTML")
-
-@router.message(Form.appeal_nickname)
-async def process_a_nickname(message: Message, state: FSMContext):
-    await state.update_data(a_nickname=message.text)
-    await state.set_state(Form.appeal_place)
     await message.answer(
-        f"{NUM_2} <b>Где вы были заблокированы?</b>\n"
-        "<i>(Саботер | Сервер с секреткой (Укажите время поста на котором вас забанили, если это секретка) | Фарм сервер)</i>",
+        f"{NUM_1} <b>Ваш ник в игре:</b>\n"
+        "<i>(Укажите ваш точный никнейм в Roblox, на который был выдан бан)</i>",
         parse_mode="HTML"
     )
 
-@router.message(Form.appeal_place)
-async def process_a_place(message: Message, state: FSMContext):
-    await state.update_data(a_place=message.text)
-    await state.set_state(Form.appeal_reason)
-    await message.answer(f"{NUM_3} <b>Причина, по которой мы должны вас разблокировать:</b>", parse_mode="HTML")
+@router.message(Form.appeal_nickname, F.text)
+async def process_a_nickname(message: Message, state: FSMContext):
+    await state.update_data(a_nickname=message.text.strip())
+    await state.set_state(Form.appeal_place)
+    await message.answer(
+        f"{NUM_2} <b>На каком сервере произошла блокировка?</b>\n"
+        "<i>Выберите нужный вариант на кнопках ниже:</i>",
+        reply_markup=appeal_servers_kb(),
+        parse_mode="HTML"
+    )
 
-@router.message(Form.appeal_reason)
+@router.callback_query(F.data.startswith("app_srv_"), Form.appeal_place)
+async def process_a_server_choice(call: CallbackQuery, state: FSMContext):
+    srv_types = {
+        "app_srv_secret": "Сервер с секреткой",
+        "app_srv_saboteur": "Поиск саботера",
+        "app_srv_farm": "Фарм сервер"
+    }
+    chosen_server = srv_types.get(call.data, "Не указан")
+    await state.update_data(a_place=chosen_server)
+    await state.set_state(Form.appeal_time)
+    await call.message.edit_text(
+        f"Выбран сервер: <b>{chosen_server}</b>\n\n"
+        f"{NUM_3} {ICON_TIMER} <b>Укажите время публикации поста:</b>\n"
+        "<i>(Укажите примерное или точное время публикации поста по МСК, например: <code>18:45</code> или <code>18:45:20 28.09</code>)</i>",
+        parse_mode="HTML"
+    )
+    await call.answer()
+
+@router.message(Form.appeal_time, F.text)
+async def process_a_time(message: Message, state: FSMContext):
+    await state.update_data(a_time=message.text.strip())
+    await state.set_state(Form.appeal_reason)
+    await message.answer(
+        f"{NUM_4} <b>Почему мы должны снять с вас бан?</b>\n"
+        "<i>(Подробно опишите вашу ситуацию и почему вы считаете блокировку ошибочной)</i>",
+        parse_mode="HTML"
+    )
+
+@router.message(Form.appeal_reason, F.text)
 async def process_a_reason(message: Message, state: FSMContext):
-    await state.update_data(a_reason=message.text)
+    await state.update_data(a_reason=message.text.strip())
     await state.set_state(Form.appeal_photos)
     await message.answer(
-        f"{NUM_4} {ICON_PHOTO} Прикрепите скриншоты или доказательства (<b>до 5 фото</b>), либо нажмите кнопку ниже:",
+        f"{NUM_5} {ICON_PHOTO} <b>Прикрепите доказательства или скриншоты (до 5 фото):</b>\n"
+        "<i>(Если у вас есть доказательства невиновности — отправьте скриншоты, либо нажмите кнопку ниже)</i>",
         reply_markup=skip_photo_kb("appeal"),
         parse_mode="HTML"
     )
@@ -1899,7 +1958,8 @@ async def skip_a_photos(call: CallbackQuery, state: FSMContext):
         data = await state.get_data()
         text = (
             f"Ник: <code>{html.escape(data.get('a_nickname', ''))}</code>\n"
-            f"Где забанен: {html.escape(data.get('a_place', ''))}\n"
+            f"Сервер бана: {html.escape(data.get('a_place', ''))}\n"
+            f"Время публикации поста: {html.escape(data.get('a_time', ''))}\n"
             f"Причина разбана: {html.escape(data.get('a_reason', ''))}"
         )
         ticket_id = await dispatch_ticket_to_admin(call.from_user.id, call.from_user, "appeal", text, [])
@@ -1939,7 +1999,8 @@ async def process_a_photo(message: Message, state: FSMContext):
 
             text = (
                 f"Ник: <code>{html.escape(cur_data.get('a_nickname', ''))}</code>\n"
-                f"Где забанен: {html.escape(cur_data.get('a_place', ''))}\n"
+                f"Сервер бана: {html.escape(cur_data.get('a_place', ''))}\n"
+                f"Время публикации поста: {html.escape(cur_data.get('a_time', ''))}\n"
                 f"Причина разбана: {html.escape(cur_data.get('a_reason', ''))}"
             )
             ticket_id = await dispatch_ticket_to_admin(message.from_user.id, message.from_user, "appeal", text, photos)
@@ -1955,7 +2016,8 @@ async def process_a_photo(message: Message, state: FSMContext):
         data = await state.get_data()
         text = (
             f"Ник: <code>{html.escape(data.get('a_nickname', ''))}</code>\n"
-            f"Где забанен: {html.escape(data.get('a_place', ''))}\n"
+            f"Сервер бана: {html.escape(data.get('a_place', ''))}\n"
+            f"Время публикации поста: {html.escape(data.get('a_time', ''))}\n"
             f"Причина разбана: {html.escape(data.get('a_reason', ''))}"
         )
         ticket_id = await dispatch_ticket_to_admin(message.from_user.id, message.from_user, "appeal", text, photos)
@@ -2121,7 +2183,6 @@ async def reject_ticket_handler(call: CallbackQuery):
         f"❓ <b>Укажите причину отказа для заявки №{ticket_id}:</b>\n<i>(Ответьте Reply на это сообщение)</i>",
         parse_mode="HTML"
     )
-    # Сохраняем ID карточки и исходный текст
     await add_pending_rejection(prompt_msg.message_id, ticket_id, call.message.message_id, base_text)
     await map_message(prompt_msg.message_id, 0, ticket_id)
     await call.answer("Напишите причину отказа в ответ на сообщение бота!")
@@ -2462,7 +2523,6 @@ async def admin_reply_in_group(message: Message):
             except Exception:
                 pass
             
-            # Обновляем саму карточку заявки
             if card_message_id:
                 base = saved_card_text or ticket_info[3] or f"Заявка <b>№{pending_ticket_id}</b>"
                 new_text = (
@@ -2494,7 +2554,6 @@ async def admin_reply_in_group(message: Message):
                 except Exception as e:
                     logging.error(f"Не удалось обновить текст карточки: {e}")
 
-        # Удаляем сервисное сообщение бота с вопросом о причине
         try:
             await bot.delete_message(chat_id=ADMIN_CHAT_ID, message_id=replied_msg_id)
         except Exception:
