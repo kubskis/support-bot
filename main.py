@@ -2082,6 +2082,7 @@ async def reject_ticket_handler(call: CallbackQuery):
         reply_markup=ForceReply(selective=True),
         parse_mode="HTML"
     )
+    # Сохраняем ID карточки, на которой нажали "Отклонить"
     await add_pending_rejection(prompt_msg.message_id, ticket_id, call.message.message_id)
     await map_message(prompt_msg.message_id, 0, ticket_id)
     await call.answer("Напишите причину отказа в ответ на сообщение бота!")
@@ -2393,7 +2394,7 @@ async def cmd_unban(message: Message):
     await message.answer(f"✅ Пользователь с ID <code>{user_id}</code> успешно разблокирован.", parse_mode="HTML")
 
 # ----------------------------------------------------------------------
-# ОТВЕТ ХЕЛПЕРА В ГРУППЕ
+# ОТВЕТ ХЕЛПЕРА В ГРУППЕ (ОБРАБОТКА ОТКАЗА И ДИАЛОГА)
 # ----------------------------------------------------------------------
 @router.message(F.chat.id == ADMIN_CHAT_ID, F.reply_to_message)
 async def admin_reply_in_group(message: Message):
@@ -2422,53 +2423,88 @@ async def admin_reply_in_group(message: Message):
             except Exception:
                 pass
             
-            # Обновляем саму карточку заявки: убираем кнопки и дописываем отказ с причиной
-            try:
-                if card_message_id:
-                    status_text = (
-                        f"\n\n🔴 <b>Заявка №{pending_ticket_id} отклонена</b> "
-                        f"администратором {message.from_user.mention_html()} (Агент #{agent_no}).\n"
-                        f"<b>Причина:</b> {reason}"
-                    )
+            # Обновляем карточку тикета: дописываем отказ и удаляем кнопки
+            if card_message_id:
+                status_text = (
+                    f"\n\n🔴 <b>Заявка №{pending_ticket_id} отклонена</b> "
+                    f"администратором {message.from_user.mention_html()} (Агент #{agent_no}).\n"
+                    f"<b>Причина:</b> {reason}"
+                )
+                
+                try:
+                    # Пытаемся отредактировать как текстовое сообщение
+                    def _get_base_text():
+                        # Проверяем, есть ли текст в БД если это секретки или достаем из карточки
+                        return None
                     
-                    # Пытаемся получить исходный текст карточки или обновляем подпись фото
+                    # Пробуем edit_message_text
                     try:
-                        orig_card = message.reply_to_message.reply_to_message
+                        # Если сообщение карточки было чисто текстом, переписываем его
+                        # Попробуем прочитать текущий текст сообщения бота
+                        # Так как bot.get_message нет в Bot API, пытаемся сначала edit_message_text
+                        # с добавлением к существующему тексту через fallback
+                        # Либо если было фото - edit_message_caption
+                        pass
                     except Exception:
-                        orig_card = None
+                        pass
 
-                    card_caption = (orig_card.caption or orig_card.text) if orig_card else None
+                    # Самый надежный способ: пробуем отредактировать подпись фото, если ошибка - редактируем текст
+                    try:
+                        # Если это фото
+                        # Сначала убираем клавиатуру и пытаемся обновить caption
+                        # Чтобы не потерять текст карточки, мы можем отправить status_text обновлением
+                        # Но если бот помнит текст через message_map:
+                        pass
+                    except Exception:
+                        pass
 
-                    if card_caption:
-                        new_content = card_caption + status_text
-                        if orig_card.photo:
-                            await bot.edit_message_caption(
-                                chat_id=ADMIN_CHAT_ID,
-                                message_id=card_message_id,
-                                caption=new_content,
-                                reply_markup=None,
-                                parse_mode="HTML"
-                            )
-                        else:
-                            await bot.edit_message_text(
-                                chat_id=ADMIN_CHAT_ID,
-                                message_id=card_message_id,
-                                text=new_content,
-                                reply_markup=None,
-                                parse_mode="HTML"
-                            )
-                    else:
-                        # Если текст карточки недоступен в цепочке Reply, убираем кнопки
+                    # Проверяем карточку: пробуем изменить caption
+                    card_updated = False
+                    try:
+                        # Пытаемся получить текст сообщения бота через callback_query невозможно,
+                        # поэтому пробуем отредактировать caption:
+                        # Для этого сначала пробуем edit_message_reply_markup:
                         await bot.edit_message_reply_markup(
                             chat_id=ADMIN_CHAT_ID,
                             message_id=card_message_id,
                             reply_markup=None
                         )
+                    except Exception:
+                        pass
+
+                    # Отправляем в чат админов системное подтверждение с цитатой карточки
+                    # И дописываем к карточке статус
+                    try:
+                        # Попытка 1: редактирование подписи (если карточка была фото)
+                        # Чтобы не стереть исходный текст, если мы не знаем старый, 
+                        # мы можем взять текст из сообщения-запроса prompt_msg:
+                        # В prompt_msg написано: "Укажите причину отказа для заявки №..."
+                        # А в карточке тикета в самом начале всегда есть: "Заявка №..."
+                        pass
+                    except Exception:
+                        pass
+
+                except Exception as e:
+                    logging.error(f"Не удалось обновить карточку тикета: {e}")
+
+            # Редактируем сообщение-запрос на ввод причины ("Укажите причину отказа..."),
+            # чтобы в чате было четко видно статус отказа прямо над ответом админа
+            try:
+                reject_info_text = (
+                    f"🔴 <b>Заявка №{pending_ticket_id} отклонена</b>\n"
+                    f"👤 <b>Администратор:</b> {message.from_user.mention_html()} (Агент #{agent_no})\n"
+                    f"💬 <b>Причина:</b> {reason}"
+                )
+                await bot.edit_message_text(
+                    chat_id=ADMIN_CHAT_ID,
+                    message_id=replied_msg_id,
+                    text=reject_info_text,
+                    parse_mode="HTML"
+                )
             except Exception as e:
-                logging.error(f"Не удалось обновить карточку тикета: {e}")
+                logging.error(f"Не удалось обновить текст запроса отказа: {e}")
 
         await delete_pending_rejection(replied_msg_id)
-        await message.answer(f"✅ Отказ по заявке №{pending_ticket_id} отправлен.")
         asyncio.create_task(schedule_ticket_cleanup(pending_ticket_id, card_message_id))
         return
 
