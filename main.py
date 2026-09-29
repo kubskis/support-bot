@@ -183,6 +183,12 @@ def _init_db_sync():
                     reminded_idle BOOLEAN DEFAULT FALSE,
                     card_text TEXT DEFAULT NULL
                 );
+                CREATE TABLE IF NOT EXISTS user_notes (
+                    user_id BIGINT PRIMARY KEY,
+                    note TEXT,
+                    author_name TEXT,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                );
                 CREATE TABLE IF NOT EXISTS message_map (
                     group_message_id BIGINT PRIMARY KEY,
                     user_id BIGINT,
@@ -353,6 +359,31 @@ async def get_or_create_agent_number(admin_id: int) -> int:
                 return res[0] if res else next_number
 
     return await asyncio.to_thread(_query)
+
+async def get_user_note(user_id: int) -> tuple | None:
+    def _query():
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT note, author_name FROM user_notes WHERE user_id = %s", (user_id,))
+                return cur.fetchone()
+    try:
+        return await asyncio.to_thread(_query)
+    except Exception:
+        return None
+
+async def set_user_note(user_id: int, note: str, author_name: str):
+    def _query():
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO user_notes (user_id, note, author_name, created_at)
+                    VALUES (%s, %s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (user_id) DO UPDATE SET
+                        note = EXCLUDED.note,
+                        author_name = EXCLUDED.author_name,
+                        created_at = CURRENT_TIMESTAMP
+                """, (user_id, note, author_name))
+    await asyncio.to_thread(_query)
 
 async def get_setting(key: str, default: str = "false") -> str:
     def _query():
@@ -852,8 +883,15 @@ async def dispatch_ticket_to_admin(user_id: int, user, category: str, text: str,
     }
     title = cat_titles.get(category, "📩 #Заявка")
     
+    # Проверяем наличие постоянной заметки по этому игроку
+    user_note_data = await get_user_note(user_id)
+    note_header = ""
+    if user_note_data:
+        note_text, note_author = user_note_data
+        note_header = f"📌 <b>Постоянная заметка:</b> <i>{html.escape(note_text)}</i> (от: {html.escape(note_author)})\n━━━━━━━━━━━━━━━━━━━━\n"
+
     ticket_id = await create_ticket(user_id, category, "")
-    admin_card_text = f"{title} | <b>Заявка №{ticket_id}</b>\n👤 От: {user_mention} | ID: <code>{user_id}</code>\n\n{text}"
+    admin_card_text = f"{note_header}{title} | <b>Заявка №{ticket_id}</b>\n👤 От: {user_mention} | ID: <code>{user_id}</code>\n\n{text}"
 
     def _save_card_txt():
         with get_db() as conn:
@@ -1801,7 +1839,6 @@ async def process_c_nicknames(message: Message, state: FSMContext):
     nicks = data.get("nicks_list", [])
     profiles = data.get("roblox_profiles", [])
     
-    # Автопроверка профиля в Roblox API
     rbx_info = await check_roblox_username(new_nick)
     if rbx_info:
         official_name = rbx_info["name"]
@@ -1950,7 +1987,7 @@ async def process_c_photo(message: Message, state: FSMContext):
                 f"Нарушитель(и): {nicks_formatted}\n"
                 f"Суть нарушения: {html.escape(cur_data.get('c_reason', ''))}\n"
                 f"Где произошло нарушение: {html.escape(cur_data.get('c_place', ''))}\n"
-                f"Время публикации поста: {html.escape(cur_data.get('c_time', ''))}"
+                f"Время публикации поста: {html.escape(data.get('c_time', ''))}"
             )
             ticket_id = await dispatch_ticket_to_admin(message.from_user.id, message.from_user, "complaint", text, photos)
             await state.clear()
@@ -2407,7 +2444,7 @@ async def user_private_message(message: Message, state: FSMContext):
 # ----------------------------------------------------------------------
 @router.message(Command("note"), F.chat.id == ADMIN_CHAT_ID)
 async def cmd_admin_note(message: Message):
-    """Скрытая заметка модератора к тикету (не пересылается игроку)"""
+    """Постоянная скрытая заметка к пользователю (отобразится во всех его будущих тикетах)"""
     if not await is_support_member(message.from_user.id) and not await is_main_admin(message.from_user.id):
         return
 
@@ -2416,28 +2453,49 @@ async def cmd_admin_note(message: Message):
         await message.answer("⚠️ Использование: ответьте на тикет командой <code>/note Текст вашей заметки</code>", parse_mode="HTML")
         return
 
-    if not message.reply_to_message:
-        await message.answer("⚠️ Ответьте этой командой (Reply) на сообщение тикета!", parse_mode="HTML")
+    user_id = None
+    ticket_id = None
+
+    if message.reply_to_message:
+        replied_msg = message.reply_to_message
+        mapping = await get_user_by_group_msg(replied_msg.message_id)
+        if mapping:
+            user_id, ticket_id = mapping[0], mapping[1]
+
+        raw_text = replied_msg.text or replied_msg.caption or ""
+        if not user_id and raw_text:
+            match_id = re.search(r"ID:?\s*<[^>]+>?(\d+)<[^>]+>?", raw_text, re.IGNORECASE)
+            if not match_id:
+                match_id = re.search(r"ID:?\s*(\d+)", raw_text, re.IGNORECASE)
+            if match_id:
+                user_id = int(match_id.group(1))
+
+    if not user_id:
+        await message.answer("❌ Не удалось определить пользователя. Ответьте этой командой (Reply) на сообщение тикета или игрока!", parse_mode="HTML")
         return
 
-    mapping = await get_user_by_group_msg(message.reply_to_message.message_id)
-    ticket_num = f"№{mapping[1]}" if mapping else ""
+    agent_no = await get_or_create_agent_number(message.from_user.id)
+    author_str = f"Агент #{agent_no}"
+    note_content = args[1].strip()
+
+    await set_user_note(user_id, note_content, author_str)
 
     try:
         await message.react([{"type": "emoji", "emoji": "✍"}])
     except Exception:
         pass
 
-    agent_no = await get_or_create_agent_number(message.from_user.id)
-    note_text = (
-        f"📝 <b>Внутренняя заметка {ticket_num}</b>\n"
-        f"👤 От: {message.from_user.mention_html()} (Агент #{agent_no})\n"
-        f"💬 <i>{html.escape(args[1])}</i>\n\n"
-        f"🔒 <i>(Заметка видна только в этом чате и не отправлена игроку)</i>"
+    ticket_str = f" по заявке №{ticket_id}" if ticket_id else ""
+    confirm_text = (
+        f"📌 <b>Постоянная заметка сохранена{ticket_str}!</b>\n\n"
+        f"👤 <b>Пользователь:</b> <code>{user_id}</code>\n"
+        f"✍️ <b>Автор:</b> {message.from_user.mention_html()} ({author_str})\n"
+        f"💬 <b>Заметка:</b> <i>{html.escape(note_content)}</i>\n\n"
+        f"🔒 <i>Эта заметка теперь будет автоматически отображаться в начале карточки всех новых заявок этого игрока!</i>"
     )
-    sent = await message.answer(note_text, parse_mode="HTML")
-    if mapping:
-        await map_message(sent.message_id, mapping[0], mapping[1])
+    sent = await message.answer(confirm_text, parse_mode="HTML")
+    if ticket_id:
+        await map_message(sent.message_id, user_id, ticket_id)
 
 @router.message(Command("news"), F.chat.id == ADMIN_CHAT_ID)
 async def cmd_news_broadcast(message: Message):
@@ -2799,7 +2857,6 @@ async def reminder_worker():
                         """)
                         idle = cur.fetchall()
 
-                        # Автозакрытие: активный тикет, последний ответил админ, простой > 24 часов
                         cur.execute("""
                             SELECT ticket_id, user_id, admin_id, card_text
                             FROM tickets
@@ -2813,7 +2870,6 @@ async def reminder_worker():
 
             unassigned_tickets, idle_tickets, expired_active = await asyncio.to_thread(_check)
 
-            # Напоминание о необработанных заявках
             for t_id, cat, u_id, hrs in unassigned_tickets:
                 hours_str = f"{int(hrs)} ч." if hrs else "2+ ч."
                 alert_text = (
@@ -2833,7 +2889,6 @@ async def reminder_worker():
                 except Exception as e:
                     logging.error(f"Ошибка отправки напоминания о заявке №{t_id}: {e}")
 
-            # Напоминание хелперу о простое
             for t_id, adm_id, u_id, mins, agent_no in idle_tickets:
                 agent_str = f"Агент #{agent_no}" if agent_no else f"ID {adm_id}"
                 admin_mention = agent_str
@@ -2859,7 +2914,6 @@ async def reminder_worker():
                 except Exception as e:
                     logging.error(f"Ошибка отправки напоминания о простое тикета №{t_id}: {e}")
 
-            # Автозакрытие тикетов по истечении 24 часов молчания пользователя
             for t_id, u_id, adm_id, c_txt in expired_active:
                 try:
                     await close_ticket_db(t_id, status='closed', admin_id=adm_id)
