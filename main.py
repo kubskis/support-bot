@@ -2176,6 +2176,7 @@ async def process_friends_nickname(message: Message, state: FSMContext):
 # ----------------------------------------------------------------------
 @router.callback_query(F.data.startswith("take_"))
 async def take_ticket_handler(call: CallbackQuery):
+    await call.answer()
     if not await is_support_member(call.from_user.id):
         await call.answer("❌ У вас нет прав хелпера!", show_alert=True)
         return
@@ -2202,14 +2203,17 @@ async def take_ticket_handler(call: CallbackQuery):
     base_text = ticket_info[3] if (ticket_info and ticket_info[3]) else (call.message.caption or call.message.text or "")
     new_text = base_text + f"\n\n🟢 <b>В работе у:</b> {call.from_user.mention_html()} (Агент #{agent_number})"
     
-    if call.message.photo:
-        await call.message.edit_caption(caption=new_text, reply_markup=close_ticket_kb(ticket_id, call.from_user.id), parse_mode="HTML")
-    else:
-        await call.message.edit_text(text=new_text, reply_markup=close_ticket_kb(ticket_id, call.from_user.id), parse_mode="HTML")
-    await call.answer(f"Заявка №{ticket_id} принята (Вы Агент #{agent_number})!")
+    try:
+        if call.message.photo:
+            await call.message.edit_caption(caption=new_text, reply_markup=close_ticket_kb(ticket_id, call.from_user.id), parse_mode="HTML")
+        else:
+            await call.message.edit_text(text=new_text, reply_markup=close_ticket_kb(ticket_id, call.from_user.id), parse_mode="HTML")
+    except Exception as e:
+        logging.error(f"Ошибка обновления карточки при взятии: {e}")
 
 @router.callback_query(F.data.startswith("reject_"))
 async def reject_ticket_handler(call: CallbackQuery):
+    await call.answer()
     if not await is_support_member(call.from_user.id):
         await call.answer("❌ У вас нет прав хелпера!", show_alert=True)
         return
@@ -2229,10 +2233,10 @@ async def reject_ticket_handler(call: CallbackQuery):
     )
     await add_pending_rejection(prompt_msg.message_id, ticket_id, call.message.message_id, base_text)
     await map_message(prompt_msg.message_id, 0, ticket_id)
-    await call.answer("Напишите причину отказа в ответ на сообщение бота!")
 
 @router.callback_query(F.data.startswith("close_"))
 async def close_ticket_handler(call: CallbackQuery):
+    await call.answer()
     parts = call.data.split("_")
     ticket_id = int(parts[1])
     assigned_admin_id = int(parts[2])
@@ -2258,22 +2262,28 @@ async def close_ticket_handler(call: CallbackQuery):
             pass
 
     status_text = f"\n\n🔒 <b>Заявка №{ticket_id} закрыта</b> администратором {call.from_user.mention_html()}."
-    if call.message.photo:
-        await call.message.edit_caption(caption=(call.message.caption or "") + status_text, parse_mode="HTML")
-    else:
-        await call.message.edit_text(text=(call.message.text or "") + status_text, parse_mode="HTML")
-    await call.answer("Заявка закрыта!")
+    try:
+        if call.message.photo:
+            await call.message.edit_caption(caption=(call.message.caption or "") + status_text, reply_markup=None, parse_mode="HTML")
+        else:
+            await call.message.edit_text(text=(call.message.text or "") + status_text, reply_markup=None, parse_mode="HTML")
+    except Exception as e:
+        logging.error(f"Ошибка редактирования карточки при закрытии: {e}")
+        try:
+            await call.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
 
     asyncio.create_task(schedule_ticket_cleanup(ticket_id, call.message.message_id))
 
 @router.callback_query(F.data.startswith("user_cancel_"))
 async def user_cancel_ticket(call: CallbackQuery):
+    await call.answer()
     ticket_id = int(call.data.split("_")[2])
     ticket_info = await get_ticket_info(ticket_id)
     if ticket_info and ticket_info[2] == 'pending':
         await close_ticket_db(ticket_id, 'closed')
         await call.message.edit_text(f"{ICON_CROSS} Заявка <b>№{ticket_id}</b> отменена вами.", parse_mode="HTML")
-        await call.answer("Заявка отменена")
         asyncio.create_task(schedule_ticket_cleanup(ticket_id, None))
     else:
         await call.answer("❌ Заявка уже взята в работу или закрыта, отмена недоступна.", show_alert=True)
@@ -2283,6 +2293,7 @@ async def user_cancel_ticket(call: CallbackQuery):
 # ----------------------------------------------------------------------
 @router.callback_query(F.data.startswith("rate_"))
 async def process_rating(call: CallbackQuery):
+    await call.answer()
     parts = call.data.split("_")
     ticket_id = int(parts[1])
     score = int(parts[2])
@@ -2297,8 +2308,6 @@ async def process_rating(call: CallbackQuery):
         await call.message.edit_text(f"{ICON_STAR} [ТЕСТ АДМИНА] Оценка {score}/5 сохранена, но в общую статистику не пошла.", parse_mode="HTML")
     else:
         await call.message.edit_text(f"{ICON_STAR} Спасибо за оценку ({score}/5)! Ваше мнение учтено.", parse_mode="HTML")
-    
-    await call.answer("Оценка сохранена!")
 
 # ----------------------------------------------------------------------
 # ДИАЛОГ В ЛС С ПОЛЬЗОВАТЕЛЕМ
