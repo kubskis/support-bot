@@ -1367,7 +1367,7 @@ async def sec_stats(call: CallbackQuery):
         text = text[:3950] + "\n... <i>(список сокращен из-за лимита длины)</i>"
 
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="adm_secret_panel")]])
-    await call.message.edit_text(text, reply_markup=kb, reply_markup=kb, parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
+    await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
     await call.answer()
 
 @router.callback_query(F.data == "sec_set_timer")
@@ -2025,7 +2025,7 @@ async def process_c_photo(message: Message, state: FSMContext):
             text = (
                 f"Нарушитель(и): {nicks_formatted}\n"
                 f"Суть нарушения: {html.escape(cur_data.get('c_reason', ''))}\n"
-                f"Где произошло нарушение: {html.escape(data.get('c_place', ''))}\n"
+                f"Где произошло нарушение: {html.escape(cur_data.get('c_place', ''))}\n"
                 f"Время публикации поста: {html.escape(data.get('c_time', ''))}"
             )
             ticket_id = await dispatch_ticket_to_admin(message.from_user.id, message.from_user, "complaint", text, photos)
@@ -2171,8 +2171,8 @@ async def process_a_photo(message: Message, state: FSMContext):
             text = (
                 f"Ник: <code>{html.escape(cur_data.get('a_nickname', ''))}</code>\n"
                 f"Сервер бана: {html.escape(cur_data.get('a_place', ''))}\n"
-                f"Время публикации поста: {html.escape(cur_data.get('a_time', ''))}\n"
-                f"Причина разбана: {html.escape(cur_data.get('a_reason', ''))}"
+                f"Время публикации поста: {html.escape(data.get('a_time', ''))}\n"
+                f"Причина разбана: {html.escape(data.get('a_reason', ''))}"
             )
             ticket_id = await dispatch_ticket_to_admin(message.from_user.id, message.from_user, "appeal", text, photos)
             await state.clear()
@@ -2493,15 +2493,12 @@ async def cmd_my_stats(message: Message):
     def _query_mystats():
         with get_db() as conn:
             with conn.cursor() as cur:
-                # Количество закрытых тикетов
                 cur.execute("SELECT COUNT(*) FROM tickets WHERE admin_id = %s AND status = 'closed'", (admin_id,))
                 closed_count = cur.fetchone()[0]
 
-                # Средняя оценка
                 cur.execute("SELECT COALESCE(AVG(score), 0) FROM ratings WHERE admin_id = %s", (admin_id,))
                 avg_score = cur.fetchone()[0]
 
-                # Позиция в общем рейтинге активности
                 cur.execute("""
                     SELECT admin_id, COUNT(*) as cnt 
                     FROM tickets 
