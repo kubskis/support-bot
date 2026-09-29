@@ -165,7 +165,46 @@ def get_db():
 def _init_db_sync():
     with get_db() as conn:
         with conn.cursor() as cursor:
+            # Исправление структуры таблицы user_notes для поддержки множественных заметок с id
             cursor.execute("""
+                CREATE TABLE IF NOT EXISTS user_notes_new (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT,
+                    note TEXT,
+                    author_name TEXT,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            
+            cursor.execute("""
+                DO $$ 
+                BEGIN 
+                    IF EXISTS (
+                        SELECT 1 FROM information_schema.table_constraints 
+                        WHERE table_name = 'user_notes' AND constraint_type = 'PRIMARY KEY'
+                    ) THEN
+                        IF NOT EXISTS (
+                            SELECT 1 FROM information_schema.columns 
+                            WHERE table_name = 'user_notes' AND column_name = 'id'
+                        ) THEN
+                            INSERT INTO user_notes_new (user_id, note, author_name, created_at)
+                            SELECT user_id, note, author_name, created_at FROM user_notes;
+                            
+                            DROP TABLE user_notes;
+                            ALTER TABLE user_notes_new RENAME TO user_notes;
+                        END IF;
+                    END IF;
+                END $$;
+            """)
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS user_notes (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT,
+                    note TEXT,
+                    author_name TEXT,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                );
                 CREATE TABLE IF NOT EXISTS users (
                     user_id BIGINT PRIMARY KEY
                 );
@@ -181,13 +220,6 @@ def _init_db_sync():
                     reminded_unassigned BOOLEAN DEFAULT FALSE,
                     reminded_idle BOOLEAN DEFAULT FALSE,
                     card_text TEXT DEFAULT NULL
-                );
-                CREATE TABLE IF NOT EXISTS user_notes (
-                    id SERIAL PRIMARY KEY,
-                    user_id BIGINT,
-                    note TEXT,
-                    author_name TEXT,
-                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
                 );
                 CREATE TABLE IF NOT EXISTS message_map (
                     group_message_id BIGINT PRIMARY KEY,
@@ -256,12 +288,6 @@ def _init_db_sync():
                 ALTER TABLE pending_rejections ADD COLUMN IF NOT EXISTS card_message_id BIGINT;
                 ALTER TABLE pending_rejections ADD COLUMN IF NOT EXISTS card_text TEXT DEFAULT NULL;
             """)
-
-            # Гарантированная миграция таблицы user_notes (если в ней ранее не было колонки id)
-            try:
-                cursor.execute("ALTER TABLE user_notes ADD COLUMN IF NOT EXISTS id SERIAL;")
-            except Exception:
-                pass
 
             if OWNER_ID:
                 cursor.execute(
@@ -2000,8 +2026,8 @@ async def process_c_photo(message: Message, state: FSMContext):
             text = (
                 f"Нарушитель(и): {nicks_formatted}\n"
                 f"Суть нарушения: {html.escape(cur_data.get('c_reason', ''))}\n"
-                f"Где произошло нарушение: {html.escape(data.get('c_place', ''))}\n"
-                f"Время публикации поста: {html.escape(data.get('c_time', ''))}"
+                f"Где произошло нарушение: {html.escape(cur_data.get('c_place', ''))}\n"
+                f"Время публикации поста: {html.escape(cur_data.get('c_time', ''))}"
             )
             ticket_id = await dispatch_ticket_to_admin(message.from_user.id, message.from_user, "complaint", text, photos)
             await state.clear()
@@ -2454,7 +2480,7 @@ async def user_private_message(message: Message, state: FSMContext):
     await message.answer(f"{ICON_WARN} Пожалуйста, выберите нужный пункт меню для обращения.", reply_markup=kb, parse_mode="HTML")
 
 # ----------------------------------------------------------------------
-# КОМАНДЫ В АДМИН-ЧАТЕ
+# КОМАНДЫ В АДМИН-ЧАТЕ (/note и /deletenote)
 # ----------------------------------------------------------------------
 @router.message(Command("note"), F.chat.id == ADMIN_CHAT_ID)
 async def cmd_admin_note(message: Message):
@@ -2481,19 +2507,16 @@ async def cmd_admin_note(message: Message):
     ticket_id = None
     replied_msg = message.reply_to_message
 
-    # 1. Поиск через базу маппинга сообщений
     mapping = await get_user_by_group_msg(replied_msg.message_id)
     if mapping:
         user_id, ticket_id = mapping[0], mapping[1]
 
-    # 2. Поиск по тексту сообщения/карточки
     raw_text = replied_msg.text or replied_msg.caption or ""
     if not user_id and raw_text:
         match_id = re.search(r"ID:?\s*(\d+)", raw_text, re.IGNORECASE)
         if match_id:
             user_id = int(match_id.group(1))
 
-    # 3. Поиск по номеру тикета в тексте
     if not ticket_id and raw_text:
         match_t = re.search(r"№(\d+)", raw_text)
         if match_t:
