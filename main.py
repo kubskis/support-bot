@@ -141,7 +141,7 @@ dp.callback_query.middleware(ThrottlingMiddleware(limit=0.8))
 dp.include_router(router)
 
 # ----------------------------------------------------------------------
-# БАЗА ДАННЫХ
+# БАЗА ДАННЫХ (Supabase / PostgreSQL)
 # ----------------------------------------------------------------------
 db_pool = psycopg2.pool.ThreadedConnectionPool(
     minconn=1,
@@ -256,6 +256,12 @@ def _init_db_sync():
                 ALTER TABLE pending_rejections ADD COLUMN IF NOT EXISTS card_message_id BIGINT;
                 ALTER TABLE pending_rejections ADD COLUMN IF NOT EXISTS card_text TEXT DEFAULT NULL;
             """)
+
+            # Гарантированная миграция таблицы user_notes (если в ней ранее не было колонки id)
+            try:
+                cursor.execute("ALTER TABLE user_notes ADD COLUMN IF NOT EXISTS id SERIAL;")
+            except Exception:
+                pass
 
             if OWNER_ID:
                 cursor.execute(
@@ -2475,12 +2481,12 @@ async def cmd_admin_note(message: Message):
     ticket_id = None
     replied_msg = message.reply_to_message
 
-    # 1. Поиск через базу маппинга
+    # 1. Поиск через базу маппинга сообщений
     mapping = await get_user_by_group_msg(replied_msg.message_id)
     if mapping:
         user_id, ticket_id = mapping[0], mapping[1]
 
-    # 2. Поиск по тексту карточки
+    # 2. Поиск по тексту сообщения/карточки
     raw_text = replied_msg.text or replied_msg.caption or ""
     if not user_id and raw_text:
         match_id = re.search(r"ID:?\s*(\d+)", raw_text, re.IGNORECASE)
@@ -2499,14 +2505,19 @@ async def cmd_admin_note(message: Message):
                     user_id = t_info[0]
 
     if not user_id:
-        await message.answer("❌ <b>Не удалось определить игрока!</b> Ответьте на карточку тикета (где есть ID или номер заявки) или на сообщение игрока.", parse_mode="HTML")
+        await message.answer("❌ <b>Не удалось определить игрока!</b> Ответьте именно на карточку тикета (где есть ID) или на сообщение игрока.", parse_mode="HTML")
         return
 
     agent_no = await get_or_create_agent_number(message.from_user.id)
     author_str = f"Агент #{agent_no}"
     note_content = args[1].strip()
 
-    note_id = await add_user_note(user_id, note_content, author_str)
+    try:
+        note_id = await add_user_note(user_id, note_content, author_str)
+    except Exception as e:
+        logging.error(f"Ошибка сохранения заметки: {e}")
+        await message.answer(f"❌ Ошибка сохранения в базе данных: {e}")
+        return
 
     try:
         await message.react([{"type": "emoji", "emoji": "✍"}])
@@ -2519,7 +2530,7 @@ async def cmd_admin_note(message: Message):
         f"👤 <b>Пользователь:</b> <code>{user_id}</code>\n"
         f"✍️ <b>Автор:</b> {message.from_user.mention_html()} ({author_str})\n"
         f"💬 <b>Заметка:</b> <i>{html.escape(note_content)}</i>\n\n"
-        f"🔒 <i>Заметка закреплена и будет выводиться во всех будущих заявках этого игрока.</i>"
+        f"🔒 <i>Заметка закреплена и будет автоматически выводиться во всех будущих заявках этого игрока.</i>"
     )
     sent = await message.answer(confirm_text, parse_mode="HTML")
     if ticket_id:
