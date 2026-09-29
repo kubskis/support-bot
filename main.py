@@ -165,7 +165,6 @@ def get_db():
 def _init_db_sync():
     with get_db() as conn:
         with conn.cursor() as cursor:
-            # Исправление структуры таблицы user_notes для поддержки множественных заметок с id
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS user_notes_new (
                     id SERIAL PRIMARY KEY,
@@ -1368,7 +1367,7 @@ async def sec_stats(call: CallbackQuery):
         text = text[:3950] + "\n... <i>(список сокращен из-за лимита длины)</i>"
 
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="adm_secret_panel")]])
-    await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
+    await call.message.edit_text(text, reply_markup=kb, reply_markup=kb, parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
     await call.answer()
 
 @router.callback_query(F.data == "sec_set_timer")
@@ -2026,8 +2025,8 @@ async def process_c_photo(message: Message, state: FSMContext):
             text = (
                 f"Нарушитель(и): {nicks_formatted}\n"
                 f"Суть нарушения: {html.escape(cur_data.get('c_reason', ''))}\n"
-                f"Где произошло нарушение: {html.escape(cur_data.get('c_place', ''))}\n"
-                f"Время публикации поста: {html.escape(cur_data.get('c_time', ''))}"
+                f"Где произошло нарушение: {html.escape(data.get('c_place', ''))}\n"
+                f"Время публикации поста: {html.escape(data.get('c_time', ''))}"
             )
             ticket_id = await dispatch_ticket_to_admin(message.from_user.id, message.from_user, "complaint", text, photos)
             await state.clear()
@@ -2480,8 +2479,55 @@ async def user_private_message(message: Message, state: FSMContext):
     await message.answer(f"{ICON_WARN} Пожалуйста, выберите нужный пункт меню для обращения.", reply_markup=kb, parse_mode="HTML")
 
 # ----------------------------------------------------------------------
-# КОМАНДЫ В АДМИН-ЧАТЕ (/note и /deletenote)
+# КОМАНДЫ В АДМИН-ЧАТЕ (/note, /deletenote, /mystats)
 # ----------------------------------------------------------------------
+@router.message(Command("mystats"), F.chat.id == ADMIN_CHAT_ID)
+async def cmd_my_stats(message: Message):
+    """Личная статистика агента поддержки"""
+    if not await is_support_member(message.from_user.id) and not await is_main_admin(message.from_user.id):
+        return
+
+    admin_id = message.from_user.id
+    agent_no = await get_or_create_agent_number(admin_id)
+
+    def _query_mystats():
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                # Количество закрытых тикетов
+                cur.execute("SELECT COUNT(*) FROM tickets WHERE admin_id = %s AND status = 'closed'", (admin_id,))
+                closed_count = cur.fetchone()[0]
+
+                # Средняя оценка
+                cur.execute("SELECT COALESCE(AVG(score), 0) FROM ratings WHERE admin_id = %s", (admin_id,))
+                avg_score = cur.fetchone()[0]
+
+                # Позиция в общем рейтинге активности
+                cur.execute("""
+                    SELECT admin_id, COUNT(*) as cnt 
+                    FROM tickets 
+                    WHERE admin_id IS NOT NULL AND status = 'closed' 
+                    GROUP BY admin_id 
+                    ORDER BY cnt DESC
+                """)
+                ranking = cur.fetchall()
+                rank = "Без места"
+                for idx, (a_id, _) in enumerate(ranking, 1):
+                    if a_id == admin_id:
+                        rank = f"#{idx} из {len(ranking)}"
+                        break
+                return closed_count, round(float(avg_score), 2), rank
+
+    closed_cnt, avg_sc, user_rank = await asyncio.to_thread(_query_mystats)
+
+    stats_text = (
+        f"📊 <b>Ваша личная статистика агента:</b>\n\n"
+        f"👤 <b>Агент:</b> {message.from_user.mention_html()} (Агент #{agent_no})\n"
+        f"🔒 Закрыто тикетов: <code>{closed_cnt}</code>\n"
+        f"⭐ Средняя оценка: <code>{avg_sc} / 5.0</code>\n"
+        f"🏆 Место в рейтинге: <b>{user_rank}</b>"
+    )
+    await message.answer(stats_text, parse_mode="HTML")
+
 @router.message(Command("note"), F.chat.id == ADMIN_CHAT_ID)
 async def cmd_admin_note(message: Message):
     """Постоянная заметка по пользователю (работает с карточки тикета)"""
