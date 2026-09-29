@@ -8,6 +8,7 @@ from datetime import datetime, timezone, timedelta
 from contextlib import contextmanager
 from typing import Any, Callable, Dict, List, Awaitable
 
+import aiohttp
 import psycopg2
 from psycopg2 import pool
 from aiohttp import web
@@ -42,7 +43,6 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 
-# Защита от дубликатов при отправке альбомов
 creation_lock = asyncio.Lock()
 processed_media_groups = set()
 
@@ -78,13 +78,32 @@ def get_user_mention(user):
 
 def is_night_time() -> bool:
     now_msk = datetime.now(MSK_TZ)
-    hour = now_msk.hour
-    return hour >= 22 or hour < 10
+    return now_msk.hour >= 22 or now_msk.hour < 10
 
 def get_night_notice() -> str:
     if is_night_time():
         return f"\n\n{ICON_TIME} <i>Обратите внимание: сейчас ночное время (с 22:00 до 10:00 МСК). Ваша заявка принята, но ответ модераторов может поступить утром!</i>"
     return ""
+
+async def check_roblox_username(username: str) -> dict | None:
+    """Проверка существования игрока в Roblox через официальный Users API"""
+    url = "https://users.roblox.com/v1/usernames/users"
+    payload = {"usernames": [username], "excludeBannedUsers": False}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=4)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    user_list = data.get("data", [])
+                    if user_list:
+                        return {
+                            "id": user_list[0]["id"],
+                            "name": user_list[0]["name"],
+                            "displayName": user_list[0]["displayName"]
+                        }
+    except Exception as e:
+        logging.error(f"Ошибка проверки Roblox профиля {username}: {e}")
+    return None
 
 # ----------------------------------------------------------------------
 # АНТИФЛУД МИДЛВАРЬ
@@ -159,6 +178,7 @@ def _init_db_sync():
                     category TEXT DEFAULT 'general',
                     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                    last_actor TEXT DEFAULT 'user',
                     reminded_unassigned BOOLEAN DEFAULT FALSE,
                     reminded_idle BOOLEAN DEFAULT FALSE,
                     card_text TEXT DEFAULT NULL
@@ -223,6 +243,7 @@ def _init_db_sync():
                 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS category TEXT DEFAULT 'general';
                 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP;
                 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP;
+                ALTER TABLE tickets ADD COLUMN IF NOT EXISTS last_actor TEXT DEFAULT 'user';
                 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS reminded_unassigned BOOLEAN DEFAULT FALSE;
                 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS reminded_idle BOOLEAN DEFAULT FALSE;
                 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS card_text TEXT DEFAULT NULL;
@@ -418,20 +439,20 @@ async def create_ticket(user_id: int, category: str = 'general', card_text: str 
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO tickets (user_id, status, category, card_text, created_at, updated_at) "
-                    "VALUES (%s, 'pending', %s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) RETURNING ticket_id",
+                    "INSERT INTO tickets (user_id, status, category, card_text, last_actor, created_at, updated_at) "
+                    "VALUES (%s, 'pending', %s, %s, 'user', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) RETURNING ticket_id",
                     (user_id, category, card_text)
                 )
                 return cur.fetchone()[0]
     return await asyncio.to_thread(_query)
 
-async def touch_ticket(ticket_id: int):
+async def touch_ticket(ticket_id: int, actor: str = 'user'):
     def _query():
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "UPDATE tickets SET updated_at = CURRENT_TIMESTAMP, reminded_idle = FALSE WHERE ticket_id = %s",
-                    (ticket_id,)
+                    "UPDATE tickets SET updated_at = CURRENT_TIMESTAMP, last_actor = %s, reminded_idle = FALSE WHERE ticket_id = %s",
+                    (actor, ticket_id)
                 )
     await asyncio.to_thread(_query)
 
@@ -488,7 +509,7 @@ async def activate_ticket(ticket_id: int, admin_id: int):
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "UPDATE tickets SET status = 'active', admin_id = %s, updated_at = CURRENT_TIMESTAMP, reminded_idle = FALSE WHERE ticket_id = %s",
+                    "UPDATE tickets SET status = 'active', admin_id = %s, last_actor = 'admin', updated_at = CURRENT_TIMESTAMP, reminded_idle = FALSE WHERE ticket_id = %s",
                     (admin_id, ticket_id)
                 )
     await asyncio.to_thread(_query)
@@ -1759,14 +1780,14 @@ async def collect_media_photos(message: Message, state: FSMContext, key: str = "
         await state.update_data({key: photos})
     return photos
 
-# --- 1. ЖАЛОБА (Обновленный опрос с добавлением нескольких нарушителей) ---
+# --- 1. ЖАЛОБА (С автопроверкой профиля Roblox) ---
 @router.message(F.text == BTN_COMPLAINT, F.chat.type == "private")
 async def start_complaint(message: Message, state: FSMContext):
     await register_user(message.from_user.id)
     if await is_banned(message.from_user.id) or await check_active_ticket(message): return
     await state.clear()
     await state.set_state(Form.complaint_nicknames)
-    await state.update_data(nicks_list=[])
+    await state.update_data(nicks_list=[], roblox_profiles=[])
     await message.answer(
         f"{NUM_1} <b>Укажите ник нарушителя:</b>\n"
         "<i>(Напишите точный игровой никнейм в Roblox)</i>",
@@ -1778,20 +1799,35 @@ async def process_c_nicknames(message: Message, state: FSMContext):
     new_nick = message.text.strip()
     data = await state.get_data()
     nicks = data.get("nicks_list", [])
-    nicks.append(new_nick)
-    await state.update_data(nicks_list=nicks)
+    profiles = data.get("roblox_profiles", [])
+    
+    # Автопроверка профиля в Roblox API
+    rbx_info = await check_roblox_username(new_nick)
+    if rbx_info:
+        official_name = rbx_info["name"]
+        rbx_id = rbx_info["id"]
+        nicks.append(official_name)
+        profiles.append(f"<a href='https://www.roblox.com/users/{rbx_id}/profile'>{official_name}</a> (ID: <code>{rbx_id}</code>)")
+        verified_text = f"Профиль найден: <a href='https://www.roblox.com/users/{rbx_id}/profile'><b>{official_name}</b></a> (ID: <code>{rbx_id}</code>)"
+    else:
+        nicks.append(new_nick)
+        profiles.append(f"<code>{html.escape(new_nick)}</code> (⚠️ <i>не найден в Roblox</i>)")
+        verified_text = f"<code>{html.escape(new_nick)}</code> (⚠️ <i>профиль не найден в Roblox</i>)"
+
+    await state.update_data(nicks_list=nicks, roblox_profiles=profiles)
 
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="➡️ Продолжить (перейти к сути)", callback_data="c_nicks_done")
     ]])
 
     await message.answer(
-        f"{ICON_CHECK} Добавлен нарушитель: <code>{html.escape(new_nick)}</code>\n\n"
+        f"{ICON_CHECK} Добавлен нарушитель: {verified_text}\n\n"
         f"👤 Всего нарушителей в списке: <b>{len(nicks)}</b>\n\n"
         "<i>Если нарушителей несколько — отправьте следующий ник сообщением. "
         "Если нарушитель только один (или вы ввели всех) — нажмите кнопку ниже:</i>",
         reply_markup=kb,
-        parse_mode="HTML"
+        parse_mode="HTML",
+        link_preview_options=LinkPreviewOptions(is_disabled=True)
     )
 
 @router.callback_query(F.data == "c_nicks_done", Form.complaint_nicknames)
@@ -1857,7 +1893,12 @@ async def skip_c_photos(call: CallbackQuery, state: FSMContext):
             await call.answer()
             return
         data = await state.get_data()
-        nicks_formatted = ", ".join([f"<code>{html.escape(n)}</code>" for n in data.get("nicks_list", [])])
+        profiles_list = data.get("roblox_profiles", [])
+        if profiles_list:
+            nicks_formatted = ", ".join(profiles_list)
+        else:
+            nicks_formatted = ", ".join([f"<code>{html.escape(n)}</code>" for n in data.get("nicks_list", [])])
+
         text = (
             f"Нарушитель(и): {nicks_formatted}\n"
             f"Суть нарушения: {html.escape(data.get('c_reason', ''))}\n"
@@ -1899,7 +1940,12 @@ async def process_c_photo(message: Message, state: FSMContext):
                 await state.clear()
                 return
 
-            nicks_formatted = ", ".join([f"<code>{html.escape(n)}</code>" for n in cur_data.get("nicks_list", [])])
+            profiles_list = cur_data.get("roblox_profiles", [])
+            if profiles_list:
+                nicks_formatted = ", ".join(profiles_list)
+            else:
+                nicks_formatted = ", ".join([f"<code>{html.escape(n)}</code>" for n in cur_data.get("nicks_list", [])])
+
             text = (
                 f"Нарушитель(и): {nicks_formatted}\n"
                 f"Суть нарушения: {html.escape(cur_data.get('c_reason', ''))}\n"
@@ -1917,7 +1963,12 @@ async def process_c_photo(message: Message, state: FSMContext):
             await state.clear()
             return
         data = await state.get_data()
-        nicks_formatted = ", ".join([f"<code>{html.escape(n)}</code>" for n in data.get("nicks_list", [])])
+        profiles_list = data.get("roblox_profiles", [])
+        if profiles_list:
+            nicks_formatted = ", ".join(profiles_list)
+        else:
+            nicks_formatted = ", ".join([f"<code>{html.escape(n)}</code>" for n in data.get("nicks_list", [])])
+
         text = (
             f"Нарушитель(и): {nicks_formatted}\n"
             f"Суть нарушения: {html.escape(data.get('c_reason', ''))}\n"
@@ -1929,7 +1980,7 @@ async def process_c_photo(message: Message, state: FSMContext):
         night_txt = get_night_notice()
         await message.answer(f"{ICON_CHECK} Жалоба №{ticket_id} отправлена! (Прикреплено фото: {len(photos)}){night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
 
-# --- 2. ОБЖАЛОВАНИЕ (Обновленные вопросы) ---
+# --- 2. ОБЖАЛОВАНИЕ ---
 @router.message(F.text == BTN_APPEAL, F.chat.type == "private")
 async def start_appeal(message: Message, state: FSMContext):
     await register_user(message.from_user.id)
@@ -2236,10 +2287,19 @@ async def reject_ticket_handler(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith("close_"))
 async def close_ticket_handler(call: CallbackQuery):
-    await call.answer()
     parts = call.data.split("_")
     ticket_id = int(parts[1])
     assigned_admin_id = int(parts[2])
+
+    ticket_info = await get_ticket_info(ticket_id)
+    
+    if not ticket_info or ticket_info[2] == 'closed':
+        await call.answer("⚠️ Заявка уже закрыта!", show_alert=False)
+        try:
+            await call.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
 
     if call.from_user.id != assigned_admin_id and not await is_main_admin(call.from_user.id):
         if not await is_support_member(call.from_user.id):
@@ -2248,25 +2308,30 @@ async def close_ticket_handler(call: CallbackQuery):
         await call.answer("❌ Закрыть тикет может только тот админ, который взял его в работу!", show_alert=True)
         return
 
-    ticket_info = await get_ticket_info(ticket_id)
-    if ticket_info:
-        await close_ticket_db(ticket_id, status='closed', admin_id=call.from_user.id)
-        try:
-            await bot.send_message(
-                ticket_info[0],
-                f"{ICON_LOCK} Ваша заявка <b>№{ticket_id}</b> закрыта поддержкой.\nОцените качество обслуживания:",
-                parse_mode="HTML",
-                reply_markup=rating_kb(ticket_id)
-            )
-        except Exception:
-            pass
+    await call.answer("Заявка закрыта!")
+    agent_no = await get_or_create_agent_number(call.from_user.id)
 
-    status_text = f"\n\n🔒 <b>Заявка №{ticket_id} закрыта</b> администратором {call.from_user.mention_html()}."
+    await close_ticket_db(ticket_id, status='closed', admin_id=call.from_user.id)
+
+    try:
+        await bot.send_message(
+            ticket_info[0],
+            f"{ICON_LOCK} Ваша заявка <b>№{ticket_id}</b> закрыта поддержкой.\nОцените качество обслуживания:",
+            parse_mode="HTML",
+            reply_markup=rating_kb(ticket_id)
+        )
+    except Exception:
+        pass
+
+    base_text = ticket_info[3] or (call.message.caption or call.message.text or f"Заявка <b>№{ticket_id}</b>")
+    status_text = f"\n\n🔒 <b>Заявка №{ticket_id} закрыта</b> администратором {call.from_user.mention_html()} (Агент #{agent_no})."
+    new_content = base_text + status_text
+
     try:
         if call.message.photo:
-            await call.message.edit_caption(caption=(call.message.caption or "") + status_text, reply_markup=None, parse_mode="HTML")
+            await call.message.edit_caption(caption=new_content, reply_markup=None, parse_mode="HTML")
         else:
-            await call.message.edit_text(text=(call.message.text or "") + status_text, reply_markup=None, parse_mode="HTML")
+            await call.message.edit_text(text=new_content, reply_markup=None, parse_mode="HTML")
     except Exception as e:
         logging.error(f"Ошибка редактирования карточки при закрытии: {e}")
         try:
@@ -2323,7 +2388,7 @@ async def user_private_message(message: Message, state: FSMContext):
 
     active_ticket = await get_active_ticket(message.from_user.id)
     if active_ticket and active_ticket[2] == 'active':
-        await touch_ticket(active_ticket[0])
+        await touch_ticket(active_ticket[0], actor='user')
         user_mention = get_user_mention(message.from_user)
         text_to_group = f"📩 <b>Сообщение по заявке №{active_ticket[0]} от {user_mention} | ID: <code>{message.from_user.id}</code>:</b>\n\n{html.escape(message.text or message.caption or '')}"
         
@@ -2340,6 +2405,40 @@ async def user_private_message(message: Message, state: FSMContext):
 # ----------------------------------------------------------------------
 # КОМАНДЫ В АДМИН-ЧАТЕ
 # ----------------------------------------------------------------------
+@router.message(Command("note"), F.chat.id == ADMIN_CHAT_ID)
+async def cmd_admin_note(message: Message):
+    """Скрытая заметка модератора к тикету (не пересылается игроку)"""
+    if not await is_support_member(message.from_user.id) and not await is_main_admin(message.from_user.id):
+        return
+
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer("⚠️ Использование: ответьте на тикет командой <code>/note Текст вашей заметки</code>", parse_mode="HTML")
+        return
+
+    if not message.reply_to_message:
+        await message.answer("⚠️ Ответьте этой командой (Reply) на сообщение тикета!", parse_mode="HTML")
+        return
+
+    mapping = await get_user_by_group_msg(message.reply_to_message.message_id)
+    ticket_num = f"№{mapping[1]}" if mapping else ""
+
+    try:
+        await message.react([{"type": "emoji", "emoji": "✍"}])
+    except Exception:
+        pass
+
+    agent_no = await get_or_create_agent_number(message.from_user.id)
+    note_text = (
+        f"📝 <b>Внутренняя заметка {ticket_num}</b>\n"
+        f"👤 От: {message.from_user.mention_html()} (Агент #{agent_no})\n"
+        f"💬 <i>{html.escape(args[1])}</i>\n\n"
+        f"🔒 <i>(Заметка видна только в этом чате и не отправлена игроку)</i>"
+    )
+    sent = await message.answer(note_text, parse_mode="HTML")
+    if mapping:
+        await map_message(sent.message_id, mapping[0], mapping[1])
+
 @router.message(Command("news"), F.chat.id == ADMIN_CHAT_ID)
 async def cmd_news_broadcast(message: Message):
     if not await is_main_admin(message.from_user.id):
@@ -2576,7 +2675,6 @@ async def admin_reply_in_group(message: Message):
             except Exception:
                 pass
             
-            # Обновляем саму карточку заявки
             if card_message_id:
                 base = saved_card_text or ticket_info[3] or f"Заявка <b>№{pending_ticket_id}</b>"
                 new_text = (
@@ -2628,7 +2726,7 @@ async def admin_reply_in_group(message: Message):
                 await message.answer("❌ Этот тикет ведет другой администратор. Вы не можете в него отвечать!")
                 return
 
-            await touch_ticket(ticket_id)
+            await touch_ticket(ticket_id, actor='admin')
             agent_no = await get_or_create_agent_number(message.from_user.id)
             
             client_text = f"👨‍💻 <b>Ответ поддержки (Агент #{agent_no}):</b>\n\n{html.escape(message.text or message.caption or '')}"
@@ -2643,7 +2741,7 @@ async def admin_reply_in_group(message: Message):
                 await message.answer(f"❌ Ошибка отправки: {e}")
 
 # ----------------------------------------------------------------------
-# ФОНОВЫЕ ВОРКЕРЫ: НАПОМИНАНИЯ И ИСТЕЧЕНИЕ СЕКРЕТОК
+# ФОНОВЫЕ ВОРКЕРЫ: НАПОМИНАНИЯ, СЕКРЕТКИ И АВТОЗАКРЫТИЕ (24 ЧАСА)
 # ----------------------------------------------------------------------
 async def secret_timer_worker():
     logging.info("Фоновый воркер секреток запущен.")
@@ -2701,10 +2799,21 @@ async def reminder_worker():
                         """)
                         idle = cur.fetchall()
 
-                        return unassigned, idle
+                        # Автозакрытие: активный тикет, последний ответил админ, простой > 24 часов
+                        cur.execute("""
+                            SELECT ticket_id, user_id, admin_id, card_text
+                            FROM tickets
+                            WHERE status = 'active'
+                              AND last_actor = 'admin'
+                              AND updated_at <= CURRENT_TIMESTAMP - INTERVAL '24 hours'
+                        """)
+                        expired_active = cur.fetchall()
 
-            unassigned_tickets, idle_tickets = await asyncio.to_thread(_check)
+                        return unassigned, idle, expired_active
 
+            unassigned_tickets, idle_tickets, expired_active = await asyncio.to_thread(_check)
+
+            # Напоминание о необработанных заявках
             for t_id, cat, u_id, hrs in unassigned_tickets:
                 hours_str = f"{int(hrs)} ч." if hrs else "2+ ч."
                 alert_text = (
@@ -2724,6 +2833,7 @@ async def reminder_worker():
                 except Exception as e:
                     logging.error(f"Ошибка отправки напоминания о заявке №{t_id}: {e}")
 
+            # Напоминание хелперу о простое
             for t_id, adm_id, u_id, mins, agent_no in idle_tickets:
                 agent_str = f"Агент #{agent_no}" if agent_no else f"ID {adm_id}"
                 admin_mention = agent_str
@@ -2748,6 +2858,26 @@ async def reminder_worker():
                     await asyncio.to_thread(_mark_idle)
                 except Exception as e:
                     logging.error(f"Ошибка отправки напоминания о простое тикета №{t_id}: {e}")
+
+            # Автозакрытие тикетов по истечении 24 часов молчания пользователя
+            for t_id, u_id, adm_id, c_txt in expired_active:
+                try:
+                    await close_ticket_db(t_id, status='closed', admin_id=adm_id)
+                    await bot.send_message(
+                        u_id,
+                        f"{ICON_LOCK} Ваша заявка <b>№{t_id}</b> автоматически закрыта в связи с отсутствием активности в течение 24 часов.\n"
+                        "Если у вас остались вопросы, вы всегда можете открыть новый тикет через меню!",
+                        parse_mode="HTML",
+                        reply_markup=rating_kb(t_id)
+                    )
+                    await bot.send_message(
+                        ADMIN_CHAT_ID,
+                        f"⏱ <b>Тикет №{t_id} автоматически закрыт</b> (пользователь не отвечал более 24 часов).",
+                        parse_mode="HTML"
+                    )
+                    asyncio.create_task(schedule_ticket_cleanup(t_id, None))
+                except Exception as ex:
+                    logging.error(f"Ошибка автозакрытия тикета №{t_id}: {ex}")
 
         except Exception as err:
             logging.error(f"Ошибка в цикле reminder_worker: {err}")
