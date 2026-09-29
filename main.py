@@ -141,7 +141,7 @@ dp.callback_query.middleware(ThrottlingMiddleware(limit=0.8))
 dp.include_router(router)
 
 # ----------------------------------------------------------------------
-# БАЗА ДАННЫХ (Supabase / PostgreSQL)
+# БАЗА ДАННЫХ
 # ----------------------------------------------------------------------
 db_pool = psycopg2.pool.ThreadedConnectionPool(
     minconn=1,
@@ -361,7 +361,6 @@ async def get_or_create_agent_number(admin_id: int) -> int:
     return await asyncio.to_thread(_query)
 
 async def get_user_notes(user_id: int) -> list:
-    """Получает все постоянные заметки по пользователю, упорядоченные по ID"""
     def _query():
         with get_db() as conn:
             with conn.cursor() as cur:
@@ -373,7 +372,6 @@ async def get_user_notes(user_id: int) -> list:
         return []
 
 async def add_user_note(user_id: int, note: str, author_name: str) -> int:
-    """Добавляет новую заметку пользователю и возвращает её ID"""
     def _query():
         with get_db() as conn:
             with conn.cursor() as cur:
@@ -386,7 +384,6 @@ async def add_user_note(user_id: int, note: str, author_name: str) -> int:
     return await asyncio.to_thread(_query)
 
 async def delete_user_note_by_id(note_id: int, user_id: int) -> bool:
-    """Удаляет конкретную заметку по её ID"""
     def _query():
         with get_db() as conn:
             with conn.cursor() as cur:
@@ -892,7 +889,6 @@ async def dispatch_ticket_to_admin(user_id: int, user, category: str, text: str,
     }
     title = cat_titles.get(category, "📩 #Заявка")
     
-    # Подтягиваем список всех постоянных заметок игрока
     notes_list = await get_user_notes(user_id)
     notes_header = ""
     if notes_list:
@@ -1998,8 +1994,8 @@ async def process_c_photo(message: Message, state: FSMContext):
             text = (
                 f"Нарушитель(и): {nicks_formatted}\n"
                 f"Суть нарушения: {html.escape(cur_data.get('c_reason', ''))}\n"
-                f"Где произошло нарушение: {html.escape(cur_data.get('c_place', ''))}\n"
-                f"Время публикации поста: {html.escape(cur_data.get('c_time', ''))}"
+                f"Где произошло нарушение: {html.escape(data.get('c_place', ''))}\n"
+                f"Время публикации поста: {html.escape(data.get('c_time', ''))}"
             )
             ticket_id = await dispatch_ticket_to_admin(message.from_user.id, message.from_user, "complaint", text, photos)
             await state.clear()
@@ -2456,34 +2452,54 @@ async def user_private_message(message: Message, state: FSMContext):
 # ----------------------------------------------------------------------
 @router.message(Command("note"), F.chat.id == ADMIN_CHAT_ID)
 async def cmd_admin_note(message: Message):
-    """Постоянная скрытая заметка к пользователю (отобразится во всех его будущих тикетах)"""
+    """Постоянная заметка по пользователю (работает с карточки тикета)"""
     if not await is_support_member(message.from_user.id) and not await is_main_admin(message.from_user.id):
         return
 
+    if not message.reply_to_message:
+        await message.answer(
+            "⚠️ <b>Как использовать команду:</b>\nОтветьте (Reply) на карточку заявки или сообщение игрока командой:\n<code>/note Текст заметки</code>",
+            parse_mode="HTML"
+        )
+        return
+
     args = message.text.split(maxsplit=1)
-    if len(args) < 2:
-        await message.answer("⚠️ Использование: ответьте на сообщение игрока/тикет командой <code>/note Текст заметки</code>", parse_mode="HTML")
+    if len(args) < 2 or not args[1].strip():
+        await message.answer(
+            "⚠️ <b>Вы не указали текст заметки!</b>\nНапишите текст через пробел после команды, например:\n<code>/note Часто ускоряет таймер</code>",
+            parse_mode="HTML"
+        )
         return
 
     user_id = None
     ticket_id = None
+    replied_msg = message.reply_to_message
 
-    if message.reply_to_message:
-        replied_msg = message.reply_to_message
-        mapping = await get_user_by_group_msg(replied_msg.message_id)
-        if mapping:
-            user_id, ticket_id = mapping[0], mapping[1]
+    # 1. Поиск через базу маппинга
+    mapping = await get_user_by_group_msg(replied_msg.message_id)
+    if mapping:
+        user_id, ticket_id = mapping[0], mapping[1]
 
-        raw_text = replied_msg.text or replied_msg.caption or ""
-        if not user_id and raw_text:
-            match_id = re.search(r"ID:?\s*<[^>]+>?(\d+)<[^>]+>?", raw_text, re.IGNORECASE)
-            if not match_id:
-                match_id = re.search(r"ID:?\s*(\d+)", raw_text, re.IGNORECASE)
-            if match_id:
-                user_id = int(match_id.group(1))
+    # 2. Поиск по тексту карточки
+    raw_text = replied_msg.text or replied_msg.caption or ""
+    if not user_id and raw_text:
+        match_id = re.search(r"ID:?\s*(\d+)", raw_text, re.IGNORECASE)
+        if match_id:
+            user_id = int(match_id.group(1))
+
+    # 3. Поиск по номеру тикета в тексте
+    if not ticket_id and raw_text:
+        match_t = re.search(r"№(\d+)", raw_text)
+        if match_t:
+            t_id = int(match_t.group(1))
+            t_info = await get_ticket_info(t_id)
+            if t_info:
+                ticket_id = t_id
+                if not user_id:
+                    user_id = t_info[0]
 
     if not user_id:
-        await message.answer("❌ Не удалось определить пользователя. Ответьте этой командой (Reply) на сообщение тикета или игрока!", parse_mode="HTML")
+        await message.answer("❌ <b>Не удалось определить игрока!</b> Ответьте на карточку тикета (где есть ID или номер заявки) или на сообщение игрока.", parse_mode="HTML")
         return
 
     agent_no = await get_or_create_agent_number(message.from_user.id)
@@ -2503,7 +2519,7 @@ async def cmd_admin_note(message: Message):
         f"👤 <b>Пользователь:</b> <code>{user_id}</code>\n"
         f"✍️ <b>Автор:</b> {message.from_user.mention_html()} ({author_str})\n"
         f"💬 <b>Заметка:</b> <i>{html.escape(note_content)}</i>\n\n"
-        f"🔒 <i>Заметка закреплена под номером <b>#{note_id}</b> и будет видна во всех будущих заявках этого игрока.</i>"
+        f"🔒 <i>Заметка закреплена и будет выводиться во всех будущих заявках этого игрока.</i>"
     )
     sent = await message.answer(confirm_text, parse_mode="HTML")
     if ticket_id:
@@ -2511,7 +2527,6 @@ async def cmd_admin_note(message: Message):
 
 @router.message(Command("deletenote"), F.chat.id == ADMIN_CHAT_ID)
 async def cmd_delete_note(message: Message):
-    """Удаление конкретной заметки главным администратором"""
     if not await is_main_admin(message.from_user.id):
         await message.answer("❌ Только главные администраторы могут удалять заметки!", parse_mode="HTML")
         return
@@ -2525,9 +2540,7 @@ async def cmd_delete_note(message: Message):
 
         raw_text = replied_msg.text or replied_msg.caption or ""
         if not user_id and raw_text:
-            match_id = re.search(r"ID:?\s*<[^>]+>?(\d+)<[^>]+>?", raw_text, re.IGNORECASE)
-            if not match_id:
-                match_id = re.search(r"ID:?\s*(\d+)", raw_text, re.IGNORECASE)
+            match_id = re.search(r"ID:?\s*(\d+)", raw_text, re.IGNORECASE)
             if match_id:
                 user_id = int(match_id.group(1))
 
@@ -2654,9 +2667,7 @@ async def cmd_ban_reply(message: Message):
         raw_text = replied_msg.text or replied_msg.caption or ""
         
         if not user_id and raw_text:
-            match_id = re.search(r"ID:?\s*<[^>]+>?(\d+)<[^>]+>?", raw_text, re.IGNORECASE)
-            if not match_id:
-                match_id = re.search(r"ID:?\s*(\d+)", raw_text, re.IGNORECASE)
+            match_id = re.search(r"ID:?\s*(\d+)", raw_text, re.IGNORECASE)
             if match_id:
                 user_id = int(match_id.group(1))
 
@@ -2735,9 +2746,7 @@ async def cmd_unban(message: Message):
 
         raw_text = replied_msg.text or replied_msg.caption or ""
         if not user_id and raw_text:
-            match_id = re.search(r"ID:?\s*<[^>]+>?(\d+)<[^>]+>?", raw_text, re.IGNORECASE)
-            if not match_id:
-                match_id = re.search(r"ID:?\s*(\d+)", raw_text, re.IGNORECASE)
+            match_id = re.search(r"ID:?\s*(\d+)", raw_text, re.IGNORECASE)
             if match_id:
                 user_id = int(match_id.group(1))
 
