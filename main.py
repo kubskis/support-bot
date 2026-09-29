@@ -86,7 +86,6 @@ def get_night_notice() -> str:
     return ""
 
 async def check_roblox_username(username: str) -> dict | None:
-    """Проверка существования игрока в Roblox через официальный Users API"""
     url = "https://users.roblox.com/v1/usernames/users"
     payload = {"usernames": [username], "excludeBannedUsers": False}
     try:
@@ -184,7 +183,8 @@ def _init_db_sync():
                     card_text TEXT DEFAULT NULL
                 );
                 CREATE TABLE IF NOT EXISTS user_notes (
-                    user_id BIGINT PRIMARY KEY,
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT,
                     note TEXT,
                     author_name TEXT,
                     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
@@ -360,30 +360,39 @@ async def get_or_create_agent_number(admin_id: int) -> int:
 
     return await asyncio.to_thread(_query)
 
-async def get_user_note(user_id: int) -> tuple | None:
+async def get_user_notes(user_id: int) -> list:
+    """Получает все постоянные заметки по пользователю, упорядоченные по ID"""
     def _query():
         with get_db() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT note, author_name FROM user_notes WHERE user_id = %s", (user_id,))
-                return cur.fetchone()
+                cur.execute("SELECT id, note, author_name FROM user_notes WHERE user_id = %s ORDER BY id ASC", (user_id,))
+                return cur.fetchall()
     try:
         return await asyncio.to_thread(_query)
     except Exception:
-        return None
+        return []
 
-async def set_user_note(user_id: int, note: str, author_name: str):
+async def add_user_note(user_id: int, note: str, author_name: str) -> int:
+    """Добавляет новую заметку пользователю и возвращает её ID"""
     def _query():
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
                     INSERT INTO user_notes (user_id, note, author_name, created_at)
                     VALUES (%s, %s, %s, CURRENT_TIMESTAMP)
-                    ON CONFLICT (user_id) DO UPDATE SET
-                        note = EXCLUDED.note,
-                        author_name = EXCLUDED.author_name,
-                        created_at = CURRENT_TIMESTAMP
+                    RETURNING id
                 """, (user_id, note, author_name))
-    await asyncio.to_thread(_query)
+                return cur.fetchone()[0]
+    return await asyncio.to_thread(_query)
+
+async def delete_user_note_by_id(note_id: int, user_id: int) -> bool:
+    """Удаляет конкретную заметку по её ID"""
+    def _query():
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM user_notes WHERE id = %s AND user_id = %s RETURNING id", (note_id, user_id))
+                return cur.fetchone() is not None
+    return await asyncio.to_thread(_query)
 
 async def get_setting(key: str, default: str = "false") -> str:
     def _query():
@@ -883,15 +892,18 @@ async def dispatch_ticket_to_admin(user_id: int, user, category: str, text: str,
     }
     title = cat_titles.get(category, "📩 #Заявка")
     
-    # Проверяем наличие постоянной заметки по этому игроку
-    user_note_data = await get_user_note(user_id)
-    note_header = ""
-    if user_note_data:
-        note_text, note_author = user_note_data
-        note_header = f"📌 <b>Постоянная заметка:</b> <i>{html.escape(note_text)}</i> (от: {html.escape(note_author)})\n━━━━━━━━━━━━━━━━━━━━\n"
+    # Подтягиваем список всех постоянных заметок игрока
+    notes_list = await get_user_notes(user_id)
+    notes_header = ""
+    if notes_list:
+        lines = []
+        for n_id, n_text, n_author in notes_list:
+            lines.append(f"• <b>[#{n_id}]</b> <i>{html.escape(n_text)}</i> (от: {html.escape(n_author)})")
+        joined = "\n".join(lines)
+        notes_header = f"📌 <b>Постоянные заметки:</b>\n{joined}\n━━━━━━━━━━━━━━━━━━━━\n"
 
     ticket_id = await create_ticket(user_id, category, "")
-    admin_card_text = f"{note_header}{title} | <b>Заявка №{ticket_id}</b>\n👤 От: {user_mention} | ID: <code>{user_id}</code>\n\n{text}"
+    admin_card_text = f"{notes_header}{title} | <b>Заявка №{ticket_id}</b>\n👤 От: {user_mention} | ID: <code>{user_id}</code>\n\n{text}"
 
     def _save_card_txt():
         with get_db() as conn:
@@ -1818,7 +1830,7 @@ async def collect_media_photos(message: Message, state: FSMContext, key: str = "
         await state.update_data({key: photos})
     return photos
 
-# --- 1. ЖАЛОБА (С автопроверкой профиля Roblox) ---
+# --- 1. ЖАЛОБА ---
 @router.message(F.text == BTN_COMPLAINT, F.chat.type == "private")
 async def start_complaint(message: Message, state: FSMContext):
     await register_user(message.from_user.id)
@@ -1987,7 +1999,7 @@ async def process_c_photo(message: Message, state: FSMContext):
                 f"Нарушитель(и): {nicks_formatted}\n"
                 f"Суть нарушения: {html.escape(cur_data.get('c_reason', ''))}\n"
                 f"Где произошло нарушение: {html.escape(cur_data.get('c_place', ''))}\n"
-                f"Время публикации поста: {html.escape(data.get('c_time', ''))}"
+                f"Время публикации поста: {html.escape(cur_data.get('c_time', ''))}"
             )
             ticket_id = await dispatch_ticket_to_admin(message.from_user.id, message.from_user, "complaint", text, photos)
             await state.clear()
@@ -2450,7 +2462,7 @@ async def cmd_admin_note(message: Message):
 
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
-        await message.answer("⚠️ Использование: ответьте на тикет командой <code>/note Текст вашей заметки</code>", parse_mode="HTML")
+        await message.answer("⚠️ Использование: ответьте на сообщение игрока/тикет командой <code>/note Текст заметки</code>", parse_mode="HTML")
         return
 
     user_id = None
@@ -2478,7 +2490,7 @@ async def cmd_admin_note(message: Message):
     author_str = f"Агент #{agent_no}"
     note_content = args[1].strip()
 
-    await set_user_note(user_id, note_content, author_str)
+    note_id = await add_user_note(user_id, note_content, author_str)
 
     try:
         await message.react([{"type": "emoji", "emoji": "✍"}])
@@ -2487,15 +2499,65 @@ async def cmd_admin_note(message: Message):
 
     ticket_str = f" по заявке №{ticket_id}" if ticket_id else ""
     confirm_text = (
-        f"📌 <b>Постоянная заметка сохранена{ticket_str}!</b>\n\n"
+        f"📌 <b>Постоянная заметка [#{note_id}] сохранена{ticket_str}!</b>\n\n"
         f"👤 <b>Пользователь:</b> <code>{user_id}</code>\n"
         f"✍️ <b>Автор:</b> {message.from_user.mention_html()} ({author_str})\n"
         f"💬 <b>Заметка:</b> <i>{html.escape(note_content)}</i>\n\n"
-        f"🔒 <i>Эта заметка теперь будет автоматически отображаться в начале карточки всех новых заявок этого игрока!</i>"
+        f"🔒 <i>Заметка закреплена под номером <b>#{note_id}</b> и будет видна во всех будущих заявках этого игрока.</i>"
     )
     sent = await message.answer(confirm_text, parse_mode="HTML")
     if ticket_id:
         await map_message(sent.message_id, user_id, ticket_id)
+
+@router.message(Command("deletenote"), F.chat.id == ADMIN_CHAT_ID)
+async def cmd_delete_note(message: Message):
+    """Удаление конкретной заметки главным администратором"""
+    if not await is_main_admin(message.from_user.id):
+        await message.answer("❌ Только главные администраторы могут удалять заметки!", parse_mode="HTML")
+        return
+
+    user_id = None
+    if message.reply_to_message:
+        replied_msg = message.reply_to_message
+        mapping = await get_user_by_group_msg(replied_msg.message_id)
+        if mapping:
+            user_id = mapping[0]
+
+        raw_text = replied_msg.text or replied_msg.caption or ""
+        if not user_id and raw_text:
+            match_id = re.search(r"ID:?\s*<[^>]+>?(\d+)<[^>]+>?", raw_text, re.IGNORECASE)
+            if not match_id:
+                match_id = re.search(r"ID:?\s*(\d+)", raw_text, re.IGNORECASE)
+            if match_id:
+                user_id = int(match_id.group(1))
+
+    if not user_id:
+        await message.answer("❌ Не удалось определить пользователя. Ответьте этой командой (Reply) на тикет или сообщение игрока!", parse_mode="HTML")
+        return
+
+    user_notes = await get_user_notes(user_id)
+    if not user_notes:
+        await message.answer(f"📭 У пользователя <code>{user_id}</code> нет постоянных заметок.", parse_mode="HTML")
+        return
+
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2 or not args[1].strip().isdigit():
+        lines = [f"• <b>[#{n_id}]</b> <i>{html.escape(n_txt)}</i>" for n_id, n_txt, _ in user_notes]
+        notes_str = "\n".join(lines)
+        await message.answer(
+            f"ℹ️ <b>Укажите номер заметки для удаления!</b>\n\n"
+            f"Список заметок пользователя <code>{user_id}</code>:\n{notes_str}\n\n"
+            f"Использование: <code>/deletenote [номер]</code> (например: <code>/deletenote {user_notes[0][0]}</code>)",
+            parse_mode="HTML"
+        )
+        return
+
+    target_note_id = int(args[1].strip())
+    success = await delete_user_note_by_id(target_note_id, user_id)
+    if success:
+        await message.answer(f"✅ Заметка <b>[#{target_note_id}]</b> по пользователю <code>{user_id}</code> успешно удалена!", parse_mode="HTML")
+    else:
+        await message.answer(f"❌ Заметка <b>[#{target_note_id}]</b> не найдена у пользователя <code>{user_id}</code>.", parse_mode="HTML")
 
 @router.message(Command("news"), F.chat.id == ADMIN_CHAT_ID)
 async def cmd_news_broadcast(message: Message):
