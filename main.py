@@ -274,10 +274,11 @@ def _init_db_sync():
                     (OWNER_ID,)
                 )
 
-            # Очищаем тестовые оценки от владельца и главных админов из ratings
+            # Очищаем все тестовые оценки от владельца, главных админов и зарегистрированных агентов
             cursor.execute("""
                 DELETE FROM ratings 
-                WHERE user_id IN (SELECT admin_id FROM main_admins) 
+                WHERE user_id IN (SELECT admin_id FROM main_admins)
+                   OR user_id IN (SELECT admin_id FROM admin_agents)
                    OR user_id = %s
             """, (OWNER_ID,))
 
@@ -493,12 +494,13 @@ async def get_tickets_stats():
                 closed = cur.fetchone()[0]
                 cur.execute("SELECT COUNT(*) FROM tickets WHERE status = 'rejected'")
                 rejected = cur.fetchone()[0]
-                # Исключаем оценки от создателя и администраторов
+                # Считаем среднюю оценку только от обычных пользователей
                 cur.execute("""
                     SELECT COALESCE(AVG(score), 0) 
                     FROM ratings 
                     WHERE user_id != %s 
                       AND user_id NOT IN (SELECT admin_id FROM main_admins)
+                      AND user_id NOT IN (SELECT admin_id FROM admin_agents)
                 """, (OWNER_ID,))
                 avg_rating = cur.fetchone()[0]
                 return total, closed, rejected, round(float(avg_rating), 2)
@@ -514,7 +516,9 @@ async def get_admin_list_stats():
                 cur.execute("""
                     SELECT t.admin_id, COUNT(*) as closed_count,
                            COALESCE(AVG(CASE 
-                               WHEN r.user_id != %s AND r.user_id NOT IN (SELECT admin_id FROM main_admins) 
+                               WHEN r.user_id != %s 
+                                AND r.user_id NOT IN (SELECT admin_id FROM main_admins) 
+                                AND r.user_id NOT IN (SELECT admin_id FROM admin_agents)
                                THEN r.score 
                                ELSE NULL 
                            END), 0) as avg_score,
@@ -818,7 +822,7 @@ class SecretAdminStates(StatesGroup):
 # ----------------------------------------------------------------------
 BTN_COMPLAINT = "🚨 Жалоба на игрока"
 BTN_APPEAL = "😡 Обжалование бана"
-BTN_FRIENDS = "👯‍♀️️ Добавление в друзья (VIP)"
+BTN_FRIENDS = "👯‍♀️ Добавление в друзья (VIP)"
 BTN_QUESTION = "❓ Задать вопрос"
 BTN_HELPER_APPLY = "📝 Подать заявку на хелпера"
 BTN_SECRET_APPLY = "🔍 Набор в искатели секреток"
@@ -2491,7 +2495,7 @@ async def take_ticket_handler(call: CallbackQuery):
         try:
             await bot.send_message(
                 ticket_info[0],
-                f"👨‍💻 <b>Агент #{agent_number}</b> взял вашу заявку <b>№{ticket_id}</b> в работу!\nТеперь вы можете писать сюда сообщения.",
+                f"👨‍‍💻 <b>Агент #{agent_number}</b> взял вашу заявку <b>№{ticket_id}</b> в работу!\nТеперь вы можете писать сюда сообщения.",
                 parse_mode="HTML"
             )
         except Exception:
@@ -2597,7 +2601,7 @@ async def user_cancel_ticket(call: CallbackQuery):
         await call.answer("❌ Заявка уже взята в работу или закрыта, отмена недоступна.", show_alert=True)
 
 # ----------------------------------------------------------------------
-# СИСТЕМА ОЦЕНОК (С ЗАЩИТОЙ ОТ САМООЦЕНКИ И ОЦЕНОК ОТ АДМИНОВ)
+# СИСТЕМА ОЦЕНОК (СТРОГИЙ ЗАПРЕТ ОЦЕНОК ОТ СТАФФА)
 # ----------------------------------------------------------------------
 @router.callback_query(F.data.startswith("rate_"))
 async def process_rating(call: CallbackQuery):
@@ -2610,13 +2614,11 @@ async def process_rating(call: CallbackQuery):
     ticket_info = await get_ticket_info(ticket_id)
     admin_id = ticket_info[1] if ticket_info else 0
 
-    # Проверяем, является ли голосующий админом/хелпером/создателем
     user_is_staff = await is_support_member(user_id) or await is_main_admin(user_id)
 
     if user_is_staff:
-        # Для тестов пишем в базу, но в статистику хелперов и общую статистику она не попадает
-        await save_rating_db(ticket_id, user_id, admin_id, score)
-        await call.message.edit_text(f"{ICON_STAR} [СТАФФ] Оценка {score}/5 сохранена, но в статистику хелперов не учитывается.", parse_mode="HTML")
+        # Полностью блокируем запись в базу, чтобы рейтинг никогда не портился!
+        await call.message.edit_text(f"{ICON_STAR} [СТАФФ] Вы являетесь администратором/хелпером. Оценка не учитывается в статистике.", parse_mode="HTML")
     else:
         await save_rating_db(ticket_id, user_id, admin_id, score)
         await call.message.edit_text(f"{ICON_STAR} Спасибо за оценку ({score}/5)! Ваше мнение учтено.", parse_mode="HTML")
@@ -2710,13 +2712,14 @@ async def cmd_my_stats(message: Message):
                 cur.execute("SELECT COUNT(*) FROM tickets WHERE admin_id = %s AND status = 'closed'", (admin_id,))
                 closed_count = cur.fetchone()[0]
 
-                # Считаем среднюю оценку только от реальных пользователей
+                # Считаем среднюю оценку только от реальных пользователей (исключаем стафф)
                 cur.execute("""
                     SELECT COALESCE(AVG(score), 0) 
                     FROM ratings 
                     WHERE admin_id = %s 
                       AND user_id != %s 
                       AND user_id NOT IN (SELECT admin_id FROM main_admins)
+                      AND user_id NOT IN (SELECT admin_id FROM admin_agents)
                 """, (admin_id, OWNER_ID))
                 avg_score = cur.fetchone()[0]
 
@@ -2940,7 +2943,7 @@ async def cmd_news_broadcast(message: Message):
         f"{ICON_CHECK} <b>Рассылка завершена!</b>\n\n"
         f"✅ Успешно доставлено: <code>{success}</code>\n"
         f"🚫 Заблокировали бота: <code>{blocked}</code>\n"
-        f"⚠️ Ошибок отправки: <code>{errors}</code>\n"
+        f"⚠️️ Ошибок отправки: <code>{errors}</code>\n"
         f"👥 Всего в базе: <code>{len(users)}</code>",
         parse_mode="HTML"
     )
