@@ -127,7 +127,7 @@ class ThrottlingMiddleware(BaseMiddleware):
             if current_time - last_time < self.limit:
                 if isinstance(event, CallbackQuery):
                     try:
-                        await event.answer("⚠️️ Не спамьте кнопками! Подождите секунду.", show_alert=False)
+                        await event.answer("⚠️ Не спамьте кнопками! Подождите секунду.", show_alert=False)
                     except Exception:
                         pass
                 return
@@ -187,6 +187,7 @@ def _init_db_sync():
                     last_actor TEXT DEFAULT 'user',
                     reminded_unassigned BOOLEAN DEFAULT FALSE,
                     reminded_idle BOOLEAN DEFAULT FALSE,
+                    last_unassigned_remind TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                     card_text TEXT DEFAULT NULL
                 );
                 CREATE TABLE IF NOT EXISTS message_map (
@@ -233,6 +234,9 @@ def _init_db_sync():
                     name TEXT PRIMARY KEY,
                     declined TEXT
                 );
+                CREATE TABLE IF NOT EXISTS special_secret_types (
+                    name TEXT PRIMARY KEY
+                );
                 CREATE TABLE IF NOT EXISTS secret_posts (
                     id SERIAL PRIMARY KEY,
                     user_id BIGINT,
@@ -252,6 +256,7 @@ def _init_db_sync():
                 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS last_actor TEXT DEFAULT 'user';
                 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS reminded_unassigned BOOLEAN DEFAULT FALSE;
                 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS reminded_idle BOOLEAN DEFAULT FALSE;
+                ALTER TABLE tickets ADD COLUMN IF NOT EXISTS last_unassigned_remind TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP;
                 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS card_text TEXT DEFAULT NULL;
                 ALTER TABLE pending_rejections ADD COLUMN IF NOT EXISTS card_message_id BIGINT;
                 ALTER TABLE pending_rejections ADD COLUMN IF NOT EXISTS card_text TEXT DEFAULT NULL;
@@ -279,6 +284,9 @@ def _init_db_sync():
                     INSERT INTO secret_types (name, declined) VALUES (%s, %s)
                     ON CONFLICT (name) DO UPDATE SET declined = EXCLUDED.declined
                 """, (s_name, s_dec))
+
+            # По умолчанию особый тип секретки - "Фарм"
+            cursor.execute("INSERT INTO special_secret_types (name) VALUES ('Фарм') ON CONFLICT (name) DO NOTHING")
 
             cursor.execute("INSERT INTO settings (key, value) VALUES ('timer_seconds', '510') ON CONFLICT (key) DO NOTHING")
 
@@ -508,8 +516,8 @@ async def create_ticket(user_id: int, category: str = 'general', card_text: str 
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO tickets (user_id, status, category, card_text, last_actor, created_at, updated_at) "
-                    "VALUES (%s, 'pending', %s, %s, 'user', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) RETURNING ticket_id",
+                    "INSERT INTO tickets (user_id, status, category, card_text, last_actor, created_at, updated_at, last_unassigned_remind) "
+                    "VALUES (%s, 'pending', %s, %s, 'user', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) RETURNING ticket_id",
                     (user_id, category, card_text)
                 )
                 return cur.fetchone()[0]
@@ -676,6 +684,14 @@ async def get_secret_types_dict() -> dict:
                 return {row[0]: row[1] for row in cur.fetchall()}
     return await asyncio.to_thread(_query)
 
+async def get_special_secret_types() -> list:
+    def _query():
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT name FROM special_secret_types ORDER BY name ASC")
+                return [row[0] for row in cur.fetchall()]
+    return await asyncio.to_thread(_query)
+
 async def check_channel_rights(bot: Bot, user_id: int) -> str | None:
     def _query():
         with get_db() as conn:
@@ -762,6 +778,7 @@ class SecretAdminStates(StatesGroup):
     del_publisher_id = State()
     add_type_name = State()
     add_type_declined = State()
+    add_special_type_name = State()
     set_timer = State()
     template_active = State()
     template_farm = State()
@@ -813,7 +830,7 @@ async def admin_panel_kb():
         [InlineKeyboardButton(text=f"📝 Набор в хелперы: {helper_status}", callback_data="toggle_helper")],
         [InlineKeyboardButton(text=f"🔍 Искатели секреток: {secret_status}", callback_data="toggle_secret")],
         [InlineKeyboardButton(text="👑 Главные админы поддержки", callback_data="manage_main_admins")],
-        [InlineKeyboardButton(text="✏️️ Ник для друзей", callback_data="change_friend_nick")],
+        [InlineKeyboardButton(text="✏ Ник для друзей", callback_data="change_friend_nick")],
         [InlineKeyboardButton(text="🔮 Управление Секретками (Панель)", callback_data="adm_secret_panel")]
     ])
 
@@ -822,8 +839,10 @@ def secret_admin_kb():
         [InlineKeyboardButton(text="👥 Управление публикаторами", callback_data="sec_manage_pubs")],
         [InlineKeyboardButton(text="📊 Статистика постов (24ч)", callback_data="sec_stats")],
         [InlineKeyboardButton(text="📝 Редактировать шаблоны", callback_data="sec_templates")],
-        [InlineKeyboardButton(text="➕ Добавить тип", callback_data="sec_add_type"),
-         InlineKeyboardButton(text="🗑 Удалить тип", callback_data="sec_del_type")],
+        [InlineKeyboardButton(text="➕ Добавить обычный тип", callback_data="sec_add_type"),
+         InlineKeyboardButton(text="🗑 Удалить обычный тип", callback_data="sec_del_type")],
+        [InlineKeyboardButton(text="➕ Добавить особый тип", callback_data="sec_add_spec_type"),
+         InlineKeyboardButton(text="🗑 Удалить особый тип", callback_data="sec_del_spec_type")],
         [InlineKeyboardButton(text="⏱ Настроить таймер", callback_data="sec_set_timer")],
         [InlineKeyboardButton(text="🔙 Назад в админку", callback_data="back_to_adm")]
     ])
@@ -880,7 +899,7 @@ def skip_photo_kb(target: str):
 def complaint_servers_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🌐 Сервер с секреткой", callback_data="cmp_srv_secret")],
-        [InlineKeyboardButton(text="🕵️ Поиск саботера", callback_data="cmp_srv_saboteur")],
+        [InlineKeyboardButton(text="🕵 Поиск саботера", callback_data="cmp_srv_saboteur")],
         [InlineKeyboardButton(text="🌾 Фарм сервер", callback_data="cmp_srv_farm")]
     ])
 
@@ -1470,7 +1489,7 @@ async def sec_del_type(call: CallbackQuery):
     for k in types_d.keys():
         buttons.append([InlineKeyboardButton(text=f"🗑 {k}", callback_data=f"sec_rmtype_{k}")])
     buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="adm_secret_panel")])
-    await call.message.edit_text("🗑 Выберите тип секретки для удаления:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await call.message.edit_text("🗑 Выберите обычный тип секретки для удаления:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
     await call.answer()
 
 @router.callback_query(F.data.startswith("sec_rmtype_"))
@@ -1483,6 +1502,52 @@ async def sec_rmtype_proc(call: CallbackQuery):
                 cur.execute("DELETE FROM secret_types WHERE name = %s", (t_name,))
     await asyncio.to_thread(_q)
     await call.message.edit_text(f"{ICON_CHECK} Тип секретки <b>{t_name}</b> удален.", parse_mode="HTML")
+    await call.answer()
+
+@router.callback_query(F.data == "sec_add_spec_type")
+async def sec_add_spec_type_prompt(call: CallbackQuery, state: FSMContext):
+    if not await is_main_admin(call.from_user.id): return
+    await state.set_state(SecretAdminStates.add_special_type_name)
+    await call.message.answer(f"{ICON_BALL} Введите название нового <b>особого типа</b> (например, <code>Фарм монет</code>):", parse_mode="HTML")
+    await call.answer()
+
+@router.message(SecretAdminStates.add_special_type_name)
+async def sec_add_spec_type_proc(message: Message, state: FSMContext):
+    if not await is_main_admin(message.from_user.id): return
+    t_name = message.text.strip()
+    def _q():
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO special_secret_types (name) VALUES (%s) ON CONFLICT (name) DO NOTHING", (t_name,))
+    await asyncio.to_thread(_q)
+    await state.clear()
+    kb = await main_keyboard(message.from_user.id)
+    await message.answer(f"{ICON_CHECK} Особый тип <b>{t_name}</b> успешно добавлен!", reply_markup=kb, parse_mode="HTML")
+
+@router.callback_query(F.data == "sec_del_spec_type")
+async def sec_del_spec_type(call: CallbackQuery):
+    if not await is_main_admin(call.from_user.id): return
+    spec_list = await get_special_secret_types()
+    if not spec_list:
+        await call.answer("Особых типов пока нет!", show_alert=True)
+        return
+    buttons = []
+    for k in spec_list:
+        buttons.append([InlineKeyboardButton(text=f"🗑 {k}", callback_data=f"sec_rmspec_{k}")])
+    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="adm_secret_panel")])
+    await call.message.edit_text("🗑 Выберите особый тип секретки для удаления:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await call.answer()
+
+@router.callback_query(F.data.startswith("sec_rmspec_"))
+async def sec_rmspec_proc(call: CallbackQuery):
+    if not await is_main_admin(call.from_user.id): return
+    t_name = call.data.split("_", 2)[2]
+    def _q():
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM special_secret_types WHERE name = %s", (t_name,))
+    await asyncio.to_thread(_q)
+    await call.message.edit_text(f"{ICON_CHECK} Особый тип <b>{t_name}</b> удален.", parse_mode="HTML")
     await call.answer()
 
 # ----------------------------------------------------------------------
@@ -1614,18 +1679,21 @@ async def pub_mode_normal(call: CallbackQuery, state: FSMContext):
 @router.callback_query(SecretPublisherStates.waiting_for_mode, F.data == "pub_mode_farm")
 async def pub_mode_farm(call: CallbackQuery, state: FSMContext):
     await state.update_data(is_farm=True)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🌾 Фарм", callback_data="pub_farm_opt_farm")],
-        [InlineKeyboardButton(text="🌀 Фарм пружинкой", callback_data="pub_farm_opt_spring")]
-    ])
-    await call.message.edit_text("🌾 <b>Выбран режим: Фарм секретка</b>\n\nВыберите тип фарма кнопкой ниже:", reply_markup=kb, parse_mode="HTML")
+    spec_list = await get_special_secret_types()
+    if not spec_list:
+        await call.message.answer(f"{ICON_CROSS} В базе нет особых типов секреток. Добавьте их в админ-панели!", parse_mode="HTML")
+        await call.answer()
+        return
+    buttons = []
+    for k in spec_list:
+        buttons.append([InlineKeyboardButton(text=f"🌾 {k}", callback_data=f"pub_farm_sel_{k}")])
+    await call.message.edit_text("🌾 <b>Выбран режим: Фарм секретка</b>\n\nВыберите тип фарма кнопкой ниже:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
     await state.set_state(SecretPublisherStates.waiting_for_farm_choice)
     await call.answer()
 
-@router.callback_query(SecretPublisherStates.waiting_for_farm_choice, F.data.startswith("pub_farm_opt_"))
+@router.callback_query(SecretPublisherStates.waiting_for_farm_choice, F.data.startswith("pub_farm_sel_"))
 async def pub_farm_choice_selected(call: CallbackQuery, state: FSMContext):
-    opt = call.data.split("_")[3]
-    f_type = "Фарм" if opt == "farm" else "Фарм пружинкой"
+    f_type = call.data.split("_", 3)[3]
     await state.update_data(secret_type=f_type)
     await call.message.edit_text(f"Выбран тип: <b>{html.escape(f_type)}</b>\n\nТеперь отправьте <b>фотографию</b> секретки:", parse_mode="HTML")
     await state.set_state(SecretPublisherStates.waiting_for_photo)
@@ -2135,7 +2203,7 @@ async def process_a_nickname(message: Message, state: FSMContext):
         confirm_text = f"Профиль найден: <a href='https://www.roblox.com/users/{rbx_id}/profile'><b>{official_name}</b></a> (ID: <code>{rbx_id}</code>)"
     else:
         official_name = nick_input
-        formatted_profile = f"<code>{html.escape(nick_input)}</code> (⚠️️ <i>профиль не найден в Roblox</i>)"
+        formatted_profile = f"<code>{html.escape(nick_input)}</code> (⚠️ <i>профиль не найден в Roblox</i>)"
         confirm_text = f"<code>{html.escape(nick_input)}</code> (⚠️ <i>профиль не найден в Roblox</i>)"
 
     await state.update_data(a_nickname=official_name, a_profile=formatted_profile)
@@ -2549,8 +2617,52 @@ async def user_private_message(message: Message, state: FSMContext):
     await message.answer(f"{ICON_WARN} Пожалуйста, выберите нужный пункт меню для обращения.", reply_markup=kb, parse_mode="HTML")
 
 # ----------------------------------------------------------------------
-# КОМАНДЫ В АДМИН-ЧАТЕ (/note, /deletenote, /mystats, /news, /ban, /unban)
+# КОМАНДЫ В АДМИН-ЧАТЕ (/note, /deletenote, /mystats, /news, /ban, /unban, /opentickets)
 # ----------------------------------------------------------------------
+@router.message(Command("opentickets"), F.chat.id == ADMIN_CHAT_ID)
+async def cmd_open_tickets(message: Message):
+    if not await is_main_admin(message.from_user.id):
+        await message.answer("❌ Только главные администраторы могут просматривать список открытых заявок!", parse_mode="HTML")
+        return
+
+    def _query():
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT ticket_id, category, user_id,
+                           EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - created_at))/60 as mins_passed
+                    FROM tickets
+                    WHERE status = 'pending'
+                    ORDER BY ticket_id ASC
+                """)
+                return cur.fetchall()
+
+    try:
+        pending_list = await asyncio.to_thread(_query)
+    except Exception as e:
+        await message.answer(f"❌ Ошибка получения тикетов из БД: {e}")
+        return
+
+    if not pending_list:
+        await message.answer("🟢 <b>Все заявки обработаны!</b> В данный момент нет открытых тикетов, ожидающих взятия.", parse_mode="HTML")
+        return
+
+    cat_names = {
+        "complaint": "Жалоба",
+        "appeal": "Обжалование",
+        "question": "Вопрос",
+        "friends": "Друзья"
+    }
+
+    text = f"📋 <b>Список неразобранных заявок (ожидают хелперов): {len(pending_list)}</b>\n\n"
+    for t_id, cat, u_id, mins in pending_list:
+        m = int(mins)
+        time_str = f"{m // 60} ч. {m % 60} мин." if m >= 60 else f"{m} мин."
+        cat_str = cat_names.get(cat, cat)
+        text += f"• <b>Заявка №{t_id}</b> ({cat_str}) — ждет <code>{time_str}</code> | Игрок: <code>{u_id}</code>\n"
+
+    await message.answer(text, parse_mode="HTML")
+
 @router.message(Command("mystats"), F.chat.id == ADMIN_CHAT_ID)
 async def cmd_my_stats(message: Message):
     if not await is_support_member(message.from_user.id) and not await is_main_admin(message.from_user.id):
@@ -2788,7 +2900,7 @@ async def cmd_news_broadcast(message: Message):
         f"{ICON_CHECK} <b>Рассылка завершена!</b>\n\n"
         f"✅ Успешно доставлено: <code>{success}</code>\n"
         f"🚫 Заблокировали бота: <code>{blocked}</code>\n"
-        f"⚠️️ Ошибок отправки: <code>{errors}</code>\n"
+        f"⚠️ Ошибок отправки: <code>{errors}</code>\n"
         f"👥 Всего в базе: <code>{len(users)}</code>",
         parse_mode="HTML"
     )
@@ -3047,20 +3159,21 @@ async def reminder_worker():
             def _check():
                 with get_db() as conn:
                     with conn.cursor() as cur:
+                        # Тикеты, которые ждут взятия более 2 часов с момента создания ИЛИ предыдущего напоминания
                         cur.execute("""
                             SELECT ticket_id, category, user_id, 
-                                   EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - created_at))/3600 as hours_passed
+                                   EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - created_at))/3600 as hours_total
                             FROM tickets
                             WHERE status = 'pending' 
-                              AND reminded_unassigned = FALSE
-                              AND created_at <= CURRENT_TIMESTAMP - INTERVAL '2 hours'
+                              AND COALESCE(last_unassigned_remind, created_at) <= CURRENT_TIMESTAMP - INTERVAL '2 hours'
                         """)
                         unassigned = cur.fetchall()
 
+                        # Тикеты в работе, простаивающие 20+ минут
                         cur.execute("""
                             SELECT t.ticket_id, t.admin_id, t.user_id,
                                    EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - t.updated_at))/60 as mins_passed,
-                                   a.agent_number
+                                   a.agent_number, t.last_actor
                             FROM tickets t
                             LEFT JOIN admin_agents a ON t.admin_id = a.admin_id
                             WHERE t.status = 'active' 
@@ -3069,6 +3182,7 @@ async def reminder_worker():
                         """)
                         idle = cur.fetchall()
 
+                        # Автозакрытие: активный тикет без ответа пользователя 24 часа после сообщения админа
                         cur.execute("""
                             SELECT ticket_id, user_id, admin_id, card_text
                             FROM tickets
@@ -3082,6 +3196,7 @@ async def reminder_worker():
 
             unassigned_tickets, idle_tickets, expired_active = await asyncio.to_thread(_check)
 
+            # Напоминание по неразобранным тикетам каждые 2 часа
             for t_id, cat, u_id, hrs in unassigned_tickets:
                 hours_str = f"{int(hrs)} ч." if hrs else "2+ ч."
                 alert_text = (
@@ -3093,39 +3208,60 @@ async def reminder_worker():
                 try:
                     sent = await bot.send_message(ADMIN_CHAT_ID, alert_text, parse_mode="HTML")
                     await map_message(sent.message_id, u_id, t_id)
-                    def _mark():
+                    def _update_last_remind():
                         with get_db() as conn:
                             with conn.cursor() as cur:
-                                cur.execute("UPDATE tickets SET reminded_unassigned = TRUE WHERE ticket_id = %s", (t_id,))
-                    await asyncio.to_thread(_mark)
+                                cur.execute("UPDATE tickets SET last_unassigned_remind = CURRENT_TIMESTAMP WHERE ticket_id = %s", (t_id,))
+                    await asyncio.to_thread(_update_last_remind)
                 except Exception as e:
                     logging.error(f"Ошибка отправки напоминания о заявке №{t_id}: {e}")
 
-            for t_id, adm_id, u_id, mins, agent_no in idle_tickets:
-                agent_str = f"Агент #{agent_no}" if agent_no else f"ID {adm_id}"
-                admin_mention = agent_str
-                try:
-                    chat_member = await bot.get_chat(adm_id)
-                    admin_mention = f'<a href="tg://user?id={adm_id}">{html.escape(chat_member.full_name)}</a> ({agent_str})'
-                except Exception:
-                    pass
+            # Напоминание о простое тикета (20 минут)
+            for t_id, adm_id, u_id, mins, agent_no, last_act in idle_tickets:
+                if last_act == 'admin':
+                    # Админ ждёт ответа игрока -> пишем игроку в ЛС
+                    client_alert = (
+                        f"⏳ <b>Напоминание по заявке №{t_id}</b>\n\n"
+                        "Поддержка ожидает вашего ответа. Если вопрос ещё актуален, пожалуйста, напишите сообщение в ответ.\n"
+                        "<i>Обратите внимание: при отсутствии активности заявка может быть автоматически закрыта!</i>"
+                    )
+                    try:
+                        await bot.send_message(u_id, client_alert, parse_mode="HTML")
+                        def _mark_user_reminded():
+                            with get_db() as conn:
+                                with conn.cursor() as cur:
+                                    cur.execute("UPDATE tickets SET reminded_idle = TRUE WHERE ticket_id = %s", (t_id,))
+                        await asyncio.to_thread(_mark_user_reminded)
+                    except Exception as e:
+                        logging.error(f"Ошибка отправки напоминания пользователю по тикету №{t_id}: {e}")
+                else:
+                    # Игрок ждёт ответа админа -> пишем в чат поддержки с тегом хелпера
+                    agent_str = f"Агент #{agent_no}" if agent_no else f"ID {adm_id}"
+                    admin_mention = agent_str
+                    try:
+                        chat_member = await bot.get_chat(adm_id)
+                        admin_mention = f'<a href="tg://user?id={adm_id}">{html.escape(chat_member.full_name)}</a> ({agent_str})'
+                    except Exception:
+                        pass
 
-                alert_text = (
-                    f"⏳ <b>Напоминание по активному тикету!</b>\n\n"
-                    f"Тикет <b>№{t_id}</b> находится в работе у {admin_mention}, но диалог простаивает уже более <b>{int(mins)} минут</b>.\n"
-                    f"Не забудьте ответить пользователю или закрыть заявку!"
-                )
-                try:
-                    sent = await bot.send_message(ADMIN_CHAT_ID, alert_text, parse_mode="HTML")
-                    await map_message(sent.message_id, u_id, t_id)
-                    def _mark_idle():
-                        with get_db() as conn:
-                            with conn.cursor() as cur:
-                                cur.execute("UPDATE tickets SET reminded_idle = TRUE WHERE ticket_id = %s", (t_id,))
-                    await asyncio.to_thread(_mark_idle)
-                except Exception as e:
-                    logging.error(f"Ошибка отправки напоминания о простое тикета №{t_id}: {e}")
+                    admin_alert = (
+                        f"⏳ <b>Напоминание по активному тикету!</b>\n\n"
+                        f"Тикет <b>№{t_id}</b> находится в работе у {admin_mention}.\n"
+                        f"Пользователь оставил сообщение, но диалог простаивает уже более <b>{int(mins)} минут</b>.\n"
+                        f"Не забудьте ответить игроку или закрыть заявку!"
+                    )
+                    try:
+                        sent = await bot.send_message(ADMIN_CHAT_ID, admin_alert, parse_mode="HTML")
+                        await map_message(sent.message_id, u_id, t_id)
+                        def _mark_admin_reminded():
+                            with get_db() as conn:
+                                with conn.cursor() as cur:
+                                    cur.execute("UPDATE tickets SET reminded_idle = TRUE WHERE ticket_id = %s", (t_id,))
+                        await asyncio.to_thread(_mark_admin_reminded)
+                    except Exception as e:
+                        logging.error(f"Ошибка отправки напоминания хелперу по тикету №{t_id}: {e}")
 
+            # Автозакрытие через 24 часа
             for t_id, u_id, adm_id, c_txt in expired_active:
                 try:
                     await close_ticket_db(t_id, status='closed', admin_id=adm_id)
