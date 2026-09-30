@@ -187,6 +187,7 @@ def _init_db_sync():
                     last_actor TEXT DEFAULT 'user',
                     reminded_unassigned BOOLEAN DEFAULT FALSE,
                     reminded_idle BOOLEAN DEFAULT FALSE,
+                    last_idle_remind TIMESTAMP WITH TIME ZONE DEFAULT NULL,
                     last_unassigned_remind TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                     card_text TEXT DEFAULT NULL
                 );
@@ -256,6 +257,7 @@ def _init_db_sync():
                 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS last_actor TEXT DEFAULT 'user';
                 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS reminded_unassigned BOOLEAN DEFAULT FALSE;
                 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS reminded_idle BOOLEAN DEFAULT FALSE;
+                ALTER TABLE tickets ADD COLUMN IF NOT EXISTS last_idle_remind TIMESTAMP WITH TIME ZONE DEFAULT NULL;
                 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS last_unassigned_remind TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP;
                 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS card_text TEXT DEFAULT NULL;
                 ALTER TABLE pending_rejections ADD COLUMN IF NOT EXISTS card_message_id BIGINT;
@@ -272,7 +274,8 @@ def _init_db_sync():
                     (OWNER_ID,)
                 )
 
-            # 4 базовых типа секреток
+            cursor.execute("DELETE FROM secret_types WHERE name = 'Тропы'")
+
             default_types = [
                 ("Лапка", "лапки"),
                 ("Сердечко", "сердечка"),
@@ -285,7 +288,6 @@ def _init_db_sync():
                     ON CONFLICT (name) DO UPDATE SET declined = EXCLUDED.declined
                 """, (s_name, s_dec))
 
-            # По умолчанию особый тип секретки - "Фарм"
             cursor.execute("INSERT INTO special_secret_types (name) VALUES ('Фарм') ON CONFLICT (name) DO NOTHING")
 
             cursor.execute("INSERT INTO settings (key, value) VALUES ('timer_seconds', '510') ON CONFLICT (key) DO NOTHING")
@@ -516,8 +518,8 @@ async def create_ticket(user_id: int, category: str = 'general', card_text: str 
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO tickets (user_id, status, category, card_text, last_actor, created_at, updated_at, last_unassigned_remind) "
-                    "VALUES (%s, 'pending', %s, %s, 'user', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) RETURNING ticket_id",
+                    "INSERT INTO tickets (user_id, status, category, card_text, last_actor, created_at, updated_at, last_unassigned_remind, last_idle_remind) "
+                    "VALUES (%s, 'pending', %s, %s, 'user', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, NULL) RETURNING ticket_id",
                     (user_id, category, card_text)
                 )
                 return cur.fetchone()[0]
@@ -528,7 +530,7 @@ async def touch_ticket(ticket_id: int, actor: str = 'user'):
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "UPDATE tickets SET updated_at = CURRENT_TIMESTAMP, last_actor = %s, reminded_idle = FALSE WHERE ticket_id = %s",
+                    "UPDATE tickets SET updated_at = CURRENT_TIMESTAMP, last_actor = %s, reminded_idle = FALSE, last_idle_remind = NULL WHERE ticket_id = %s",
                     (actor, ticket_id)
                 )
     await asyncio.to_thread(_query)
@@ -586,7 +588,7 @@ async def activate_ticket(ticket_id: int, admin_id: int):
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "UPDATE tickets SET status = 'active', admin_id = %s, last_actor = 'admin', updated_at = CURRENT_TIMESTAMP, reminded_idle = FALSE WHERE ticket_id = %s",
+                    "UPDATE tickets SET status = 'active', admin_id = %s, last_actor = 'admin', updated_at = CURRENT_TIMESTAMP, reminded_idle = FALSE, last_idle_remind = NULL WHERE ticket_id = %s",
                     (admin_id, ticket_id)
                 )
     await asyncio.to_thread(_query)
@@ -2462,7 +2464,7 @@ async def take_ticket_handler(call: CallbackQuery):
         try:
             await bot.send_message(
                 ticket_info[0],
-                f"👨‍💻 <b>Агент #{agent_number}</b> взял вашу заявку <b>№{ticket_id}</b> в работу!\nТеперь вы можете писать сюда сообщения.",
+                f"👨‍‍💻 <b>Агент #{agent_number}</b> взял вашу заявку <b>№{ticket_id}</b> в работу!\nТеперь вы можете писать сюда сообщения.",
                 parse_mode="HTML"
             )
         except Exception:
@@ -2900,7 +2902,7 @@ async def cmd_news_broadcast(message: Message):
         f"{ICON_CHECK} <b>Рассылка завершена!</b>\n\n"
         f"✅ Успешно доставлено: <code>{success}</code>\n"
         f"🚫 Заблокировали бота: <code>{blocked}</code>\n"
-        f"⚠️ Ошибок отправки: <code>{errors}</code>\n"
+        f"⚠️️ Ошибок отправки: <code>{errors}</code>\n"
         f"👥 Всего в базе: <code>{len(users)}</code>",
         parse_mode="HTML"
     )
@@ -3169,16 +3171,21 @@ async def reminder_worker():
                         """)
                         unassigned = cur.fetchall()
 
-                        # Тикеты в работе, простаивающие 20+ минут
+                        # Тикеты в работе:
+                        # 1. Первое напоминание через 20 минут тишины (reminded_idle = FALSE)
+                        # 2. Последующие напоминания каждый 1 час после предыдущего напоминания (reminded_idle = TRUE)
                         cur.execute("""
                             SELECT t.ticket_id, t.admin_id, t.user_id,
                                    EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - t.updated_at))/60 as mins_passed,
-                                   a.agent_number, t.last_actor
+                                   a.agent_number, t.last_actor, t.reminded_idle
                             FROM tickets t
                             LEFT JOIN admin_agents a ON t.admin_id = a.admin_id
                             WHERE t.status = 'active' 
-                              AND t.reminded_idle = FALSE
-                              AND t.updated_at <= CURRENT_TIMESTAMP - INTERVAL '20 minutes'
+                              AND (
+                                  (t.reminded_idle = FALSE AND t.updated_at <= CURRENT_TIMESTAMP - INTERVAL '20 minutes')
+                                  OR
+                                  (t.reminded_idle = TRUE AND t.last_idle_remind IS NOT NULL AND t.last_idle_remind <= CURRENT_TIMESTAMP - INTERVAL '1 hour')
+                              )
                         """)
                         idle = cur.fetchall()
 
@@ -3216,13 +3223,13 @@ async def reminder_worker():
                 except Exception as e:
                     logging.error(f"Ошибка отправки напоминания о заявке №{t_id}: {e}")
 
-            # Напоминание о простое тикета (20 минут)
-            for t_id, adm_id, u_id, mins, agent_no, last_act in idle_tickets:
+            # Напоминание о простое тикета: через 20 минут, затем каждый 1 час
+            for t_id, adm_id, u_id, mins, agent_no, last_act, was_reminded in idle_tickets:
                 if last_act == 'admin':
                     # Админ ждёт ответа игрока -> пишем игроку в ЛС
                     client_alert = (
                         f"⏳ <b>Напоминание по заявке №{t_id}</b>\n\n"
-                        "Поддержка ожидает вашего ответа. Если вопрос ещё актуален, пожалуйста, напишите сообщение в ответ.\n"
+                        "Поддержка ожидает вашего ответа. Если вопрос ещё актуален, пожалуйста, отправьте сообщение в этот чат.\n"
                         "<i>Обратите внимание: при отсутствии активности заявка может быть автоматически закрыта!</i>"
                     )
                     try:
@@ -3230,7 +3237,11 @@ async def reminder_worker():
                         def _mark_user_reminded():
                             with get_db() as conn:
                                 with conn.cursor() as cur:
-                                    cur.execute("UPDATE tickets SET reminded_idle = TRUE WHERE ticket_id = %s", (t_id,))
+                                    cur.execute("""
+                                        UPDATE tickets 
+                                        SET reminded_idle = TRUE, last_idle_remind = CURRENT_TIMESTAMP 
+                                        WHERE ticket_id = %s
+                                    """, (t_id,))
                         await asyncio.to_thread(_mark_user_reminded)
                     except Exception as e:
                         logging.error(f"Ошибка отправки напоминания пользователю по тикету №{t_id}: {e}")
@@ -3244,11 +3255,12 @@ async def reminder_worker():
                     except Exception:
                         pass
 
+                    repeat_prefix = "Повторное напоминание" if was_reminded else "Напоминание"
                     admin_alert = (
-                        f"⏳ <b>Напоминание по активному тикету!</b>\n\n"
+                        f"⏳ <b>{repeat_prefix} по активному тикету!</b>\n\n"
                         f"Тикет <b>№{t_id}</b> находится в работе у {admin_mention}.\n"
-                        f"Пользователь оставил сообщение, но диалог простаивает уже более <b>{int(mins)} минут</b>.\n"
-                        f"Не забудьте ответить игроку или закрыть заявку!"
+                        f"Пользователь ожидает вашего ответа (простой: <b>{int(mins)} минут</b>).\n"
+                        f"Пожалуйста, ответьте игроку или закройте заявку!"
                     )
                     try:
                         sent = await bot.send_message(ADMIN_CHAT_ID, admin_alert, parse_mode="HTML")
@@ -3256,7 +3268,11 @@ async def reminder_worker():
                         def _mark_admin_reminded():
                             with get_db() as conn:
                                 with conn.cursor() as cur:
-                                    cur.execute("UPDATE tickets SET reminded_idle = TRUE WHERE ticket_id = %s", (t_id,))
+                                    cur.execute("""
+                                        UPDATE tickets 
+                                        SET reminded_idle = TRUE, last_idle_remind = CURRENT_TIMESTAMP 
+                                        WHERE ticket_id = %s
+                                    """, (t_id,))
                         await asyncio.to_thread(_mark_admin_reminded)
                     except Exception as e:
                         logging.error(f"Ошибка отправки напоминания хелперу по тикету №{t_id}: {e}")
