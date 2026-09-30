@@ -270,7 +270,7 @@ def _init_db_sync():
             # Удаляем старый дубликат "Тропы", если он остался в базе
             cursor.execute("DELETE FROM secret_types WHERE name = 'Тропы'")
 
-            # Базовые типы секреток: Телевизор со склонением "троп"
+            # Базовые типы секреток
             default_types = [
                 ("Лапка", "лапки"),
                 ("Сердечко", "сердечка"),
@@ -300,7 +300,7 @@ def _init_db_sync():
             cursor.execute("INSERT INTO settings (key, value) VALUES ('template_active', %s) ON CONFLICT (key) DO NOTHING", (default_active_template,))
 
             default_farm_template = (
-                "❕Секретка❕\n\n"
+                "❕Фарм-Секретка❕\n\n"
                 "Тип: [Тип_Особенной_Секретки]\n\n"
                 "Правила:\n"
                 "1. Не ускорять\n"
@@ -311,7 +311,11 @@ def _init_db_sync():
                 "Ссылка: [Ссылка]\n\n"
                 "🤍Наш <a href='https://t.me/SecretsToH'>чат</a> | Наш <a href='https://t.me/ToHSecretss'>канал</a> | Наша <a href='https://t.me/ToHSecrets_bot'>поддержка</a>🤍"
             )
-            cursor.execute("INSERT INTO settings (key, value) VALUES ('template_farm', %s) ON CONFLICT (key) DO NOTHING", (default_farm_template,))
+            # Обновляем дефолтный шаблон фарм-секретки с новым заголовком ❕Фарм-Секретка❕
+            cursor.execute("""
+                INSERT INTO settings (key, value) VALUES ('template_farm', %s)
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+            """, (default_farm_template,))
 
             default_expired_template = (
                 "❕Секретка❕\n"
@@ -745,7 +749,7 @@ class SecretPublisherStates(StatesGroup):
     waiting_for_channel = State()
     waiting_for_mode = State()
     waiting_for_type = State()
-    waiting_for_farm_type = State()
+    waiting_for_farm_choice = State()
     waiting_for_photo = State()
     waiting_for_link = State()
     waiting_for_confirm = State()
@@ -802,7 +806,7 @@ async def admin_panel_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📊 Статистика поддержки", callback_data="adm_stats"),
          InlineKeyboardButton(text="👥 Статистика хелперов", callback_data="adm_list_stats")],
-        [InlineKeyboardButton(text=f"👯‍♀️️ Добавление в друзья: {friend_status}", callback_data="toggle_friend")],
+        [InlineKeyboardButton(text=f"👯‍♀ Добавление в друзья: {friend_status}", callback_data="toggle_friend")],
         [InlineKeyboardButton(text=f"📝 Набор в хелперы: {helper_status}", callback_data="toggle_helper")],
         [InlineKeyboardButton(text=f"🔍 Искатели секреток: {secret_status}", callback_data="toggle_secret")],
         [InlineKeyboardButton(text="👑 Главные админы поддержки", callback_data="manage_main_admins")],
@@ -1607,16 +1611,22 @@ async def pub_mode_normal(call: CallbackQuery, state: FSMContext):
 @router.callback_query(SecretPublisherStates.waiting_for_mode, F.data == "pub_mode_farm")
 async def pub_mode_farm(call: CallbackQuery, state: FSMContext):
     await state.update_data(is_farm=True)
-    await state.set_state(SecretPublisherStates.waiting_for_farm_type)
-    await call.message.edit_text("🌾 <b>Выбран режим: Фарм секретка</b>\n\nВведите тип особенной секретки (например: <code>Фарм монет</code>, <code>Секретка + Фарм</code>):", parse_mode="HTML")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🌾 Фарм", callback_data="pub_farm_opt_farm")],
+        [InlineKeyboardButton(text="🌀 Фарм пружинкой", callback_data="pub_farm_opt_spring")]
+    ])
+    await call.message.edit_text("🌾 <b>Выбран режим: Фарм секретка</b>\n\nВыберите тип фарма кнопкой ниже:", reply_markup=kb, parse_mode="HTML")
+    await state.set_state(SecretPublisherStates.waiting_for_farm_choice)
     await call.answer()
 
-@router.message(SecretPublisherStates.waiting_for_farm_type, F.text)
-async def pub_farm_type_entered(message: Message, state: FSMContext):
-    f_type = message.text.strip()
+@router.callback_query(SecretPublisherStates.waiting_for_farm_choice, F.data.startswith("pub_farm_opt_"))
+async def pub_farm_choice_selected(call: CallbackQuery, state: FSMContext):
+    opt = call.data.split("_")[3]
+    f_type = "Фарм" if opt == "farm" else "Фарм пружинкой"
     await state.update_data(secret_type=f_type)
-    await message.answer(f"Тип фарма: <b>{html.escape(f_type)}</b>\n\nТеперь отправьте <b>фотографию</b> секретки:", parse_mode="HTML")
+    await call.message.edit_text(f"Выбран тип: <b>{html.escape(f_type)}</b>\n\nТеперь отправьте <b>фотографию</b> секретки:", parse_mode="HTML")
     await state.set_state(SecretPublisherStates.waiting_for_photo)
+    await call.answer()
 
 @router.callback_query(SecretPublisherStates.waiting_for_type, F.data.startswith("pub_settype_"))
 async def pub_settype(call: CallbackQuery, state: FSMContext):
@@ -1997,7 +2007,7 @@ async def process_c_time(message: Message, state: FSMContext):
     await state.set_state(Form.complaint_photos)
     await message.answer(
         f"{NUM_5} {ICON_PHOTO} <b>Прикрепите доказательства (до 5 фото):</b>\n\n"
-        "⚠️ <b>Важно:</b> фото строго запрещено обрезать! Плашка уровней и чат сервера должны быть отчётливо видны.",
+        "⚠️️ <b>Важно:</b> фото строго запрещено обрезать! Плашка уровней и чат сервера должны быть отчётливо видны.",
         reply_markup=skip_photo_kb("complaint"),
         parse_mode="HTML"
     )
