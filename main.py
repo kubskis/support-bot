@@ -293,9 +293,9 @@ def _init_db_sync():
                 "3. Не покупать негативные мутаторы\n"
                 "4. Не подниматься выше уровня над секреткой и не идти к воротам ускорения\n"
                 "При несоблюдении правил, вы получите бан.\n"
-                "Обжаловать бан можно в <a href='https://t.me/ToHSecrets_bot'>поддержке</a>!\n\n"
+                "Обжаловать бан можно в поддержке!\n\n"
                 "Секретка: [Ссылка]\n\n"
-                "🤍Наш <a href='https://t.me/SecretsToH'>чат</a> | Наш <a href='https://t.me/ToHSecretss'>канал</a> | Наш <a href='https://t.me/ToHSecrets_bot'>бот</a>🤍"
+                "🤍Наш <a href='https://t.me/SecretsToH'>чат</a> | Наш <a href='https://t.me/ToHSecretss'>канал</a> | Наша <a href='https://t.me/ToHSecrets_bot'>поддержка</a>🤍"
             )
             cursor.execute("INSERT INTO settings (key, value) VALUES ('template_active', %s) ON CONFLICT (key) DO NOTHING", (default_active_template,))
 
