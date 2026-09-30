@@ -141,7 +141,7 @@ dp.callback_query.middleware(ThrottlingMiddleware(limit=0.8))
 dp.include_router(router)
 
 # ----------------------------------------------------------------------
-# БАЗА ДАННЫХ (Supabase / PostgreSQL)
+# БАЗА ДАННЫХ
 # ----------------------------------------------------------------------
 db_pool = psycopg2.pool.ThreadedConnectionPool(
     minconn=1,
@@ -165,37 +165,6 @@ def get_db():
 def _init_db_sync():
     with get_db() as conn:
         with conn.cursor() as cursor:
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS user_notes_new (
-                    id SERIAL PRIMARY KEY,
-                    user_id BIGINT,
-                    note TEXT,
-                    author_name TEXT,
-                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-                );
-            """)
-            
-            cursor.execute("""
-                DO $$ 
-                BEGIN 
-                    IF EXISTS (
-                        SELECT 1 FROM information_schema.table_constraints 
-                        WHERE table_name = 'user_notes' AND constraint_type = 'PRIMARY KEY'
-                    ) THEN
-                        IF NOT EXISTS (
-                            SELECT 1 FROM information_schema.columns 
-                            WHERE table_name = 'user_notes' AND column_name = 'id'
-                        ) THEN
-                            INSERT INTO user_notes_new (user_id, note, author_name, created_at)
-                            SELECT user_id, note, author_name, created_at FROM user_notes;
-                            
-                            DROP TABLE user_notes;
-                            ALTER TABLE user_notes_new RENAME TO user_notes;
-                        END IF;
-                    END IF;
-                END $$;
-            """)
-
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS user_notes (
                     id SERIAL PRIMARY KEY,
@@ -298,9 +267,20 @@ def _init_db_sync():
                     (OWNER_ID,)
                 )
 
-            default_types = [("Лапка", "лапки"), ("Сердечко", "сердечка"), ("Тропы", "троп")]
+            # Удаляем старый дубликат "Тропы", если он остался в базе
+            cursor.execute("DELETE FROM secret_types WHERE name = 'Тропы'")
+
+            # Базовые типы секреток: Телевизор со склонением "троп"
+            default_types = [
+                ("Лапка", "лапки"),
+                ("Сердечко", "сердечка"),
+                ("Телевизор", "троп")
+            ]
             for s_name, s_dec in default_types:
-                cursor.execute("INSERT INTO secret_types (name, declined) VALUES (%s, %s) ON CONFLICT (name) DO NOTHING", (s_name, s_dec))
+                cursor.execute("""
+                    INSERT INTO secret_types (name, declined) VALUES (%s, %s)
+                    ON CONFLICT (name) DO UPDATE SET declined = EXCLUDED.declined
+                """, (s_name, s_dec))
 
             cursor.execute("INSERT INTO settings (key, value) VALUES ('timer_seconds', '510') ON CONFLICT (key) DO NOTHING")
 
@@ -318,6 +298,20 @@ def _init_db_sync():
                 "🤍Наш <a href='https://t.me/SecretsToH'>чат</a> | Наш <a href='https://t.me/ToHSecretss'>канал</a> | Наш <a href='https://t.me/ToHSecrets_bot'>бот</a>🤍"
             )
             cursor.execute("INSERT INTO settings (key, value) VALUES ('template_active', %s) ON CONFLICT (key) DO NOTHING", (default_active_template,))
+
+            default_farm_template = (
+                "❕Секретка❕\n\n"
+                "Тип: [Тип_Особенной_Секретки]\n\n"
+                "Правила:\n"
+                "1. Не ускорять\n"
+                "2. Выйти с сервера после получения монеток (можете перезайти, но выйти нужно, не занимаем очередь)\n"
+                "3. Не покупать негативные мутаторы\n"
+                "При несоблюдении правил, вы получите бан.\n"
+                "Обжаловать бан можно в поддержке!\n\n"
+                "Ссылка: [Ссылка]\n\n"
+                "🤍Наш <a href='https://t.me/SecretsToH'>чат</a> | Наш <a href='https://t.me/ToHSecretss'>канал</a> | Наша <a href='https://t.me/ToHSecrets_bot'>поддержка</a>🤍"
+            )
+            cursor.execute("INSERT INTO settings (key, value) VALUES ('template_farm', %s) ON CONFLICT (key) DO NOTHING", (default_farm_template,))
 
             default_expired_template = (
                 "❕Секретка❕\n"
@@ -716,25 +710,6 @@ async def expire_secret_post(bot: Bot, post_id: int, channel_id: str, message_id
     except Exception as e:
         logging.error(f"Не удалось обновить истекший пост №{post_id}: {e}")
 
-async def schedule_ticket_cleanup(ticket_id: int, card_message_id: int = None):
-    await asyncio.sleep(3600)
-    try:
-        msg_ids = await get_ticket_messages(ticket_id)
-        if card_message_id and card_message_id not in msg_ids:
-            msg_ids.append(card_message_id)
-
-        for m_id in msg_ids:
-            try:
-                await bot.delete_message(chat_id=ADMIN_CHAT_ID, message_id=m_id)
-            except TelegramBadRequest:
-                pass
-            except Exception:
-                pass
-            await asyncio.sleep(0.05)
-        logging.info(f"Тикет №{ticket_id} успешно очищен из чата поддержки через 1 час.")
-    except Exception as e:
-        logging.error(f"Ошибка при очистке тикета №{ticket_id}: {e}")
-
 # ----------------------------------------------------------------------
 # СОСТОЯНИЯ (FSM)
 # ----------------------------------------------------------------------
@@ -768,7 +743,9 @@ class Form(StatesGroup):
 
 class SecretPublisherStates(StatesGroup):
     waiting_for_channel = State()
+    waiting_for_mode = State()
     waiting_for_type = State()
+    waiting_for_farm_type = State()
     waiting_for_photo = State()
     waiting_for_link = State()
     waiting_for_confirm = State()
@@ -780,6 +757,7 @@ class SecretAdminStates(StatesGroup):
     add_type_declined = State()
     set_timer = State()
     template_active = State()
+    template_farm = State()
     template_expired = State()
 
 # ----------------------------------------------------------------------
@@ -824,11 +802,11 @@ async def admin_panel_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📊 Статистика поддержки", callback_data="adm_stats"),
          InlineKeyboardButton(text="👥 Статистика хелперов", callback_data="adm_list_stats")],
-        [InlineKeyboardButton(text=f"👯‍♀️ Добавление в друзья: {friend_status}", callback_data="toggle_friend")],
+        [InlineKeyboardButton(text=f"👯‍♀️️ Добавление в друзья: {friend_status}", callback_data="toggle_friend")],
         [InlineKeyboardButton(text=f"📝 Набор в хелперы: {helper_status}", callback_data="toggle_helper")],
         [InlineKeyboardButton(text=f"🔍 Искатели секреток: {secret_status}", callback_data="toggle_secret")],
         [InlineKeyboardButton(text="👑 Главные админы поддержки", callback_data="manage_main_admins")],
-        [InlineKeyboardButton(text="✏️ Ник для друзей", callback_data="change_friend_nick")],
+        [InlineKeyboardButton(text="✏ Ник для друзей", callback_data="change_friend_nick")],
         [InlineKeyboardButton(text="🔮 Управление Секретками (Панель)", callback_data="adm_secret_panel")]
     ])
 
@@ -895,7 +873,7 @@ def skip_photo_kb(target: str):
 def complaint_servers_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🌐 Сервер с секреткой", callback_data="cmp_srv_secret")],
-        [InlineKeyboardButton(text="🕵️ Поиск саботера", callback_data="cmp_srv_saboteur")],
+        [InlineKeyboardButton(text="🕵 Поиск саботера", callback_data="cmp_srv_saboteur")],
         [InlineKeyboardButton(text="🌾 Фарм сервер", callback_data="cmp_srv_farm")]
     ])
 
@@ -1392,7 +1370,8 @@ async def sec_set_timer_proc(message: Message, state: FSMContext):
 async def sec_templates(call: CallbackQuery):
     if not await is_main_admin(call.from_user.id): return
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✏️ Активный пост", callback_data="sec_tmpl_act")],
+        [InlineKeyboardButton(text="✏️ Обычный активный пост", callback_data="sec_tmpl_act")],
+        [InlineKeyboardButton(text="🌾 Шаблон фарм-секретки", callback_data="sec_tmpl_farm")],
         [InlineKeyboardButton(text="✏️ Истекший пост", callback_data="sec_tmpl_exp")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="adm_secret_panel")]
     ])
@@ -1414,6 +1393,22 @@ async def sec_tmpl_act_proc(message: Message, state: FSMContext):
     await state.clear()
     kb = await main_keyboard(message.from_user.id)
     await message.answer(f"{ICON_CHECK} Шаблон активного поста обновлен!", reply_markup=kb, parse_mode="HTML")
+
+@router.callback_query(F.data == "sec_tmpl_farm")
+async def sec_tmpl_farm(call: CallbackQuery, state: FSMContext):
+    if not await is_main_admin(call.from_user.id): return
+    tmpl = await get_setting("template_farm")
+    await state.set_state(SecretAdminStates.template_farm)
+    await call.message.answer(f"{ICON_PENCIL} <b>Текущий шаблон фарм-секретки:</b>\n\n<pre>{html.escape(tmpl)}</pre>\n\nОтправьте новый текст (доступны теги <code>[Тип_Особенной_Секретки]</code>, <code>[Ссылка]</code>):", parse_mode="HTML")
+    await call.answer()
+
+@router.message(SecretAdminStates.template_farm)
+async def sec_tmpl_farm_proc(message: Message, state: FSMContext):
+    if not await is_main_admin(message.from_user.id): return
+    await set_setting("template_farm", message.text)
+    await state.clear()
+    kb = await main_keyboard(message.from_user.id)
+    await message.answer(f"{ICON_CHECK} Шаблон фарм-секретки обновлен!", reply_markup=kb, parse_mode="HTML")
 
 @router.callback_query(F.data == "sec_tmpl_exp")
 async def sec_tmpl_exp(call: CallbackQuery, state: FSMContext):
@@ -1484,7 +1479,7 @@ async def sec_rmtype_proc(call: CallbackQuery):
     await call.answer()
 
 # ----------------------------------------------------------------------
-# ПУБЛИКАЦИЯ СЕКРЕТОК
+# ПУБЛИКАЦИЯ СЕКРЕТОК (ОБЫЧНЫЕ + ФАРМ)
 # ----------------------------------------------------------------------
 @router.message(F.text == BTN_SECRETS, F.chat.type == "private")
 async def open_secrets_menu(message: Message, state: FSMContext):
@@ -1585,6 +1580,18 @@ async def pub_send_secret(call: CallbackQuery, state: FSMContext):
         await call.message.answer(f"{ICON_CROSS} Сначала привяжите канал через меню секреток!", reply_markup=publisher_menu_kb(), parse_mode="HTML")
         await call.answer()
         return
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔮 Обычная секретка", callback_data="pub_mode_normal")],
+        [InlineKeyboardButton(text="🌾 Фарм секретка", callback_data="pub_mode_farm")]
+    ])
+    await call.message.edit_text("<b>Выберите категорию публикации:</b>", reply_markup=kb, parse_mode="HTML")
+    await state.set_state(SecretPublisherStates.waiting_for_mode)
+    await call.answer()
+
+@router.callback_query(SecretPublisherStates.waiting_for_mode, F.data == "pub_mode_normal")
+async def pub_mode_normal(call: CallbackQuery, state: FSMContext):
+    await state.update_data(is_farm=False)
     types_d = await get_secret_types_dict()
     if not types_d:
         await call.message.answer(f"{ICON_CROSS} В базе нет типов секреток. Обратитесь к создателю.", parse_mode="HTML")
@@ -1596,6 +1603,20 @@ async def pub_send_secret(call: CallbackQuery, state: FSMContext):
     await call.message.edit_text("Выберите тип секретки:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
     await state.set_state(SecretPublisherStates.waiting_for_type)
     await call.answer()
+
+@router.callback_query(SecretPublisherStates.waiting_for_mode, F.data == "pub_mode_farm")
+async def pub_mode_farm(call: CallbackQuery, state: FSMContext):
+    await state.update_data(is_farm=True)
+    await state.set_state(SecretPublisherStates.waiting_for_farm_type)
+    await call.message.edit_text("🌾 <b>Выбран режим: Фарм секретка</b>\n\nВведите тип особенной секретки (например: <code>Фарм монет</code>, <code>Секретка + Фарм</code>):", parse_mode="HTML")
+    await call.answer()
+
+@router.message(SecretPublisherStates.waiting_for_farm_type, F.text)
+async def pub_farm_type_entered(message: Message, state: FSMContext):
+    f_type = message.text.strip()
+    await state.update_data(secret_type=f_type)
+    await message.answer(f"Тип фарма: <b>{html.escape(f_type)}</b>\n\nТеперь отправьте <b>фотографию</b> секретки:", parse_mode="HTML")
+    await state.set_state(SecretPublisherStates.waiting_for_photo)
 
 @router.callback_query(SecretPublisherStates.waiting_for_type, F.data.startswith("pub_settype_"))
 async def pub_settype(call: CallbackQuery, state: FSMContext):
@@ -1633,14 +1654,24 @@ async def pub_link(message: Message, state: FSMContext):
     await state.update_data(link=clean)
     data = await state.get_data()
     stype = data["secret_type"]
-    types_d = await get_secret_types_dict()
-    dec = types_d.get(stype, stype)
-    tmpl = await get_setting("template_active")
-    preview = (
-        tmpl.replace("[Тип_Секретки]", stype)
-            .replace("[Склоненный_Тип]", dec)
-            .replace("[Ссылка]", clean)
-    )
+    is_farm = data.get("is_farm", False)
+
+    if is_farm:
+        tmpl = await get_setting("template_farm")
+        preview = (
+            tmpl.replace("[Тип_Особенной_Секретки]", stype)
+                .replace("[Ссылка]", clean)
+        )
+    else:
+        types_d = await get_secret_types_dict()
+        dec = types_d.get(stype, stype)
+        tmpl = await get_setting("template_active")
+        preview = (
+            tmpl.replace("[Тип_Секретки]", stype)
+                .replace("[Склоненный_Тип]", dec)
+                .replace("[Ссылка]", clean)
+        )
+        
     conf_kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✅ Опубликовать", callback_data="pub_conf_yes"),
         InlineKeyboardButton(text="❌ Отмена", callback_data="pub_conf_no")
@@ -1661,14 +1692,24 @@ async def pub_confirm(call: CallbackQuery, state: FSMContext):
             return
         data = await state.get_data()
         stype = data["secret_type"]
-        types_d = await get_secret_types_dict()
-        dec = types_d.get(stype, stype)
-        tmpl = await get_setting("template_active")
-        final_txt = (
-            tmpl.replace("[Тип_Секретки]", stype)
-                .replace("[Склоненный_Тип]", dec)
-                .replace("[Ссылка]", data["link"])
-        )
+        is_farm = data.get("is_farm", False)
+
+        if is_farm:
+            tmpl = await get_setting("template_farm")
+            final_txt = (
+                tmpl.replace("[Тип_Особенной_Секретки]", stype)
+                    .replace("[Ссылка]", data["link"])
+            )
+        else:
+            types_d = await get_secret_types_dict()
+            dec = types_d.get(stype, stype)
+            tmpl = await get_setting("template_active")
+            final_txt = (
+                tmpl.replace("[Тип_Секретки]", stype)
+                    .replace("[Склоненный_Тип]", dec)
+                    .replace("[Ссылка]", data["link"])
+            )
+
         try:
             sent = await bot.send_photo(chat_id=ch_id, photo=data["photo_id"], caption=final_txt, parse_mode="HTML")
             def _save():
@@ -2026,7 +2067,7 @@ async def process_c_photo(message: Message, state: FSMContext):
                 f"Нарушитель(и): {nicks_formatted}\n"
                 f"Суть нарушения: {html.escape(cur_data.get('c_reason', ''))}\n"
                 f"Где произошло нарушение: {html.escape(cur_data.get('c_place', ''))}\n"
-                f"Время публикации поста: {html.escape(data.get('c_time', ''))}"
+                f"Время публикации поста: {html.escape(cur_data.get('c_time', ''))}"
             )
             ticket_id = await dispatch_ticket_to_admin(message.from_user.id, message.from_user, "complaint", text, photos)
             await state.clear()
@@ -2056,7 +2097,7 @@ async def process_c_photo(message: Message, state: FSMContext):
         night_txt = get_night_notice()
         await message.answer(f"{ICON_CHECK} Жалоба №{ticket_id} отправлена! (Прикреплено фото: {len(photos)}){night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
 
-# --- 2. ОБЖАЛОВАНИЕ ---
+# --- 2. ОБЖАЛОВАНИЕ (С ПРОВЕРКОЙ ROBLOX) ---
 @router.message(F.text == BTN_APPEAL, F.chat.type == "private")
 async def start_appeal(message: Message, state: FSMContext):
     await register_user(message.from_user.id)
@@ -2071,13 +2112,29 @@ async def start_appeal(message: Message, state: FSMContext):
 
 @router.message(Form.appeal_nickname, F.text)
 async def process_a_nickname(message: Message, state: FSMContext):
-    await state.update_data(a_nickname=message.text.strip())
+    nick_input = message.text.strip()
+    rbx_info = await check_roblox_username(nick_input)
+    
+    if rbx_info:
+        official_name = rbx_info["name"]
+        rbx_id = rbx_info["id"]
+        formatted_profile = f"<a href='https://www.roblox.com/users/{rbx_id}/profile'>{official_name}</a> (ID: <code>{rbx_id}</code>)"
+        confirm_text = f"Профиль найден: <a href='https://www.roblox.com/users/{rbx_id}/profile'><b>{official_name}</b></a> (ID: <code>{rbx_id}</code>)"
+    else:
+        official_name = nick_input
+        formatted_profile = f"<code>{html.escape(nick_input)}</code> (⚠️ <i>профиль не найден в Roblox</i>)"
+        confirm_text = f"<code>{html.escape(nick_input)}</code> (⚠️ <i>профиль не найден в Roblox</i>)"
+
+    await state.update_data(a_nickname=official_name, a_profile=formatted_profile)
     await state.set_state(Form.appeal_place)
+    
     await message.answer(
+        f"{ICON_CHECK} Ник зафиксирован: {confirm_text}\n\n"
         f"{NUM_2} <b>На каком сервере произошла блокировка?</b>\n"
         "<i>Выберите нужный вариант на кнопках ниже:</i>",
         reply_markup=appeal_servers_kb(),
-        parse_mode="HTML"
+        parse_mode="HTML",
+        link_preview_options=LinkPreviewOptions(is_disabled=True)
     )
 
 @router.callback_query(F.data.startswith("app_srv_"), Form.appeal_place)
@@ -2127,8 +2184,9 @@ async def skip_a_photos(call: CallbackQuery, state: FSMContext):
             await call.answer()
             return
         data = await state.get_data()
+        profile_str = data.get("a_profile") or f"<code>{html.escape(data.get('a_nickname', ''))}</code>"
         text = (
-            f"Ник: <code>{html.escape(data.get('a_nickname', ''))}</code>\n"
+            f"Ник: {profile_str}\n"
             f"Сервер бана: {html.escape(data.get('a_place', ''))}\n"
             f"Время публикации поста: {html.escape(data.get('a_time', ''))}\n"
             f"Причина разбана: {html.escape(data.get('a_reason', ''))}"
@@ -2168,11 +2226,12 @@ async def process_a_photo(message: Message, state: FSMContext):
                 await state.clear()
                 return
 
+            profile_str = cur_data.get("a_profile") or f"<code>{html.escape(cur_data.get('a_nickname', ''))}</code>"
             text = (
-                f"Ник: <code>{html.escape(cur_data.get('a_nickname', ''))}</code>\n"
+                f"Ник: {profile_str}\n"
                 f"Сервер бана: {html.escape(cur_data.get('a_place', ''))}\n"
-                f"Время публикации поста: {html.escape(data.get('a_time', ''))}\n"
-                f"Причина разбана: {html.escape(data.get('a_reason', ''))}"
+                f"Время публикации поста: {html.escape(cur_data.get('a_time', ''))}\n"
+                f"Причина разбана: {html.escape(cur_data.get('a_reason', ''))}"
             )
             ticket_id = await dispatch_ticket_to_admin(message.from_user.id, message.from_user, "appeal", text, photos)
             await state.clear()
@@ -2185,8 +2244,9 @@ async def process_a_photo(message: Message, state: FSMContext):
             await state.clear()
             return
         data = await state.get_data()
+        profile_str = data.get("a_profile") or f"<code>{html.escape(data.get('a_nickname', ''))}</code>"
         text = (
-            f"Ник: <code>{html.escape(data.get('a_nickname', ''))}</code>\n"
+            f"Ник: {profile_str}\n"
             f"Сервер бана: {html.escape(data.get('a_place', ''))}\n"
             f"Время публикации поста: {html.escape(data.get('a_time', ''))}\n"
             f"Причина разбана: {html.escape(data.get('a_reason', ''))}"
@@ -2321,7 +2381,7 @@ async def take_ticket_handler(call: CallbackQuery):
         try:
             await bot.send_message(
                 ticket_info[0],
-                f"👨‍💻 <b>Агент #{agent_number}</b> взял вашу заявку <b>№{ticket_id}</b> в работу!\nТеперь вы можете писать сюда сообщения.",
+                f"👨‍‍💻 <b>Агент #{agent_number}</b> взял вашу заявку <b>№{ticket_id}</b> в работу!\nТеперь вы можете писать сюда сообщения.",
                 parse_mode="HTML"
             )
         except Exception:
@@ -2415,8 +2475,6 @@ async def close_ticket_handler(call: CallbackQuery):
         except Exception:
             pass
 
-    asyncio.create_task(schedule_ticket_cleanup(ticket_id, call.message.message_id))
-
 @router.callback_query(F.data.startswith("user_cancel_"))
 async def user_cancel_ticket(call: CallbackQuery):
     await call.answer()
@@ -2425,7 +2483,6 @@ async def user_cancel_ticket(call: CallbackQuery):
     if ticket_info and ticket_info[2] == 'pending':
         await close_ticket_db(ticket_id, 'closed')
         await call.message.edit_text(f"{ICON_CROSS} Заявка <b>№{ticket_id}</b> отменена вами.", parse_mode="HTML")
-        asyncio.create_task(schedule_ticket_cleanup(ticket_id, None))
     else:
         await call.answer("❌ Заявка уже взята в работу или закрыта, отмена недоступна.", show_alert=True)
 
@@ -2479,11 +2536,10 @@ async def user_private_message(message: Message, state: FSMContext):
     await message.answer(f"{ICON_WARN} Пожалуйста, выберите нужный пункт меню для обращения.", reply_markup=kb, parse_mode="HTML")
 
 # ----------------------------------------------------------------------
-# КОМАНДЫ В АДМИН-ЧАТЕ (/note, /deletenote, /mystats)
+# КОМАНДЫ В АДМИН-ЧАТЕ (/note, /deletenote, /mystats, /news, /ban, /unban)
 # ----------------------------------------------------------------------
 @router.message(Command("mystats"), F.chat.id == ADMIN_CHAT_ID)
 async def cmd_my_stats(message: Message):
-    """Личная статистика агента поддержки"""
     if not await is_support_member(message.from_user.id) and not await is_main_admin(message.from_user.id):
         return
 
@@ -2527,7 +2583,6 @@ async def cmd_my_stats(message: Message):
 
 @router.message(Command("note"), F.chat.id == ADMIN_CHAT_ID)
 async def cmd_admin_note(message: Message):
-    """Постоянная заметка по пользователю (работает с карточки тикета)"""
     if not await is_support_member(message.from_user.id) and not await is_main_admin(message.from_user.id):
         return
 
@@ -2736,13 +2791,11 @@ async def cmd_ban_reply(message: Message):
 
     if message.reply_to_message:
         replied_msg = message.reply_to_message
-        
         mapping = await get_user_by_group_msg(replied_msg.message_id)
         if mapping:
             user_id, ticket_id = mapping[0], mapping[1]
 
         raw_text = replied_msg.text or replied_msg.caption or ""
-        
         if not user_id and raw_text:
             match_id = re.search(r"ID:?\s*(\d+)", raw_text, re.IGNORECASE)
             if match_id:
@@ -2789,7 +2842,6 @@ async def cmd_ban_reply(message: Message):
 
     if ticket_id:
         await close_ticket_db(ticket_id, 'rejected')
-        asyncio.create_task(schedule_ticket_cleanup(ticket_id, None))
 
     try:
         await bot.send_message(
@@ -2919,7 +2971,6 @@ async def admin_reply_in_group(message: Message):
 
         await delete_pending_rejection(replied_msg_id)
         await message.answer(f"✅ Отказ по заявке №{pending_ticket_id} отправлен.")
-        asyncio.create_task(schedule_ticket_cleanup(pending_ticket_id, card_message_id))
         return
 
     mapping = await get_user_by_group_msg(replied_msg_id)
@@ -3077,7 +3128,6 @@ async def reminder_worker():
                         f"⏱ <b>Тикет №{t_id} автоматически закрыт</b> (пользователь не отвечал более 24 часов).",
                         parse_mode="HTML"
                     )
-                    asyncio.create_task(schedule_ticket_cleanup(t_id, None))
                 except Exception as ex:
                     logging.error(f"Ошибка автозакрытия тикета №{t_id}: {ex}")
 
