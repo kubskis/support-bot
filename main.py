@@ -274,6 +274,13 @@ def _init_db_sync():
                     (OWNER_ID,)
                 )
 
+            # Очищаем тестовые оценки от владельца и главных админов из ratings
+            cursor.execute("""
+                DELETE FROM ratings 
+                WHERE user_id IN (SELECT admin_id FROM main_admins) 
+                   OR user_id = %s
+            """, (OWNER_ID,))
+
             cursor.execute("DELETE FROM secret_types WHERE name = 'Тропы'")
 
             default_types = [
@@ -289,7 +296,6 @@ def _init_db_sync():
                 """, (s_name, s_dec))
 
             cursor.execute("INSERT INTO special_secret_types (name) VALUES ('Фарм') ON CONFLICT (name) DO NOTHING")
-
             cursor.execute("INSERT INTO settings (key, value) VALUES ('timer_seconds', '510') ON CONFLICT (key) DO NOTHING")
 
             default_active_template = (
@@ -487,7 +493,13 @@ async def get_tickets_stats():
                 closed = cur.fetchone()[0]
                 cur.execute("SELECT COUNT(*) FROM tickets WHERE status = 'rejected'")
                 rejected = cur.fetchone()[0]
-                cur.execute("SELECT COALESCE(AVG(score), 0) FROM ratings WHERE user_id != %s", (OWNER_ID,))
+                # Исключаем оценки от создателя и администраторов
+                cur.execute("""
+                    SELECT COALESCE(AVG(score), 0) 
+                    FROM ratings 
+                    WHERE user_id != %s 
+                      AND user_id NOT IN (SELECT admin_id FROM main_admins)
+                """, (OWNER_ID,))
                 avg_rating = cur.fetchone()[0]
                 return total, closed, rejected, round(float(avg_rating), 2)
     try:
@@ -500,13 +512,19 @@ async def get_admin_list_stats():
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
-                    SELECT t.admin_id, COUNT(*) as closed_count, COALESCE(AVG(r.score), 0) as avg_score, a.agent_number
+                    SELECT t.admin_id, COUNT(*) as closed_count,
+                           COALESCE(AVG(CASE 
+                               WHEN r.user_id != %s AND r.user_id NOT IN (SELECT admin_id FROM main_admins) 
+                               THEN r.score 
+                               ELSE NULL 
+                           END), 0) as avg_score,
+                           a.agent_number
                     FROM tickets t
                     LEFT JOIN ratings r ON t.ticket_id = r.ticket_id
                     LEFT JOIN admin_agents a ON t.admin_id = a.admin_id
                     WHERE t.admin_id IS NOT NULL AND t.status = 'closed'
                     GROUP BY t.admin_id, a.agent_number
-                """)
+                """, (OWNER_ID,))
                 return cur.fetchall()
     try:
         return await asyncio.to_thread(_query)
@@ -526,13 +544,22 @@ async def create_ticket(user_id: int, category: str = 'general', card_text: str 
     return await asyncio.to_thread(_query)
 
 async def touch_ticket(ticket_id: int, actor: str = 'user'):
+    """
+    Обновляет updated_at ТОЛЬКО если сменился автор последнего сообщения!
+    Если игрок досылает сообщения подряд — точка отсчёта ожидания хелпера НЕ сбрасывается.
+    """
     def _query():
         with get_db() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE tickets SET updated_at = CURRENT_TIMESTAMP, last_actor = %s, reminded_idle = FALSE, last_idle_remind = NULL WHERE ticket_id = %s",
-                    (actor, ticket_id)
-                )
+                cur.execute("SELECT last_actor FROM tickets WHERE ticket_id = %s", (ticket_id,))
+                row = cur.fetchone()
+                current_actor = row[0] if row else None
+
+                if current_actor != actor:
+                    cur.execute(
+                        "UPDATE tickets SET updated_at = CURRENT_TIMESTAMP, last_actor = %s, reminded_idle = FALSE, last_idle_remind = NULL WHERE ticket_id = %s",
+                        (actor, ticket_id)
+                    )
     await asyncio.to_thread(_query)
 
 async def map_message(group_msg_id: int, user_id: int, ticket_id: int):
@@ -791,7 +818,7 @@ class SecretAdminStates(StatesGroup):
 # ----------------------------------------------------------------------
 BTN_COMPLAINT = "🚨 Жалоба на игрока"
 BTN_APPEAL = "😡 Обжалование бана"
-BTN_FRIENDS = "👯‍♀️ Добавление в друзья (VIP)"
+BTN_FRIENDS = "👯‍♀️️ Добавление в друзья (VIP)"
 BTN_QUESTION = "❓ Задать вопрос"
 BTN_HELPER_APPLY = "📝 Подать заявку на хелпера"
 BTN_SECRET_APPLY = "🔍 Набор в искатели секреток"
@@ -1165,7 +1192,7 @@ async def process_del_main_admin(message: Message, state: FSMContext):
         kb = await main_keyboard(message.from_user.id)
         await message.answer(f"{ICON_CHECK} Пользователь <code>{del_id}</code> снят с поста главного администратора.", reply_markup=kb, parse_mode="HTML")
     except ValueError:
-        await message.answer(f"{ICON_CROSS} Неверный формат ID. Введите числовой Telegram ID:", parse_mode="HTML")
+        await message.answer(f"{ICON_CROSS} Введите числовой Telegram ID:", parse_mode="HTML")
 
 @router.callback_query(F.data == "toggle_friend")
 async def toggle_friend_callback(call: CallbackQuery):
@@ -2464,7 +2491,7 @@ async def take_ticket_handler(call: CallbackQuery):
         try:
             await bot.send_message(
                 ticket_info[0],
-                f"👨‍‍💻 <b>Агент #{agent_number}</b> взял вашу заявку <b>№{ticket_id}</b> в работу!\nТеперь вы можете писать сюда сообщения.",
+                f"👨‍💻 <b>Агент #{agent_number}</b> взял вашу заявку <b>№{ticket_id}</b> в работу!\nТеперь вы можете писать сюда сообщения.",
                 parse_mode="HTML"
             )
         except Exception:
@@ -2570,7 +2597,7 @@ async def user_cancel_ticket(call: CallbackQuery):
         await call.answer("❌ Заявка уже взята в работу или закрыта, отмена недоступна.", show_alert=True)
 
 # ----------------------------------------------------------------------
-# СИСТЕМА ОЦЕНОК
+# СИСТЕМА ОЦЕНОК (С ЗАЩИТОЙ ОТ САМООЦЕНКИ И ОЦЕНОК ОТ АДМИНОВ)
 # ----------------------------------------------------------------------
 @router.callback_query(F.data.startswith("rate_"))
 async def process_rating(call: CallbackQuery):
@@ -2583,11 +2610,15 @@ async def process_rating(call: CallbackQuery):
     ticket_info = await get_ticket_info(ticket_id)
     admin_id = ticket_info[1] if ticket_info else 0
 
-    await save_rating_db(ticket_id, user_id, admin_id, score)
+    # Проверяем, является ли голосующий админом/хелпером/создателем
+    user_is_staff = await is_support_member(user_id) or await is_main_admin(user_id)
 
-    if await is_main_admin(user_id):
-        await call.message.edit_text(f"{ICON_STAR} [ТЕСТ АДМИНА] Оценка {score}/5 сохранена, но в общую статистику не пошла.", parse_mode="HTML")
+    if user_is_staff:
+        # Для тестов пишем в базу, но в статистику хелперов и общую статистику она не попадает
+        await save_rating_db(ticket_id, user_id, admin_id, score)
+        await call.message.edit_text(f"{ICON_STAR} [СТАФФ] Оценка {score}/5 сохранена, но в статистику хелперов не учитывается.", parse_mode="HTML")
     else:
+        await save_rating_db(ticket_id, user_id, admin_id, score)
         await call.message.edit_text(f"{ICON_STAR} Спасибо за оценку ({score}/5)! Ваше мнение учтено.", parse_mode="HTML")
 
 # ----------------------------------------------------------------------
@@ -2679,7 +2710,14 @@ async def cmd_my_stats(message: Message):
                 cur.execute("SELECT COUNT(*) FROM tickets WHERE admin_id = %s AND status = 'closed'", (admin_id,))
                 closed_count = cur.fetchone()[0]
 
-                cur.execute("SELECT COALESCE(AVG(score), 0) FROM ratings WHERE admin_id = %s", (admin_id,))
+                # Считаем среднюю оценку только от реальных пользователей
+                cur.execute("""
+                    SELECT COALESCE(AVG(score), 0) 
+                    FROM ratings 
+                    WHERE admin_id = %s 
+                      AND user_id != %s 
+                      AND user_id NOT IN (SELECT admin_id FROM main_admins)
+                """, (admin_id, OWNER_ID))
                 avg_score = cur.fetchone()[0]
 
                 cur.execute("""
@@ -2902,7 +2940,7 @@ async def cmd_news_broadcast(message: Message):
         f"{ICON_CHECK} <b>Рассылка завершена!</b>\n\n"
         f"✅ Успешно доставлено: <code>{success}</code>\n"
         f"🚫 Заблокировали бота: <code>{blocked}</code>\n"
-        f"⚠️️ Ошибок отправки: <code>{errors}</code>\n"
+        f"⚠️ Ошибок отправки: <code>{errors}</code>\n"
         f"👥 Всего в базе: <code>{len(users)}</code>",
         parse_mode="HTML"
     )
@@ -3172,7 +3210,7 @@ async def reminder_worker():
                         unassigned = cur.fetchall()
 
                         # Тикеты в работе:
-                        # 1. Первое напоминание через 20 минут тишины (reminded_idle = FALSE)
+                        # 1. Первое напоминание через 20 минут тишины от последнего ответа другой стороны (reminded_idle = FALSE)
                         # 2. Последующие напоминания каждый 1 час после предыдущего напоминания (reminded_idle = TRUE)
                         cur.execute("""
                             SELECT t.ticket_id, t.admin_id, t.user_id,
