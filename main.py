@@ -319,11 +319,11 @@ def _init_db_sync():
 
             default_expired_template = (
                 "❕Секретка❕\n"
-                "Секретка: [Тип_Секретки]\n\n"
+                "Тип: [Тип_Секретки]\n\n"
                 "Секретка: Время вышло! В канале еще будут секретки и вы успеете попасть на них🤍\n\n"
                 "🤍Наш <a href='https://t.me/SecretsToH'>чат</a> | "
                 "Наш <a href='https://t.me/ToHSecretss'>канал</a> | "
-                "Наш <a href='https://t.me/ToHSecrets_bot'>бот</a>🤍"
+                "Наша <a href='https://t.me/ToHSecrets_bot'>Поддержка</a>🤍"
             )
             cursor.execute("INSERT INTO settings (key, value) VALUES ('template_expired', %s) ON CONFLICT (key) DO NOTHING", (default_expired_template,))
 
