@@ -127,7 +127,7 @@ class ThrottlingMiddleware(BaseMiddleware):
             if current_time - last_time < self.limit:
                 if isinstance(event, CallbackQuery):
                     try:
-                        await event.answer("⚠️ Не спамьте кнопками! Подождите секунду.", show_alert=False)
+                        await event.answer("⚠️️ Не спамьте кнопками! Подождите секунду.", show_alert=False)
                     except Exception:
                         pass
                 return
@@ -267,13 +267,11 @@ def _init_db_sync():
                     (OWNER_ID,)
                 )
 
-            # Удаляем старый дубликат "Тропы", если он остался в базе
-            cursor.execute("DELETE FROM secret_types WHERE name = 'Тропы'")
-
-            # Базовые типы секреток
+            # 4 базовых типа секреток
             default_types = [
                 ("Лапка", "лапки"),
                 ("Сердечко", "сердечка"),
+                ("Тропы", "троп"),
                 ("Телевизор", "троп")
             ]
             for s_name, s_dec in default_types:
@@ -293,11 +291,14 @@ def _init_db_sync():
                 "3. Не покупать негативные мутаторы\n"
                 "4. Не подниматься выше уровня над секреткой и не идти к воротам ускорения\n"
                 "При несоблюдении правил, вы получите бан.\n"
-                "Обжаловать бан можно в поддержке!\n\n"
-                "Секретка: [Ссылка]\n\n"
+                "Обжаловать бан можно в <a href='https://t.me/ToHSecrets_bot'>поддержке</a>!\n\n"
+                "Ссылка: [Ссылка]\n\n"
                 "🤍Наш <a href='https://t.me/SecretsToH'>чат</a> | Наш <a href='https://t.me/ToHSecretss'>канал</a> | Наша <a href='https://t.me/ToHSecrets_bot'>поддержка</a>🤍"
             )
-            cursor.execute("INSERT INTO settings (key, value) VALUES ('template_active', %s) ON CONFLICT (key) DO NOTHING", (default_active_template,))
+            cursor.execute("""
+                INSERT INTO settings (key, value) VALUES ('template_active', %s)
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+            """, (default_active_template,))
 
             default_farm_template = (
                 "❕Фарм-Секретка❕\n\n"
@@ -307,11 +308,10 @@ def _init_db_sync():
                 "2. Выйти с сервера после получения монеток (можете перезайти, но выйти нужно, не занимаем очередь)\n"
                 "3. Не покупать негативные мутаторы\n"
                 "При несоблюдении правил, вы получите бан.\n"
-                "Обжаловать бан можно в поддержке!\n\n"
+                "Обжаловать бан можно в <a href='https://t.me/ToHSecrets_bot'>поддержке</a>!\n\n"
                 "Ссылка: [Ссылка]\n\n"
                 "🤍Наш <a href='https://t.me/SecretsToH'>чат</a> | Наш <a href='https://t.me/ToHSecretss'>канал</a> | Наша <a href='https://t.me/ToHSecrets_bot'>поддержка</a>🤍"
             )
-            # Обновляем дефолтный шаблон фарм-секретки с новым заголовком ❕Фарм-Секретка❕
             cursor.execute("""
                 INSERT INTO settings (key, value) VALUES ('template_farm', %s)
                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
@@ -320,12 +320,15 @@ def _init_db_sync():
             default_expired_template = (
                 "❕Секретка❕\n"
                 "Тип: [Тип_Секретки]\n\n"
-                "Секретка: Время вышло! В канале еще будут секретки и вы успеете попасть на них🤍\n\n"
+                "Время вышло! В канале еще будут секретки и вы успеете попасть на них🤍\n\n"
                 "🤍Наш <a href='https://t.me/SecretsToH'>чат</a> | "
                 "Наш <a href='https://t.me/ToHSecretss'>канал</a> | "
-                "Наша <a href='https://t.me/ToHSecrets_bot'>Поддержка</a>🤍"
+                "Наша <a href='https://t.me/ToHSecrets_bot'>поддержка</a>🤍"
             )
-            cursor.execute("INSERT INTO settings (key, value) VALUES ('template_expired', %s) ON CONFLICT (key) DO NOTHING", (default_expired_template,))
+            cursor.execute("""
+                INSERT INTO settings (key, value) VALUES ('template_expired', %s)
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+            """, (default_expired_template,))
 
     logging.info("База данных успешно инициализирована.")
 
@@ -707,7 +710,7 @@ async def expire_secret_post(bot: Bot, post_id: int, channel_id: str, message_id
                 cur.execute("UPDATE secret_posts SET is_expired = TRUE WHERE id = %s", (post_id,))
     await asyncio.to_thread(_mark)
 
-    expired_tmpl = await get_setting("template_expired", "❕Секретка❕\nСекретка: [Тип_Секретки]\n\nВремя вышло!")
+    expired_tmpl = await get_setting("template_expired", "❕Секретка❕\nТип: [Тип_Секретки]\n\nВремя вышло!")
     final_text = expired_tmpl.replace("[Тип_Секретки]", s_type)
     try:
         await bot.edit_message_caption(chat_id=channel_id, message_id=message_id, caption=final_text, parse_mode="HTML")
@@ -806,11 +809,11 @@ async def admin_panel_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📊 Статистика поддержки", callback_data="adm_stats"),
          InlineKeyboardButton(text="👥 Статистика хелперов", callback_data="adm_list_stats")],
-        [InlineKeyboardButton(text=f"👯‍♀ Добавление в друзья: {friend_status}", callback_data="toggle_friend")],
+        [InlineKeyboardButton(text=f"👯‍♀️ Добавление в друзья: {friend_status}", callback_data="toggle_friend")],
         [InlineKeyboardButton(text=f"📝 Набор в хелперы: {helper_status}", callback_data="toggle_helper")],
         [InlineKeyboardButton(text=f"🔍 Искатели секреток: {secret_status}", callback_data="toggle_secret")],
         [InlineKeyboardButton(text="👑 Главные админы поддержки", callback_data="manage_main_admins")],
-        [InlineKeyboardButton(text="✏ Ник для друзей", callback_data="change_friend_nick")],
+        [InlineKeyboardButton(text="✏️️ Ник для друзей", callback_data="change_friend_nick")],
         [InlineKeyboardButton(text="🔮 Управление Секретками (Панель)", callback_data="adm_secret_panel")]
     ])
 
@@ -877,7 +880,7 @@ def skip_photo_kb(target: str):
 def complaint_servers_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🌐 Сервер с секреткой", callback_data="cmp_srv_secret")],
-        [InlineKeyboardButton(text="🕵 Поиск саботера", callback_data="cmp_srv_saboteur")],
+        [InlineKeyboardButton(text="🕵️ Поиск саботера", callback_data="cmp_srv_saboteur")],
         [InlineKeyboardButton(text="🌾 Фарм сервер", callback_data="cmp_srv_farm")]
     ])
 
@@ -2007,7 +2010,7 @@ async def process_c_time(message: Message, state: FSMContext):
     await state.set_state(Form.complaint_photos)
     await message.answer(
         f"{NUM_5} {ICON_PHOTO} <b>Прикрепите доказательства (до 5 фото):</b>\n\n"
-        "⚠️️ <b>Важно:</b> фото строго запрещено обрезать! Плашка уровней и чат сервера должны быть отчётливо видны.",
+        "⚠️ <b>Важно:</b> фото строго запрещено обрезать! Плашка уровней и чат сервера должны быть отчётливо видны.",
         reply_markup=skip_photo_kb("complaint"),
         parse_mode="HTML"
     )
@@ -2132,7 +2135,7 @@ async def process_a_nickname(message: Message, state: FSMContext):
         confirm_text = f"Профиль найден: <a href='https://www.roblox.com/users/{rbx_id}/profile'><b>{official_name}</b></a> (ID: <code>{rbx_id}</code>)"
     else:
         official_name = nick_input
-        formatted_profile = f"<code>{html.escape(nick_input)}</code> (⚠️ <i>профиль не найден в Roblox</i>)"
+        formatted_profile = f"<code>{html.escape(nick_input)}</code> (⚠️️ <i>профиль не найден в Roblox</i>)"
         confirm_text = f"<code>{html.escape(nick_input)}</code> (⚠️ <i>профиль не найден в Roblox</i>)"
 
     await state.update_data(a_nickname=official_name, a_profile=formatted_profile)
@@ -2391,7 +2394,7 @@ async def take_ticket_handler(call: CallbackQuery):
         try:
             await bot.send_message(
                 ticket_info[0],
-                f"👨‍‍💻 <b>Агент #{agent_number}</b> взял вашу заявку <b>№{ticket_id}</b> в работу!\nТеперь вы можете писать сюда сообщения.",
+                f"👨‍💻 <b>Агент #{agent_number}</b> взял вашу заявку <b>№{ticket_id}</b> в работу!\nТеперь вы можете писать сюда сообщения.",
                 parse_mode="HTML"
             )
         except Exception:
@@ -2785,7 +2788,7 @@ async def cmd_news_broadcast(message: Message):
         f"{ICON_CHECK} <b>Рассылка завершена!</b>\n\n"
         f"✅ Успешно доставлено: <code>{success}</code>\n"
         f"🚫 Заблокировали бота: <code>{blocked}</code>\n"
-        f"⚠️ Ошибок отправки: <code>{errors}</code>\n"
+        f"⚠️️ Ошибок отправки: <code>{errors}</code>\n"
         f"👥 Всего в базе: <code>{len(users)}</code>",
         parse_mode="HTML"
     )
