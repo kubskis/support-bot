@@ -44,6 +44,7 @@ dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 
 creation_lock = asyncio.Lock()
+publish_lock = asyncio.Lock()
 processed_media_groups = set()
 
 # Кастомные TGP цифры
@@ -274,7 +275,6 @@ def _init_db_sync():
                     (OWNER_ID,)
                 )
 
-            # Очищаем все тестовые оценки от владельца, главных админов и зарегистрированных агентов
             cursor.execute("""
                 DELETE FROM ratings 
                 WHERE user_id IN (SELECT admin_id FROM main_admins)
@@ -494,7 +494,6 @@ async def get_tickets_stats():
                 closed = cur.fetchone()[0]
                 cur.execute("SELECT COUNT(*) FROM tickets WHERE status = 'rejected'")
                 rejected = cur.fetchone()[0]
-                # Считаем среднюю оценку только от обычных пользователей
                 cur.execute("""
                     SELECT COALESCE(AVG(score), 0) 
                     FROM ratings 
@@ -548,10 +547,6 @@ async def create_ticket(user_id: int, category: str = 'general', card_text: str 
     return await asyncio.to_thread(_query)
 
 async def touch_ticket(ticket_id: int, actor: str = 'user'):
-    """
-    Обновляет updated_at ТОЛЬКО если сменился автор последнего сообщения!
-    Если игрок досылает сообщения подряд — точка отсчёта ожидания хелпера НЕ сбрасывается.
-    """
     def _query():
         with get_db() as conn:
             with conn.cursor() as cur:
@@ -786,13 +781,18 @@ class Form(StatesGroup):
     question_content = State()
     set_friend_nick = State()
     
+    # Поддержка (4 шага)
+    helper_name = State()
     helper_age = State()
-    helper_timezone = State()
-    helper_experience = State()
+    helper_time = State()
+    helper_why = State()
 
+    # Искатель секреток (5 шагов)
+    secret_name = State()
     secret_age = State()
-    secret_experience = State()
-    secret_activity = State()
+    secret_vip = State()
+    secret_time = State()
+    secret_why = State()
 
     add_main_admin_id = State()
     del_main_admin_id = State()
@@ -1584,7 +1584,7 @@ async def sec_rmspec_proc(call: CallbackQuery):
     await call.answer()
 
 # ----------------------------------------------------------------------
-# ПУБЛИКАЦИЯ СЕКРЕТОК (ОБЫЧНЫЕ + ФАРМ)
+# ПУБЛИКАЦИЯ СЕКРЕТОК (ОБЫЧНЫЕ + ФАРМ) С ЗАЩИТОЙ ОТ ДАБЛ-КЛИКА
 # ----------------------------------------------------------------------
 @router.message(F.text == BTN_SECRETS, F.chat.type == "private")
 async def open_secrets_menu(message: Message, state: FSMContext):
@@ -1797,56 +1797,86 @@ async def pub_link(message: Message, state: FSMContext):
 @router.callback_query(SecretPublisherStates.waiting_for_confirm, F.data.startswith("pub_conf_"))
 async def pub_confirm(call: CallbackQuery, state: FSMContext):
     action = call.data.split("_")[2]
+    
     if action == "yes":
-        ch_id = await check_channel_rights(bot, call.from_user.id)
-        if not ch_id:
-            await call.message.edit_caption(caption=f"{ICON_CROSS} Ошибка: нет доступа к привязанному каналу!", reply_markup=None, parse_mode="HTML")
-            await state.clear()
-            await call.answer()
-            return
-        data = await state.get_data()
-        stype = data["secret_type"]
-        is_farm = data.get("is_farm", False)
-
-        if is_farm:
-            tmpl = await get_setting("template_farm")
-            final_txt = (
-                tmpl.replace("[Тип_Особенной_Секретки]", stype)
-                    .replace("[Ссылка]", data["link"])
-            )
-        else:
-            types_d = await get_secret_types_dict()
-            dec = types_d.get(stype, stype)
-            tmpl = await get_setting("template_active")
-            final_txt = (
-                tmpl.replace("[Тип_Секретки]", stype)
-                    .replace("[Склоненный_Тип]", dec)
-                    .replace("[Ссылка]", data["link"])
-            )
-
         try:
-            sent = await bot.send_photo(chat_id=ch_id, photo=data["photo_id"], caption=final_txt, parse_mode="HTML")
-            def _save():
-                with get_db() as conn:
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            "INSERT INTO secret_posts (user_id, channel_id, message_id, secret_type, base_text) "
-                            "VALUES (%s, %s, %s, %s, %s) RETURNING id",
-                            (call.from_user.id, ch_id, sent.message_id, stype, final_txt)
-                        )
-                        return cur.fetchone()[0]
-            await asyncio.to_thread(_save)
-            await call.message.edit_caption(caption=f"{ICON_CHECK} Пост успешно опубликован в канале!", reply_markup=None, parse_mode="HTML")
-        except Exception as e:
-            await call.message.edit_caption(caption=f"{ICON_CROSS} Ошибка публикации: {e}", reply_markup=None, parse_mode="HTML")
+            await call.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+        async with publish_lock:
+            data = await state.get_data()
+            if not data or "secret_type" not in data:
+                await call.answer()
+                return
+
+            ch_id = await check_channel_rights(bot, call.from_user.id)
+            if not ch_id:
+                try:
+                    await call.message.edit_caption(caption=f"{ICON_CROSS} Ошибка: нет доступа к привязанному каналу!", reply_markup=None, parse_mode="HTML")
+                except Exception:
+                    pass
+                await state.clear()
+                await call.answer()
+                return
+
+            stype = data["secret_type"]
+            is_farm = data.get("is_farm", False)
+
+            if is_farm:
+                tmpl = await get_setting("template_farm")
+                final_txt = (
+                    tmpl.replace("[Тип_Особенной_Секретки]", stype)
+                        .replace("[Ссылка]", data["link"])
+                )
+            else:
+                types_d = await get_secret_types_dict()
+                dec = types_d.get(stype, stype)
+                tmpl = await get_setting("template_active")
+                final_txt = (
+                    tmpl.replace("[Тип_Секретки]", stype)
+                        .replace("[Склоненный_Тип]", dec)
+                        .replace("[Ссылка]", data["link"])
+                )
+
+            try:
+                sent = await bot.send_photo(chat_id=ch_id, photo=data["photo_id"], caption=final_txt, parse_mode="HTML")
+                def _save():
+                    with get_db() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "INSERT INTO secret_posts (user_id, channel_id, message_id, secret_type, base_text) "
+                                "VALUES (%s, %s, %s, %s, %s) RETURNING id",
+                                (call.from_user.id, ch_id, sent.message_id, stype, final_txt)
+                            )
+                            return cur.fetchone()[0]
+                await asyncio.to_thread(_save)
+                
+                try:
+                    await call.message.edit_caption(caption=f"{ICON_CHECK} Пост успешно опубликован в канале!", reply_markup=None, parse_mode="HTML")
+                except TelegramBadRequest:
+                    pass
+            except Exception as e:
+                try:
+                    await call.message.edit_caption(caption=f"{ICON_CROSS} Ошибка публикации: {e}", reply_markup=None, parse_mode="HTML")
+                except TelegramBadRequest:
+                    pass
+            finally:
+                await state.clear()
     else:
-        await call.message.edit_caption(caption=f"{ICON_CROSS} Публикация отменена.", reply_markup=None, parse_mode="HTML")
-    await state.clear()
+        try:
+            await call.message.edit_caption(caption=f"{ICON_CROSS} Публикация отменена.", reply_markup=None, parse_mode="HTML")
+        except TelegramBadRequest:
+            pass
+        await state.clear()
+
     await call.answer()
 
 # ----------------------------------------------------------------------
-# СИСТЕМА НАБОРА В ХЕЛПЕРЫ И ИСКАТЕЛИ СЕКРЕТОВ
+# СИСТЕМА НАБОРА В ХЕЛПЕРЫ И ИСКАТЕЛИ СЕКРЕТОВ (ОБНОВЛЕННЫЕ ШАБЛОНЫ + ПРОВЕРКА ЮЗЕРНЕЙМА)
 # ----------------------------------------------------------------------
+
+# --- НАБОР В ХЕЛПЕРЫ (ПОДДЕРЖКА) ---
 @router.message(F.text == BTN_HELPER_APPLY, F.chat.type == "private")
 async def start_helper_apply(message: Message, state: FSMContext):
     await register_user(message.from_user.id)
@@ -1855,35 +1885,54 @@ async def start_helper_apply(message: Message, state: FSMContext):
         await message.answer(f"{ICON_WARN} Набор в команду поддержки в данный момент закрыт.", parse_mode="HTML")
         return
     await state.clear()
+    await state.set_state(Form.helper_name)
+    await message.answer(f"<tg-emoji emoji-id='5346192285799302524'>🔥</tg-emoji> <b>Заявка в команду поддержки (Хелперы)</b>\n\n{NUM_1} Ваше имя:", parse_mode="HTML")
+
+@router.message(Form.helper_name)
+async def process_helper_name(message: Message, state: FSMContext):
+    await state.update_data(helper_name=message.text.strip())
     await state.set_state(Form.helper_age)
-    await message.answer(f"<tg-emoji emoji-id='5346192285799302524'>🔥</tg-emoji> <b>Заявка в команду поддержки (Хелперы)</b>\n\n{NUM_1} Укажите ваш возраст:", parse_mode="HTML")
+    await message.answer(f"{NUM_2} Ваш возраст:", parse_mode="HTML")
 
 @router.message(Form.helper_age)
 async def process_helper_age(message: Message, state: FSMContext):
-    await state.update_data(helper_age=message.text)
-    await state.set_state(Form.helper_timezone)
-    await message.answer(f"{NUM_2} Укажите ваш часовой пояс (например, МСК, +2 от МСК):", parse_mode="HTML")
+    await state.update_data(helper_age=message.text.strip())
+    await state.set_state(Form.helper_time)
+    await message.answer(f"{NUM_3} Сколько времени вы готовы уделять на ответы в поддержке?", parse_mode="HTML")
 
-@router.message(Form.helper_timezone)
-async def process_helper_timezone(message: Message, state: FSMContext):
-    await state.update_data(helper_timezone=message.text)
-    await state.set_state(Form.helper_experience)
-    await message.answer(f"{NUM_3} Был ли у вас опыт работы в поддержке или на аналогичных проектах? Опишите кратко:", parse_mode="HTML")
+@router.message(Form.helper_time)
+async def process_helper_time(message: Message, state: FSMContext):
+    await state.update_data(helper_time=message.text.strip())
+    await state.set_state(Form.helper_why)
+    await message.answer(f"{NUM_4} Почему вы хотите именно к нам?", parse_mode="HTML")
 
-@router.message(Form.helper_experience)
-async def process_helper_experience(message: Message, state: FSMContext):
+@router.message(Form.helper_why)
+async def process_helper_why(message: Message, state: FSMContext):
+    # Проверка наличия юзернейма
+    if not message.from_user.username:
+        await message.answer(
+            f"{ICON_WARN} <b>У вас не установлен @username в профиле Telegram!</b>\n\n"
+            "Для отправки анкеты и связи с администрацией обязательно иметь юзернейм.\n"
+            "Пожалуйста, установите его в настройках Telegram (Настройки ➔ Изменить профиль ➔ Имя пользователя) "
+            "и затем <b>отправьте ответ на 4-й пункт ещё раз</b>.",
+            parse_mode="HTML"
+        )
+        return
+
+    why_text = message.text.strip()
     data = await state.get_data()
     user = message.from_user
     user_mention = get_user_mention(user)
 
     admin_text = (
-        f"📝 <b>Новая заявка на хелпера!</b>\n\n"
+        f"📝 <b>Новая заявка в команду поддержки (Хелперы)!</b>\n\n"
         f"👤 От: {user_mention}\n"
         f"🆔 ID: <code>{user.id}</code>\n"
-        f"👤 Username: @{user.username if user.username else 'отсутствует'}\n\n"
-        f"👶 <b>Возраст:</b> {html.escape(data.get('helper_age', 'Не указан'))}\n"
-        f"🌍 <b>Часовой пояс:</b> {html.escape(data.get('helper_timezone', 'Не указан'))}\n"
-        f"💼 <b>Опыт:</b> {html.escape(message.text or '')}"
+        f"👤 Username: @{user.username}\n\n"
+        f"1. <b>Имя:</b> {html.escape(data.get('helper_name', 'Не указано'))}\n"
+        f"2. <b>Возраст:</b> {html.escape(data.get('helper_age', 'Не указан'))}\n"
+        f"3. <b>Время на поддержку:</b> {html.escape(data.get('helper_time', 'Не указано'))}\n"
+        f"4. <b>Почему к нам:</b> {html.escape(why_text)}"
     )
 
     sent = await bot.send_message(ADMIN_CHAT_ID, admin_text, reply_markup=helper_decision_kb(user.id), parse_mode="HTML")
@@ -1900,7 +1949,7 @@ async def helper_accept_callback(call: CallbackQuery):
         return
     user_id = int(call.data.split("_")[2])
     try:
-        await bot.send_message(user_id, "<tg-emoji emoji-id='5346038654819123712'>🔥</tg-emoji> <b>Поздравляем! Ваша заявка на хелпера принята!</b> Админы свяжутся с вами в ближайшее время.", parse_mode="HTML")
+        await bot.send_message(user_id, "<tg-emoji emoji-id='5346038654819123712'>🔥</tg-emoji> <b>Поздравляем! Ваша заявка на хелпера принята!</b> Администрация свяжется с вами в ближайшее время.", parse_mode="HTML")
     except Exception:
         pass
     await call.message.edit_text(call.message.text + "\n\n🟢 <b>Статус:</b> Одобрено ✅", parse_mode="HTML")
@@ -1919,6 +1968,7 @@ async def helper_reject_callback(call: CallbackQuery):
     await call.message.edit_text(call.message.text + "\n\n🔴 <b>Статус:</b> Отклонено ❌", parse_mode="HTML")
     await call.answer("Заявка отклонена!")
 
+# --- НАБОР В ИСКАТЕЛИ СЕКРЕТОК ---
 @router.message(F.text == BTN_SECRET_APPLY, F.chat.type == "private")
 async def start_secret_apply(message: Message, state: FSMContext):
     await register_user(message.from_user.id)
@@ -1927,23 +1977,47 @@ async def start_secret_apply(message: Message, state: FSMContext):
         await message.answer(f"{ICON_WARN} Набор в искатели секреток в данный момент закрыт.", parse_mode="HTML")
         return
     await state.clear()
+    await state.set_state(Form.secret_name)
+    await message.answer(f"<tg-emoji emoji-id='5345840270279724328'>🔥</tg-emoji> <b>Заявка в искатели секреток</b>\n\n{NUM_1} Ваше имя:", parse_mode="HTML")
+
+@router.message(Form.secret_name)
+async def process_secret_name(message: Message, state: FSMContext):
+    await state.update_data(secret_name=message.text.strip())
     await state.set_state(Form.secret_age)
-    await message.answer(f"<tg-emoji emoji-id='5345840270279724328'>🔥</tg-emoji> <b>Заявка в искатели секреток</b>\n\n{NUM_1} Укажите ваш возраст:", parse_mode="HTML")
+    await message.answer(f"{NUM_2} Ваш возраст:", parse_mode="HTML")
 
 @router.message(Form.secret_age)
 async def process_secret_age(message: Message, state: FSMContext):
-    await state.update_data(secret_age=message.text)
-    await state.set_state(Form.secret_experience)
-    await message.answer(f"{NUM_2} Есть ли у вас опыт поиска секретов/пасхалок? Расскажите о своих успехах:", parse_mode="HTML")
+    await state.update_data(secret_age=message.text.strip())
+    await state.set_state(Form.secret_vip)
+    await message.answer(f"{NUM_3} Есть ли у вас вип сервер в Tower Of Hell?", parse_mode="HTML")
 
-@router.message(Form.secret_experience)
-async def process_secret_experience(message: Message, state: FSMContext):
-    await state.update_data(secret_experience=message.text)
-    await state.set_state(Form.secret_activity)
-    await message.answer(f"{NUM_3} Сколько времени вы готовы уделять игре и проекту ежедневно?", parse_mode="HTML")
+@router.message(Form.secret_vip)
+async def process_secret_vip(message: Message, state: FSMContext):
+    await state.update_data(secret_vip=message.text.strip())
+    await state.set_state(Form.secret_time)
+    await message.answer(f"{NUM_4} Сколько вы готовы уделять времени поиску секреток?", parse_mode="HTML")
 
-@router.message(Form.secret_activity)
-async def process_secret_activity(message: Message, state: FSMContext):
+@router.message(Form.secret_time)
+async def process_secret_time(message: Message, state: FSMContext):
+    await state.update_data(secret_time=message.text.strip())
+    await state.set_state(Form.secret_why)
+    await message.answer(f"{NUM_5} Почему вы хотите именно к нам?", parse_mode="HTML")
+
+@router.message(Form.secret_why)
+async def process_secret_why(message: Message, state: FSMContext):
+    # Проверка наличия юзернейма
+    if not message.from_user.username:
+        await message.answer(
+            f"{ICON_WARN} <b>У вас не установлен @username в профиле Telegram!</b>\n\n"
+            "Для отправки анкеты и связи с администрацией обязательно иметь юзернейм.\n"
+            "Пожалуйста, установите его в настройках Telegram (Настройки ➔ Изменить профиль ➔ Имя пользователя) "
+            "и затем <b>отправьте ответ на 5-й пункт ещё раз</b>.",
+            parse_mode="HTML"
+        )
+        return
+
+    why_text = message.text.strip()
     data = await state.get_data()
     user = message.from_user
     user_mention = get_user_mention(user)
@@ -1952,10 +2026,12 @@ async def process_secret_activity(message: Message, state: FSMContext):
         f"🔍 <b>Новая заявка в искатели секреток!</b>\n\n"
         f"👤 От: {user_mention}\n"
         f"🆔 ID: <code>{user.id}</code>\n"
-        f"👤 Username: @{user.username if user.username else 'отсутствует'}\n\n"
-        f"👶 <b>Возраст:</b> {html.escape(data.get('secret_age', 'Не указан'))}\n"
-        f"💼 <b>Опыт:</b> {html.escape(data.get('secret_experience', 'Не указан'))}\n"
-        f"⏱ <b>Онлайн:</b> {html.escape(message.text or '')}"
+        f"👤 Username: @{user.username}\n\n"
+        f"1. <b>Имя:</b> {html.escape(data.get('secret_name', 'Не указано'))}\n"
+        f"2. <b>Возраст:</b> {html.escape(data.get('secret_age', 'Не указан'))}\n"
+        f"3. <b>VIP сервер в ToH:</b> {html.escape(data.get('secret_vip', 'Не указано'))}\n"
+        f"4. <b>Время на поиск:</b> {html.escape(data.get('secret_time', 'Не указано'))}\n"
+        f"5. <b>Почему к нам:</b> {html.escape(why_text)}"
     )
 
     sent = await bot.send_message(ADMIN_CHAT_ID, admin_text, reply_markup=secret_decision_kb(user.id), parse_mode="HTML")
@@ -1972,7 +2048,7 @@ async def secret_accept_callback(call: CallbackQuery):
         return
     user_id = int(call.data.split("_")[2])
     try:
-        await bot.send_message(user_id, "<tg-emoji emoji-id='5346038654819123712'>🔥</tg-emoji> <b>Поздравляем! Ваша заявка в искатели секреток принята!</b>", parse_mode="HTML")
+        await bot.send_message(user_id, "<tg-emoji emoji-id='5346038654819123712'>🔥</tg-emoji> <b>Поздравляем! Ваша заявка в искатели секреток принята!</b> Администрация свяжется с вами в ближайшее время.", parse_mode="HTML")
     except Exception:
         pass
     await call.message.edit_text(call.message.text + "\n\n🟢 <b>Статус:</b> Одобрено ✅", parse_mode="HTML")
@@ -2180,8 +2256,8 @@ async def process_c_photo(message: Message, state: FSMContext):
             text = (
                 f"Нарушитель(и): {nicks_formatted}\n"
                 f"Суть нарушения: {html.escape(cur_data.get('c_reason', ''))}\n"
-                f"Где произошло нарушение: {html.escape(cur_data.get('c_place', ''))}\n"
-                f"Время публикации поста: {html.escape(cur_data.get('c_time', ''))}"
+                f"Где произошло нарушение: {html.escape(data.get('c_place', ''))}\n"
+                f"Время публикации поста: {html.escape(data.get('c_time', ''))}"
             )
             ticket_id = await dispatch_ticket_to_admin(message.from_user.id, message.from_user, "complaint", text, photos)
             await state.clear()
@@ -2344,8 +2420,8 @@ async def process_a_photo(message: Message, state: FSMContext):
             text = (
                 f"Ник: {profile_str}\n"
                 f"Сервер бана: {html.escape(cur_data.get('a_place', ''))}\n"
-                f"Время публикации поста: {html.escape(cur_data.get('a_time', ''))}\n"
-                f"Причина разбана: {html.escape(cur_data.get('a_reason', ''))}"
+                f"Время публикации поста: {html.escape(data.get('a_time', ''))}\n"
+                f"Причина разбана: {html.escape(data.get('a_reason', ''))}"
             )
             ticket_id = await dispatch_ticket_to_admin(message.from_user.id, message.from_user, "appeal", text, photos)
             await state.clear()
@@ -2617,7 +2693,6 @@ async def process_rating(call: CallbackQuery):
     user_is_staff = await is_support_member(user_id) or await is_main_admin(user_id)
 
     if user_is_staff:
-        # Полностью блокируем запись в базу, чтобы рейтинг никогда не портился!
         await call.message.edit_text(f"{ICON_STAR} [СТАФФ] Вы являетесь администратором/хелпером. Оценка не учитывается в статистике.", parse_mode="HTML")
     else:
         await save_rating_db(ticket_id, user_id, admin_id, score)
@@ -2712,7 +2787,6 @@ async def cmd_my_stats(message: Message):
                 cur.execute("SELECT COUNT(*) FROM tickets WHERE admin_id = %s AND status = 'closed'", (admin_id,))
                 closed_count = cur.fetchone()[0]
 
-                # Считаем среднюю оценку только от реальных пользователей (исключаем стафф)
                 cur.execute("""
                     SELECT COALESCE(AVG(score), 0) 
                     FROM ratings 
@@ -2943,7 +3017,7 @@ async def cmd_news_broadcast(message: Message):
         f"{ICON_CHECK} <b>Рассылка завершена!</b>\n\n"
         f"✅ Успешно доставлено: <code>{success}</code>\n"
         f"🚫 Заблокировали бота: <code>{blocked}</code>\n"
-        f"⚠️️ Ошибок отправки: <code>{errors}</code>\n"
+        f"⚠ Ошибок отправки: <code>{errors}</code>\n"
         f"👥 Всего в базе: <code>{len(users)}</code>",
         parse_mode="HTML"
     )
@@ -3202,7 +3276,6 @@ async def reminder_worker():
             def _check():
                 with get_db() as conn:
                     with conn.cursor() as cur:
-                        # Тикеты, которые ждут взятия более 2 часов с момента создания ИЛИ предыдущего напоминания
                         cur.execute("""
                             SELECT ticket_id, category, user_id, 
                                    EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - created_at))/3600 as hours_total
@@ -3212,9 +3285,6 @@ async def reminder_worker():
                         """)
                         unassigned = cur.fetchall()
 
-                        # Тикеты в работе:
-                        # 1. Первое напоминание через 20 минут тишины от последнего ответа другой стороны (reminded_idle = FALSE)
-                        # 2. Последующие напоминания каждый 1 час после предыдущего напоминания (reminded_idle = TRUE)
                         cur.execute("""
                             SELECT t.ticket_id, t.admin_id, t.user_id,
                                    EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - t.updated_at))/60 as mins_passed,
@@ -3230,7 +3300,6 @@ async def reminder_worker():
                         """)
                         idle = cur.fetchall()
 
-                        # Автозакрытие: активный тикет без ответа пользователя 24 часа после сообщения админа
                         cur.execute("""
                             SELECT ticket_id, user_id, admin_id, card_text
                             FROM tickets
@@ -3244,7 +3313,6 @@ async def reminder_worker():
 
             unassigned_tickets, idle_tickets, expired_active = await asyncio.to_thread(_check)
 
-            # Напоминание по неразобранным тикетам каждые 2 часа
             for t_id, cat, u_id, hrs in unassigned_tickets:
                 hours_str = f"{int(hrs)} ч." if hrs else "2+ ч."
                 alert_text = (
@@ -3264,10 +3332,8 @@ async def reminder_worker():
                 except Exception as e:
                     logging.error(f"Ошибка отправки напоминания о заявке №{t_id}: {e}")
 
-            # Напоминание о простое тикета: через 20 минут, затем каждый 1 час
             for t_id, adm_id, u_id, mins, agent_no, last_act, was_reminded in idle_tickets:
                 if last_act == 'admin':
-                    # Админ ждёт ответа игрока -> пишем игроку в ЛС
                     client_alert = (
                         f"⏳ <b>Напоминание по заявке №{t_id}</b>\n\n"
                         "Поддержка ожидает вашего ответа. Если вопрос ещё актуален, пожалуйста, отправьте сообщение в этот чат.\n"
@@ -3287,7 +3353,6 @@ async def reminder_worker():
                     except Exception as e:
                         logging.error(f"Ошибка отправки напоминания пользователю по тикету №{t_id}: {e}")
                 else:
-                    # Игрок ждёт ответа админа -> пишем в чат поддержки с тегом хелпера
                     agent_str = f"Агент #{agent_no}" if agent_no else f"ID {adm_id}"
                     admin_mention = agent_str
                     try:
@@ -3318,7 +3383,6 @@ async def reminder_worker():
                     except Exception as e:
                         logging.error(f"Ошибка отправки напоминания хелперу по тикету №{t_id}: {e}")
 
-            # Автозакрытие через 24 часа
             for t_id, u_id, adm_id, c_txt in expired_active:
                 try:
                     await close_ticket_db(t_id, status='closed', admin_id=adm_id)
