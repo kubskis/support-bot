@@ -290,7 +290,8 @@ def _init_db_sync():
                 ("Лапка", "лапки"),
                 ("Сердечко", "сердечка"),
                 ("Тропы", "троп"),
-                ("Телевизор", "троп")
+                ("Телевизор", "троп"),
+                ("Сейф", "пружинку")
             ]
             for s_name, s_dec in default_types:
                 cursor.execute("""
@@ -356,16 +357,16 @@ _init_db_sync()
 async def setup_bot_commands(bot: Bot):
     """Регистрирует подсказки команд в Telegram для ЛС и всех групп"""
     try:
-        # Для ЛС
         default_commands = [
             BotCommand(command="start", description="🔄 Главное меню поддержки"),
         ]
         await bot.set_my_commands(default_commands, scope=BotCommandScopeAllPrivateChats())
 
-        # Для групп (админ-чат поддержки)
         admin_commands = [
-            BotCommand(command="mystats", description="📊 Личная статистика агента"),
-            BotCommand(command="secstats", description="🔮 Статистика публикатора секреток"),
+            BotCommand(command="mystats", description="📊 Моя статистика агента"),
+            BotCommand(command="secstats", description="🔮 Моя статистика публикатора"),
+            BotCommand(command="supptop", description="🏆 Топ агентов поддержки (Гл. Админ)"),
+            BotCommand(command="sectop", description="🏆 Топ искателей за всё время (Гл. Админ)"),
             BotCommand(command="opentickets", description="📋 Неразобранные тикеты (Гл. Админ)"),
             BotCommand(command="note", description="📌 Добавить заметку игроку (Reply)"),
             BotCommand(command="deletenote", description="🗑 Удалить заметку игрока (Гл. Админ)"),
@@ -967,7 +968,7 @@ def complaint_servers_kb():
 def appeal_servers_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🌐 Сервер с секреткой", callback_data="app_srv_secret")],
-        [InlineKeyboardButton(text="🕵️ Поиск саботера", callback_data="app_srv_saboteur")],
+        [InlineKeyboardButton(text="🕵️️ Поиск саботера", callback_data="app_srv_saboteur")],
         [InlineKeyboardButton(text="🌾 Фарм сервер", callback_data="app_srv_farm")]
     ])
 
@@ -1459,7 +1460,7 @@ async def sec_templates(call: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✏️ Обычный активный пост", callback_data="sec_tmpl_act")],
         [InlineKeyboardButton(text="🌾 Шаблон фарм-секретки", callback_data="sec_tmpl_farm")],
-        [InlineKeyboardButton(text="✏️️ Истекший пост", callback_data="sec_tmpl_exp")],
+        [InlineKeyboardButton(text="✏ Истекший пост", callback_data="sec_tmpl_exp")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="adm_secret_panel")]
     ])
     await call.message.edit_text(f"{ICON_PENCIL} <b>Редактирование шаблонов:</b>\n\nВыберите нужный шаблон:", reply_markup=kb, parse_mode="HTML")
@@ -2094,615 +2095,6 @@ async def secret_reject_callback(call: CallbackQuery):
     await call.answer("Заявка отклонена!")
 
 # ----------------------------------------------------------------------
-# СОЗДАНИЕ ТИКЕТОВ С МЕДИА-БУФЕРОМ (ДО 5 ФОТО)
-# ----------------------------------------------------------------------
-async def check_active_ticket(message: Message) -> bool:
-    active = await get_active_ticket(message.from_user.id)
-    if active:
-        await message.answer(
-            f"{ICON_WARN} У вас уже есть активный тикет <b>№{active[0]}</b>.\nДождитесь ответа или закройте его, прежде чем открывать новый.",
-            parse_mode="HTML"
-        )
-        return True
-    return False
-
-async def collect_media_photos(message: Message, state: FSMContext, key: str = "photos") -> list:
-    data = await state.get_data()
-    photos = data.get(key, [])
-    if message.photo:
-        photos.append(message.photo[-1].file_id)
-        await state.update_data({key: photos})
-    return photos
-
-# --- 1. ЖАЛОБА ---
-@router.message(F.text == BTN_COMPLAINT, F.chat.type == "private")
-async def start_complaint(message: Message, state: FSMContext):
-    await register_user(message.from_user.id)
-    if await is_banned(message.from_user.id) or await check_active_ticket(message): return
-    await state.clear()
-    await state.set_state(Form.complaint_nicknames)
-    await state.update_data(nicks_list=[], roblox_profiles=[])
-    await message.answer(
-        f"{NUM_1} <b>Укажите ник нарушителя:</b>\n"
-        "<i>(Напишите точный игровой никнейм в Roblox)</i>",
-        parse_mode="HTML"
-    )
-
-@router.message(Form.complaint_nicknames, F.text)
-async def process_c_nicknames(message: Message, state: FSMContext):
-    new_nick = message.text.strip()
-    data = await state.get_data()
-    nicks = data.get("nicks_list", [])
-    profiles = data.get("roblox_profiles", [])
-    
-    rbx_info = await check_roblox_username(new_nick)
-    if rbx_info:
-        official_name = rbx_info["name"]
-        rbx_id = rbx_info["id"]
-        nicks.append(official_name)
-        profiles.append(f"<a href='https://www.roblox.com/users/{rbx_id}/profile'>{official_name}</a> (ID: <code>{rbx_id}</code>)")
-        verified_text = f"Профиль найден: <a href='https://www.roblox.com/users/{rbx_id}/profile'><b>{official_name}</b></a> (ID: <code>{rbx_id}</code>)"
-    else:
-        nicks.append(new_nick)
-        profiles.append(f"<code>{html.escape(new_nick)}</code> (⚠️ <i>не найден в Roblox</i>)")
-        verified_text = f"<code>{html.escape(new_nick)}</code> (⚠️ <i>профиль не найден в Roblox</i>)"
-
-    await state.update_data(nicks_list=nicks, roblox_profiles=profiles)
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="➡️ Продолжить (перейти к сути)", callback_data="c_nicks_done")
-    ]])
-
-    await message.answer(
-        f"{ICON_CHECK} Добавлен нарушитель: {verified_text}\n\n"
-        f"👤 Всего нарушителей в списке: <b>{len(nicks)}</b>\n\n"
-        "<i>Если нарушителей несколько — отправьте следующий ник сообщением. "
-        "Если нарушитель только один (или вы ввели всех) — нажмите кнопку ниже:</i>",
-        reply_markup=kb,
-        parse_mode="HTML",
-        link_preview_options=LinkPreviewOptions(is_disabled=True)
-    )
-
-@router.callback_query(F.data == "c_nicks_done", Form.complaint_nicknames)
-async def process_c_nicks_done(call: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    nicks = data.get("nicks_list", [])
-    if not nicks:
-        await call.answer("Сначала введите хотя бы один ник!", show_alert=True)
-        return
-    await state.set_state(Form.complaint_reason)
-    await call.message.edit_text(
-        f"{NUM_2} <b>Опишите суть нарушения:</b>\n"
-        "<i>(Что именно произошло: ускорение таймера, негативные мутаторы, срыв игры и т.д.)</i>",
-        parse_mode="HTML"
-    )
-    await call.answer()
-
-@router.message(Form.complaint_reason, F.text)
-async def process_c_reason(message: Message, state: FSMContext):
-    await state.update_data(c_reason=message.text.strip())
-    await state.set_state(Form.complaint_place)
-    await message.answer(
-        f"{NUM_3} <b>Где произошло нарушение?</b>\n"
-        "<i>Выберите нужный вариант на кнопках ниже:</i>",
-        reply_markup=complaint_servers_kb(),
-        parse_mode="HTML"
-    )
-
-@router.callback_query(F.data.startswith("cmp_srv_"), Form.complaint_place)
-async def process_c_server_choice(call: CallbackQuery, state: FSMContext):
-    srv_types = {
-        "cmp_srv_secret": "Сервер с секреткой",
-        "cmp_srv_saboteur": "Поиск саботера",
-        "cmp_srv_farm": "Фарм сервер"
-    }
-    chosen_server = srv_types.get(call.data, "Не указан")
-    await state.update_data(c_place=chosen_server)
-    await state.set_state(Form.complaint_time)
-    await call.message.edit_text(
-        f"Выбран сервер: <b>{chosen_server}</b>\n\n"
-        f"{NUM_4} {ICON_TIMER} <b>Укажите время публикации поста:</b>\n"
-        "<i>(Укажите примерное или точное время публикации поста по МСК, например: <code>18:45</code> или <code>18:45:20 28.09</code>)</i>",
-        parse_mode="HTML"
-    )
-    await call.answer()
-
-@router.message(Form.complaint_time, F.text)
-async def process_c_time(message: Message, state: FSMContext):
-    await state.update_data(c_time=message.text.strip())
-    await state.set_state(Form.complaint_photos)
-    await message.answer(
-        f"{NUM_5} {ICON_PHOTO} <b>Прикрепите доказательства (до 5 фото):</b>\n\n"
-        "⚠️ <b>Важно:</b> фото строго запрещено обрезать! Плашка уровней и чат сервера должны быть отчётливо видны.",
-        reply_markup=skip_photo_kb("complaint"),
-        parse_mode="HTML"
-    )
-
-@router.callback_query(F.data == "skip_photo_complaint", Form.complaint_photos)
-async def skip_c_photos(call: CallbackQuery, state: FSMContext):
-    async with creation_lock:
-        if await check_active_ticket(call.message):
-            await state.clear()
-            await call.answer()
-            return
-        data = await state.get_data()
-        profiles_list = data.get("roblox_profiles", [])
-        if profiles_list:
-            nicks_formatted = ", ".join(profiles_list)
-        else:
-            nicks_formatted = ", ".join([f"<code>{html.escape(n)}</code>" for n in data.get("nicks_list", [])])
-
-        text = (
-            f"Нарушитель(и): {nicks_formatted}\n"
-            f"Суть нарушения: {html.escape(data.get('c_reason', ''))}\n"
-            f"Где произошло нарушение: {html.escape(data.get('c_place', ''))}\n"
-            f"Время публикации поста: {html.escape(data.get('c_time', ''))}"
-        )
-        ticket_id = await dispatch_ticket_to_admin(call.from_user.id, call.from_user, "complaint", text, [])
-        night_txt = get_night_notice()
-        await call.message.edit_text(f"{ICON_CHECK} Жалоба №{ticket_id} отправлена!{night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
-        await state.clear()
-        await call.answer()
-
-@router.message(Form.complaint_photos, F.photo)
-async def process_c_photo(message: Message, state: FSMContext):
-    if await check_active_ticket(message):
-        await state.clear()
-        return
-
-    photos = await collect_media_photos(message, state, "c_photos")
-    if len(photos) > 5:
-        await message.answer(f"{ICON_CROSS} Лимит превышен! Прикрепите не более 5 фото.", parse_mode="HTML")
-        await state.clear()
-        return
-
-    mg_id = message.media_group_id
-    if mg_id:
-        await asyncio.sleep(1.2)
-        async with creation_lock:
-            if mg_id in processed_media_groups:
-                return
-            processed_media_groups.add(mg_id)
-            if len(processed_media_groups) > 500:
-                processed_media_groups.clear()
-
-            cur_data = await state.get_data()
-            photos = cur_data.get("c_photos", photos)
-
-            if await check_active_ticket(message):
-                await state.clear()
-                return
-
-            profiles_list = cur_data.get("roblox_profiles", [])
-            if profiles_list:
-                nicks_formatted = ", ".join(profiles_list)
-            else:
-                nicks_formatted = ", ".join([f"<code>{html.escape(n)}</code>" for n in cur_data.get("nicks_list", [])])
-
-            text = (
-                f"Нарушитель(и): {nicks_formatted}\n"
-                f"Суть нарушения: {html.escape(cur_data.get('c_reason', ''))}\n"
-                f"Где произошло нарушение: {html.escape(data.get('c_place', ''))}\n"
-                f"Время публикации поста: {html.escape(data.get('c_time', ''))}"
-            )
-            ticket_id = await dispatch_ticket_to_admin(message.from_user.id, message.from_user, "complaint", text, photos)
-            await state.clear()
-            night_txt = get_night_notice()
-            await message.answer(f"{ICON_CHECK} Жалоба №{ticket_id} отправлена! (Прикреплено фото: {len(photos)}){night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
-            return
-
-    async with creation_lock:
-        if await check_active_ticket(message):
-            await state.clear()
-            return
-        data = await state.get_data()
-        profiles_list = data.get("roblox_profiles", [])
-        if profiles_list:
-            nicks_formatted = ", ".join(profiles_list)
-        else:
-            nicks_formatted = ", ".join([f"<code>{html.escape(n)}</code>" for n in data.get("nicks_list", [])])
-
-        text = (
-            f"Нарушитель(и): {nicks_formatted}\n"
-            f"Суть нарушения: {html.escape(data.get('c_reason', ''))}\n"
-            f"Где произошло нарушение: {html.escape(data.get('c_place', ''))}\n"
-            f"Время публикации поста: {html.escape(data.get('c_time', ''))}"
-        )
-        ticket_id = await dispatch_ticket_to_admin(message.from_user.id, message.from_user, "complaint", text, photos)
-        await state.clear()
-        night_txt = get_night_notice()
-        await message.answer(f"{ICON_CHECK} Жалоба №{ticket_id} отправлена! (Прикреплено фото: {len(photos)}){night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
-
-# --- 2. ОБЖАЛОВАНИЕ (С ПРОВЕРКОЙ ROBLOX) ---
-@router.message(F.text == BTN_APPEAL, F.chat.type == "private")
-async def start_appeal(message: Message, state: FSMContext):
-    await register_user(message.from_user.id)
-    if await is_banned(message.from_user.id) or await check_active_ticket(message): return
-    await state.clear()
-    await state.set_state(Form.appeal_nickname)
-    await message.answer(
-        f"{NUM_1} <b>Ваш ник в игре:</b>\n"
-        "<i>(Укажите ваш точный никнейм в Roblox, на который был выдан бан)</i>",
-        parse_mode="HTML"
-    )
-
-@router.message(Form.appeal_nickname, F.text)
-async def process_a_nickname(message: Message, state: FSMContext):
-    nick_input = message.text.strip()
-    rbx_info = await check_roblox_username(nick_input)
-    
-    if rbx_info:
-        official_name = rbx_info["name"]
-        rbx_id = rbx_info["id"]
-        formatted_profile = f"<a href='https://www.roblox.com/users/{rbx_id}/profile'>{official_name}</a> (ID: <code>{rbx_id}</code>)"
-        confirm_text = f"Профиль найден: <a href='https://www.roblox.com/users/{rbx_id}/profile'><b>{official_name}</b></a> (ID: <code>{rbx_id}</code>)"
-    else:
-        official_name = nick_input
-        formatted_profile = f"<code>{html.escape(nick_input)}</code> (⚠️ <i>профиль не найден в Roblox</i>)"
-        confirm_text = f"<code>{html.escape(nick_input)}</code> (⚠️ <i>профиль не найден в Roblox</i>)"
-
-    await state.update_data(a_nickname=official_name, a_profile=formatted_profile)
-    await state.set_state(Form.appeal_place)
-    
-    await message.answer(
-        f"{ICON_CHECK} Ник зафиксирован: {confirm_text}\n\n"
-        f"{NUM_2} <b>На каком сервере произошла блокировка?</b>\n"
-        "<i>Выберите нужный вариант на кнопках ниже:</i>",
-        reply_markup=appeal_servers_kb(),
-        parse_mode="HTML",
-        link_preview_options=LinkPreviewOptions(is_disabled=True)
-    )
-
-@router.callback_query(F.data.startswith("app_srv_"), Form.appeal_place)
-async def process_a_server_choice(call: CallbackQuery, state: FSMContext):
-    srv_types = {
-        "app_srv_secret": "Сервер с секреткой",
-        "app_srv_saboteur": "Поиск саботера",
-        "app_srv_farm": "Фарм сервер"
-    }
-    chosen_server = srv_types.get(call.data, "Не указан")
-    await state.update_data(a_place=chosen_server)
-    await state.set_state(Form.appeal_time)
-    await call.message.edit_text(
-        f"Выбран сервер: <b>{chosen_server}</b>\n\n"
-        f"{NUM_3} {ICON_TIMER} <b>Укажите время публикации поста:</b>\n"
-        "<i>(Укажите примерное или точное время публикации поста по МСК, например: <code>18:45</code> или <code>18:45:20 28.09</code>)</i>",
-        parse_mode="HTML"
-    )
-    await call.answer()
-
-@router.message(Form.appeal_time, F.text)
-async def process_a_time(message: Message, state: FSMContext):
-    await state.update_data(a_time=message.text.strip())
-    await state.set_state(Form.appeal_reason)
-    await message.answer(
-        f"{NUM_4} <b>Почему мы должны снять с вас бан?</b>\n"
-        "<i>(Подробно опишите вашу ситуацию и почему вы считаете блокировку ошибочной)</i>",
-        parse_mode="HTML"
-    )
-
-@router.message(Form.appeal_reason, F.text)
-async def process_a_reason(message: Message, state: FSMContext):
-    await state.update_data(a_reason=message.text.strip())
-    await state.set_state(Form.appeal_photos)
-    await message.answer(
-        f"{NUM_5} {ICON_PHOTO} <b>Прикрепите доказательства или скриншоты (до 5 фото):</b>\n"
-        "<i>(Если у вас есть доказательства невиновности — отправьте скриншоты, либо нажмите кнопку ниже)</i>",
-        reply_markup=skip_photo_kb("appeal"),
-        parse_mode="HTML"
-    )
-
-@router.callback_query(F.data == "skip_photo_appeal", Form.appeal_photos)
-async def skip_a_photos(call: CallbackQuery, state: FSMContext):
-    async with creation_lock:
-        if await check_active_ticket(call.message):
-            await state.clear()
-            await call.answer()
-            return
-        data = await state.get_data()
-        profile_str = data.get("a_profile") or f"<code>{html.escape(data.get('a_nickname', ''))}</code>"
-        text = (
-            f"Ник: {profile_str}\n"
-            f"Сервер бана: {html.escape(data.get('a_place', ''))}\n"
-            f"Время публикации поста: {html.escape(data.get('a_time', ''))}\n"
-            f"Причина разбана: {html.escape(data.get('a_reason', ''))}"
-        )
-        ticket_id = await dispatch_ticket_to_admin(call.from_user.id, call.from_user, "appeal", text, [])
-        night_txt = get_night_notice()
-        await call.message.edit_text(f"{ICON_CHECK} Обжалование №{ticket_id} отправлено!{night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
-        await state.clear()
-        await call.answer()
-
-@router.message(Form.appeal_photos, F.photo)
-async def process_a_photo(message: Message, state: FSMContext):
-    if await check_active_ticket(message):
-        await state.clear()
-        return
-
-    photos = await collect_media_photos(message, state, "a_photos")
-    if len(photos) > 5:
-        await message.answer(f"{ICON_CROSS} Лимит превышен! Прикрепите не более 5 фото.", parse_mode="HTML")
-        await state.clear()
-        return
-
-    mg_id = message.media_group_id
-    if mg_id:
-        await asyncio.sleep(1.2)
-        async with creation_lock:
-            if mg_id in processed_media_groups:
-                return
-            processed_media_groups.add(mg_id)
-            if len(processed_media_groups) > 500:
-                processed_media_groups.clear()
-
-            cur_data = await state.get_data()
-            photos = cur_data.get("a_photos", photos)
-
-            if await check_active_ticket(message):
-                await state.clear()
-                return
-
-            profile_str = cur_data.get("a_profile") or f"<code>{html.escape(cur_data.get('a_nickname', ''))}</code>"
-            text = (
-                f"Ник: {profile_str}\n"
-                f"Сервер бана: {html.escape(cur_data.get('a_place', ''))}\n"
-                f"Время публикации поста: {html.escape(data.get('a_time', ''))}\n"
-                f"Причина разбана: {html.escape(data.get('a_reason', ''))}"
-            )
-            ticket_id = await dispatch_ticket_to_admin(message.from_user.id, message.from_user, "appeal", text, photos)
-            await state.clear()
-            night_txt = get_night_notice()
-            await message.answer(f"{ICON_CHECK} Обжалование №{ticket_id} отправлено! (Прикреплено фото: {len(photos)}){night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
-            return
-
-    async with creation_lock:
-        if await check_active_ticket(message):
-            await state.clear()
-            return
-        data = await state.get_data()
-        profile_str = data.get("a_profile") or f"<code>{html.escape(data.get('a_nickname', ''))}</code>"
-        text = (
-            f"Ник: {profile_str}\n"
-            f"Сервер бана: {html.escape(data.get('a_place', ''))}\n"
-            f"Время публикации поста: {html.escape(data.get('a_time', ''))}\n"
-            f"Причина разбана: {html.escape(data.get('a_reason', ''))}"
-        )
-        ticket_id = await dispatch_ticket_to_admin(message.from_user.id, message.from_user, "appeal", text, photos)
-        await state.clear()
-        night_txt = get_night_notice()
-        await message.answer(f"{ICON_CHECK} Обжалование №{ticket_id} отправлено! (Прикреплено фото: {len(photos)}){night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
-
-# --- 3. ВОПРОС ---
-@router.message(F.text == BTN_QUESTION, F.chat.type == "private")
-async def start_question(message: Message, state: FSMContext):
-    await register_user(message.from_user.id)
-    if await is_banned(message.from_user.id) or await check_active_ticket(message): return
-    await state.clear()
-    await state.set_state(Form.question_content)
-    await message.answer(f"<tg-emoji emoji-id='5348435310994802643'>🔥</tg-emoji> Задайте ваш вопрос (можно отправить текст или до 5 фото с описанием):", parse_mode="HTML")
-
-@router.message(Form.question_content, F.photo | F.text)
-async def process_question(message: Message, state: FSMContext):
-    if await check_active_ticket(message):
-        await state.clear()
-        return
-
-    mg_id = message.media_group_id
-
-    if message.photo:
-        photos = await collect_media_photos(message, state, "q_photos")
-        if len(photos) > 5:
-            await message.answer(f"{ICON_CROSS} Лимит превышен! Прикрепите не более 5 фото.", parse_mode="HTML")
-            await state.clear()
-            return
-        
-        caption_text = message.caption or "Без описания"
-        data = await state.get_data()
-        if "q_text" not in data and message.caption:
-            await state.update_data(q_text=caption_text)
-
-        if mg_id:
-            await asyncio.sleep(1.2)
-            async with creation_lock:
-                if mg_id in processed_media_groups:
-                    return
-                processed_media_groups.add(mg_id)
-                if len(processed_media_groups) > 500:
-                    processed_media_groups.clear()
-
-                cur_data = await state.get_data()
-                photos = cur_data.get("q_photos", photos)
-                caption_text = cur_data.get("q_text", caption_text)
-
-                if await check_active_ticket(message):
-                    await state.clear()
-                    return
-
-                ticket_id = await dispatch_ticket_to_admin(
-                    message.from_user.id, message.from_user, "question", html.escape(caption_text), photos
-                )
-                await state.clear()
-                night_txt = get_night_notice()
-                await message.answer(f"{ICON_CHECK} Вопрос №{ticket_id} отправлен!{night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
-                return
-
-        async with creation_lock:
-            if await check_active_ticket(message):
-                await state.clear()
-                return
-            ticket_id = await dispatch_ticket_to_admin(
-                message.from_user.id, message.from_user, "question", html.escape(caption_text), photos
-            )
-            await state.clear()
-            night_txt = get_night_notice()
-            await message.answer(f"{ICON_CHECK} Вопрос №{ticket_id} отправлен!{night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
-            return
-    else:
-        async with creation_lock:
-            if await check_active_ticket(message):
-                await state.clear()
-                return
-            ticket_id = await dispatch_ticket_to_admin(
-                message.from_user.id, message.from_user, "question", html.escape(message.text or ''), []
-            )
-            await state.clear()
-            night_txt = get_night_notice()
-            await message.answer(f"{ICON_CHECK} Вопрос №{ticket_id} отправлен!{night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
-
-# --- 4. ДРУЗЬЯ ---
-@router.message(F.text == BTN_FRIENDS, F.chat.type == "private")
-async def start_friends(message: Message, state: FSMContext):
-    await register_user(message.from_user.id)
-    if await is_banned(message.from_user.id) or await check_active_ticket(message): return
-    if await get_setting("friend_active", "false") != "true":
-        await message.answer(f"{ICON_WARN} Раздел добавления в друзья временно закрыт на технические работы.", parse_mode="HTML")
-        return
-    await state.clear()
-    friend_nick = await get_setting("friend_nickname", "Администратор")
-    await state.set_state(Form.friends_nickname)
-    await message.answer(f"{ICON_USERS} Добавьтесь в друзья к игроку: <code>{html.escape(friend_nick)}</code>\n\n{NUM_1} Укажите ваш ник в игре:", parse_mode="HTML")
-
-@router.message(Form.friends_nickname)
-async def process_friends_nickname(message: Message, state: FSMContext):
-    async with creation_lock:
-        if await check_active_ticket(message):
-            await state.clear()
-            return
-        text = f"Ник: <code>{html.escape(message.text or '')}</code>"
-        ticket_id = await dispatch_ticket_to_admin(message.from_user.id, message.from_user, "friends", text, [])
-        night_txt = get_night_notice()
-        await message.answer(f"{ICON_CHECK} Заявка №{ticket_id} создана!{night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
-        await state.clear()
-
-# ----------------------------------------------------------------------
-# КНОПКИ УПРАВЛЕНИЯ ТИКЕТАМИ
-# ----------------------------------------------------------------------
-@router.callback_query(F.data.startswith("take_"))
-async def take_ticket_handler(call: CallbackQuery):
-    await call.answer()
-    if not await is_support_member(call.from_user.id):
-        await call.answer("❌ У вас нет прав хелпера!", show_alert=True)
-        return
-
-    ticket_id = int(call.data.split("_")[1])
-    ticket_info = await get_ticket_info(ticket_id)
-    if ticket_info and ticket_info[2] != 'pending':
-        await call.answer("❌ Заявка уже занята или обработана!", show_alert=True)
-        return
-
-    agent_number = await get_or_create_agent_number(call.from_user.id)
-    await activate_ticket(ticket_id, call.from_user.id)
-
-    if ticket_info:
-        try:
-            await bot.send_message(
-                ticket_info[0],
-                f"👨‍💻 <b>Агент #{agent_number}</b> взял вашу заявку <b>№{ticket_id}</b> в работу!\nТеперь вы можете писать сюда сообщения.",
-                parse_mode="HTML"
-            )
-        except Exception:
-            pass
-
-    base_text = ticket_info[3] if (ticket_info and ticket_info[3]) else (call.message.caption or call.message.text or "")
-    new_text = base_text + f"\n\n🟢 <b>В работе у:</b> {call.from_user.mention_html()} (Агент #{agent_number})"
-    
-    try:
-        if call.message.photo:
-            await call.message.edit_caption(caption=new_text, reply_markup=close_ticket_kb(ticket_id, call.from_user.id), parse_mode="HTML")
-        else:
-            await call.message.edit_text(text=new_text, reply_markup=close_ticket_kb(ticket_id, call.from_user.id), parse_mode="HTML")
-    except Exception as e:
-        logging.error(f"Ошибка обновления карточки при взятии: {e}")
-
-@router.callback_query(F.data.startswith("reject_"))
-async def reject_ticket_handler(call: CallbackQuery):
-    await call.answer()
-    if not await is_support_member(call.from_user.id):
-        await call.answer("❌ У вас нет прав хелпера!", show_alert=True)
-        return
-
-    ticket_id = int(call.data.split("_")[1])
-    ticket_info = await get_ticket_info(ticket_id)
-    if ticket_info and ticket_info[2] != 'pending':
-        await call.answer("❌ Заявка уже обработана!", show_alert=True)
-        return
-
-    base_text = ticket_info[3] if (ticket_info and ticket_info[3]) else (call.message.caption or call.message.text or "")
-
-    prompt_msg = await bot.send_message(
-        ADMIN_CHAT_ID,
-        f"❓ <b>Укажите причину отказа для заявки №{ticket_id}:</b>\n<i>(Ответьте Reply на это сообщение)</i>",
-        parse_mode="HTML"
-    )
-    await add_pending_rejection(prompt_msg.message_id, ticket_id, call.message.message_id, base_text)
-    await map_message(prompt_msg.message_id, 0, ticket_id)
-
-@router.callback_query(F.data.startswith("close_"))
-async def close_ticket_handler(call: CallbackQuery):
-    parts = call.data.split("_")
-    ticket_id = int(parts[1])
-    assigned_admin_id = int(parts[2])
-
-    ticket_info = await get_ticket_info(ticket_id)
-    
-    if not ticket_info or ticket_info[2] == 'closed':
-        await call.answer("⚠️ Заявка уже закрыта!", show_alert=False)
-        try:
-            await call.message.edit_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-        return
-
-    if call.from_user.id != assigned_admin_id and not await is_main_admin(call.from_user.id):
-        if not await is_support_member(call.from_user.id):
-            await call.answer("❌ Нет доступа!", show_alert=True)
-            return
-        await call.answer("❌ Закрыть тикет может только тот админ, который взял его в работу!", show_alert=True)
-        return
-
-    await call.answer("Заявка закрыта!")
-    agent_no = await get_or_create_agent_number(call.from_user.id)
-
-    await close_ticket_db(ticket_id, status='closed', admin_id=call.from_user.id)
-
-    try:
-        await bot.send_message(
-            ticket_info[0],
-            f"{ICON_LOCK} Ваша заявка <b>№{ticket_id}</b> закрыта поддержкой.\nОцените качество обслуживания:",
-            parse_mode="HTML",
-            reply_markup=rating_kb(ticket_id)
-        )
-    except Exception:
-        pass
-
-    base_text = ticket_info[3] or (call.message.caption or call.message.text or f"Заявка <b>№{ticket_id}</b>")
-    status_text = f"\n\n🔒 <b>Заявка №{ticket_id} закрыта</b> администратором {call.from_user.mention_html()} (Агент #{agent_no})."
-    new_content = base_text + status_text
-
-    try:
-        if call.message.photo:
-            await call.message.edit_caption(caption=new_content, reply_markup=None, parse_mode="HTML")
-        else:
-            await call.message.edit_text(text=new_content, reply_markup=None, parse_mode="HTML")
-    except Exception as e:
-        logging.error(f"Ошибка редактирования карточки при закрытии: {e}")
-        try:
-            await call.message.edit_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-
-@router.callback_query(F.data.startswith("user_cancel_"))
-async def user_cancel_ticket(call: CallbackQuery):
-    await call.answer()
-    ticket_id = int(call.data.split("_")[2])
-    ticket_info = await get_ticket_info(ticket_id)
-    if ticket_info and ticket_info[2] == 'pending':
-        await close_ticket_db(ticket_id, 'closed')
-        await call.message.edit_text(f"{ICON_CROSS} Заявка <b>№{ticket_id}</b> отменена вами.", parse_mode="HTML")
-    else:
-        await call.answer("❌ Заявка уже взята в работу или закрыта, отмена недоступна.", show_alert=True)
-
-# ----------------------------------------------------------------------
 # СИСТЕМА ОЦЕНОК (СТРОГИЙ ЗАПРЕТ ОЦЕНОК ОТ СТАФФА)
 # ----------------------------------------------------------------------
 @router.callback_query(F.data.startswith("rate_"))
@@ -2746,14 +2138,14 @@ async def user_private_message(message: Message, state: FSMContext):
             sent = await bot.send_photo(ADMIN_CHAT_ID, photo=message.photo[-1].file_id, caption=text_to_group, parse_mode="HTML")
         else:
             sent = await bot.send_message(ADMIN_CHAT_ID, text_to_group, parse_mode="HTML")
-        await map_message(sent.message_id, message.from_user.id, active_ticket[0])
+        await map_message(sent.message_id, user_id, active_ticket[0])
         return
 
     kb = await main_keyboard(message.from_user.id)
     await message.answer(f"{ICON_WARN} Пожалуйста, выберите нужный пункт меню для обращения.", reply_markup=kb, parse_mode="HTML")
 
 # ----------------------------------------------------------------------
-# КОМАНДЫ В АДМИН-ЧАТЕ (/note, /deletenote, /mystats, /secstats, /news, /ban, /unban, /opentickets)
+# КОМАНДЫ В АДМИН-ЧАТЕ (/note, /deletenote, /mystats, /secstats, /supptop, /sectop, /news, /ban, /unban, /opentickets)
 # ----------------------------------------------------------------------
 @router.message(Command("opentickets"), F.chat.id == ADMIN_CHAT_ID)
 async def cmd_open_tickets(message: Message):
@@ -2922,6 +2314,131 @@ async def cmd_sec_stats(message: Message):
         f"🌟 Любимый тип секретки: <b>{fav_t}</b>\n"
         f"🏆 Место в топе искателей: <b>{rank_str}</b>"
     )
+    await message.answer(text, parse_mode="HTML")
+
+@router.message(Command("supptop"), F.chat.id == ADMIN_CHAT_ID)
+async def cmd_supp_top(message: Message):
+    """Общий рейтинг агентов поддержки (Только для гл. админов)"""
+    if not await is_main_admin(message.from_user.id):
+        await message.answer("❌ Только главные администраторы могут просматривать общий рейтинг поддержки!", parse_mode="HTML")
+        return
+
+    def _query():
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT 
+                        t.admin_id,
+                        COUNT(t.ticket_id) AS cnt,
+                        COALESCE(AVG(CASE 
+                            WHEN r.user_id != %s 
+                             AND r.user_id NOT IN (SELECT admin_id FROM main_admins) 
+                             AND r.user_id NOT IN (SELECT admin_id FROM admin_agents)
+                            THEN r.score 
+                            ELSE NULL 
+                        END), 0) AS avg_sc,
+                        a.agent_number
+                    FROM tickets t
+                    LEFT JOIN ratings r ON t.ticket_id = r.ticket_id
+                    LEFT JOIN admin_agents a ON t.admin_id = a.admin_id
+                    WHERE t.admin_id IS NOT NULL AND t.status = 'closed'
+                    GROUP BY t.admin_id, a.agent_number
+                    ORDER BY avg_sc DESC, cnt DESC
+                """, (OWNER_ID,))
+                return cur.fetchall()
+
+    try:
+        top_list = await asyncio.to_thread(_query)
+    except Exception as e:
+        await message.answer(f"❌ Ошибка получения топа поддержки: {e}")
+        return
+
+    if not top_list:
+        await message.answer("📭 В базе пока нет данных о закрытых тикетах агентов поддержки.", parse_mode="HTML")
+        return
+
+    medals = ["🥇", "🥈", "🥉"]
+    text = "🏆 <b>Общий рейтинг команды поддержки:</b>\n\n"
+
+    for idx, (adm_id, cnt, avg_sc, agent_no) in enumerate(top_list, 1):
+        medal = medals[idx - 1] if idx <= 3 else f"<b>{idx}.</b>"
+        agent_str = f" [Агент #{agent_no}]" if agent_no else ""
+        try:
+            chat_info = await bot.get_chat(adm_id)
+            name = chat_info.full_name
+        except Exception:
+            name = f"ID: {adm_id}"
+
+        avg_formatted = round(float(avg_sc), 2)
+        text += (
+            f"{medal} <b>{html.escape(name)}</b>{agent_str}\n"
+            f"   ⭐ Оценка: <b>{avg_formatted} / 5.0</b> | 🔒 Закрыто тикетов: <code>{cnt}</code>\n\n"
+        )
+
+    await message.answer(text, parse_mode="HTML")
+
+@router.message(Command("sectop"), F.chat.id == ADMIN_CHAT_ID)
+async def cmd_sec_top(message: Message):
+    """Общий рейтинг искателей секреток за ВСЁ время (Только для гл. админов)"""
+    if not await is_main_admin(message.from_user.id):
+        await message.answer("❌ Только главные администраторы могут просматривать общий рейтинг искателей секреток!", parse_mode="HTML")
+        return
+
+    def _query():
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT 
+                        sp.user_id,
+                        COUNT(sp.id) as total_cnt
+                    FROM secret_posts sp
+                    GROUP BY sp.user_id
+                    ORDER BY total_cnt DESC
+                """)
+                rows = cur.fetchall()
+
+                full_data = []
+                for uid, t_cnt in rows:
+                    cur.execute("""
+                        SELECT secret_type, COUNT(*) as scnt 
+                        FROM secret_posts 
+                        WHERE user_id = %s 
+                        GROUP BY secret_type 
+                        ORDER BY scnt DESC LIMIT 1
+                    """, (uid,))
+                    fav_row = cur.fetchone()
+                    fav_str = f"{fav_row[0]} ({fav_row[1]} шт.)" if fav_row else "—"
+                    full_data.append((uid, t_cnt, fav_str))
+
+                return full_data
+
+    try:
+        top_list = await asyncio.to_thread(_query)
+    except Exception as e:
+        await message.answer(f"❌ Ошибка получения топа секреток: {e}")
+        return
+
+    if not top_list:
+        await message.answer("📭 В базе пока нет опубликованных секреток.", parse_mode="HTML")
+        return
+
+    medals = ["🥇", "🥈", "🥉"]
+    text = "🔮 <b>Общий рейтинг искателей секреток (за всё время):</b>\n\n"
+
+    for idx, (uid, total_cnt, fav_type) in enumerate(top_list, 1):
+        medal = medals[idx - 1] if idx <= 3 else f"<b>{idx}.</b>"
+        try:
+            chat_info = await bot.get_chat(uid)
+            name = chat_info.full_name
+        except Exception:
+            name = f"ID: {uid}"
+
+        text += (
+            f"{medal} <b>{html.escape(name)}</b> (<code>{uid}</code>)\n"
+            f"   📝 Всего постов: <code>{total_cnt}</code>\n"
+            f"   🌟 Любимый тип: <i>{html.escape(fav_type)}</i>\n\n"
+        )
+
     await message.answer(text, parse_mode="HTML")
 
 @router.message(Command("note"), F.chat.id == ADMIN_CHAT_ID)
@@ -3329,7 +2846,7 @@ async def admin_reply_in_group(message: Message):
             await touch_ticket(ticket_id, actor='admin')
             agent_no = await get_or_create_agent_number(message.from_user.id)
             
-            client_text = f"👨‍‍💻 <b>Ответ поддержки (Агент #{agent_no}):</b>\n\n{html.escape(message.text or message.caption or '')}"
+            client_text = f"👨‍💻 <b>Ответ поддержки (Агент #{agent_no}):</b>\n\n{html.escape(message.text or message.caption or '')}"
             try:
                 if message.photo:
                     await bot.send_photo(user_id, photo=message.photo[-1].file_id, caption=client_text, parse_mode="HTML")
@@ -3377,7 +2894,6 @@ async def reminder_worker():
             def _check():
                 with get_db() as conn:
                     with conn.cursor() as cur:
-                        # Тикеты, которые ждут взятия более 2 часов с момента создания ИЛИ предыдущего напоминания
                         cur.execute("""
                             SELECT ticket_id, category, user_id, 
                                    EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - created_at))/3600 as hours_total
@@ -3387,9 +2903,6 @@ async def reminder_worker():
                         """)
                         unassigned = cur.fetchall()
 
-                        # Тикеты в работе:
-                        # 1. Первое напоминание через 20 минут тишины от последнего ответа другой стороны (reminded_idle = FALSE)
-                        # 2. Последующие напоминания каждый 1 час после предыдущего напоминания (reminded_idle = TRUE)
                         cur.execute("""
                             SELECT t.ticket_id, t.admin_id, t.user_id,
                                    EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - t.updated_at))/60 as mins_passed,
@@ -3405,7 +2918,6 @@ async def reminder_worker():
                         """)
                         idle = cur.fetchall()
 
-                        # Автозакрытие: активный тикет без ответа пользователя 24 часа после сообщения админа
                         cur.execute("""
                             SELECT ticket_id, user_id, admin_id, card_text
                             FROM tickets
@@ -3419,7 +2931,6 @@ async def reminder_worker():
 
             unassigned_tickets, idle_tickets, expired_active = await asyncio.to_thread(_check)
 
-            # Напоминание по неразобранным тикетам каждые 2 часа
             for t_id, cat, u_id, hrs in unassigned_tickets:
                 hours_str = f"{int(hrs)} ч." if hrs else "2+ ч."
                 alert_text = (
@@ -3439,7 +2950,6 @@ async def reminder_worker():
                 except Exception as e:
                     logging.error(f"Ошибка отправки напоминания о заявке №{t_id}: {e}")
 
-            # Напоминание о простое тикета: через 20 минут, затем каждый 1 час
             for t_id, adm_id, u_id, mins, agent_no, last_act, was_reminded in idle_tickets:
                 if last_act == 'admin':
                     client_alert = (
@@ -3491,7 +3001,6 @@ async def reminder_worker():
                     except Exception as e:
                         logging.error(f"Ошибка отправки напоминания хелперу по тикету №{t_id}: {e}")
 
-            # Автозакрытие через 24 часа
             for t_id, u_id, adm_id, c_txt in expired_active:
                 try:
                     await close_ticket_db(t_id, status='closed', admin_id=adm_id)
