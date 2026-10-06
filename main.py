@@ -14,7 +14,7 @@ from psycopg2 import pool
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router, BaseMiddleware
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter, TelegramBadRequest
-from aiogram.filters import Command, CommandStart, ChatMemberUpdatedFilter, KICKED, LEFT, RESTRICTED, MEMBER, ADMINISTRATOR, CREATOR
+from aiogram.filters import Command, CommandStart, ChatMemberUpdatedFilter, MEMBER, ADMINISTRATOR
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -30,9 +30,7 @@ from aiogram.types import (
 # ----------------------------------------------------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
-ADMIN_CHAT_ID = -1003945292994  # ID основной группы поддержки
-TOPIC_SUPPORT_ID = 2            # ID темы "Поддержка"
-TOPIC_SECRETS_ID = 4            # ID темы "Секретки"
+ADMIN_CHAT_ID = -1003945292994  # ID основной группы поддержки по умолчанию
 OWNER_ID = int(os.getenv("ADMIN_ID", "0"))  # Главный создатель бота
 MSK_TZ = timezone(timedelta(hours=3))
 
@@ -257,6 +255,8 @@ def _init_db_sync():
                     chat_id BIGINT PRIMARY KEY,
                     title TEXT,
                     is_allowed BOOLEAN DEFAULT FALSE,
+                    support_thread_id INTEGER DEFAULT 2,
+                    secrets_thread_id INTEGER DEFAULT 4,
                     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
                 );
             """)
@@ -274,6 +274,8 @@ def _init_db_sync():
                 ALTER TABLE pending_rejections ADD COLUMN IF NOT EXISTS card_message_id BIGINT;
                 ALTER TABLE pending_rejections ADD COLUMN IF NOT EXISTS card_text TEXT DEFAULT NULL;
                 ALTER TABLE secret_posts ADD COLUMN IF NOT EXISTS group_message_id BIGINT DEFAULT NULL;
+                ALTER TABLE allowed_chats ADD COLUMN IF NOT EXISTS support_thread_id INTEGER DEFAULT 2;
+                ALTER TABLE allowed_chats ADD COLUMN IF NOT EXISTS secrets_thread_id INTEGER DEFAULT 4;
             """)
 
             if OWNER_ID:
@@ -286,10 +288,9 @@ def _init_db_sync():
                     (OWNER_ID,)
                 )
 
-            # Дефолтный админский чат авторизуем по умолчанию
             cursor.execute("""
-                INSERT INTO allowed_chats (chat_id, title, is_allowed)
-                VALUES (%s, 'Главный чат поддержки', TRUE)
+                INSERT INTO allowed_chats (chat_id, title, is_allowed, support_thread_id, secrets_thread_id)
+                VALUES (%s, 'Главный чат поддержки', TRUE, 2, 4)
                 ON CONFLICT (chat_id) DO UPDATE SET is_allowed = TRUE
             """, (ADMIN_CHAT_ID,))
 
@@ -409,7 +410,7 @@ async def is_main_admin(user_id: int) -> bool:
         return False
 
 # ----------------------------------------------------------------------
-# ПРОВЕРКА И УПРАВЛЕНИЕ АДМИН-ЧАТАМИ
+# ПРОВЕРКА И ДИНАМИЧЕСКИЕ НАСТРОЙКИ АДМИН-ЧАТОВ
 # ----------------------------------------------------------------------
 async def is_chat_allowed(chat_id: int) -> bool:
     if chat_id == ADMIN_CHAT_ID:
@@ -461,6 +462,41 @@ async def register_chat_in_db(chat_id: int, title: str):
                 """, (chat_id, title))
     await asyncio.to_thread(_query)
 
+async def get_chat_topics(chat_id: int) -> tuple[int | None, int | None]:
+    """Возвращает (support_thread_id, secrets_thread_id)"""
+    def _query():
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT support_thread_id, secrets_thread_id FROM allowed_chats WHERE chat_id = %s", (chat_id,))
+                row = cur.fetchone()
+                if row:
+                    return row[0], row[1]
+                return (2, 4) if chat_id == ADMIN_CHAT_ID else (None, None)
+    try:
+        return await asyncio.to_thread(_query)
+    except Exception:
+        return (2, 4) if chat_id == ADMIN_CHAT_ID else (None, None)
+
+async def set_chat_topic(chat_id: int, topic_type: str, thread_id: int):
+    col = "support_thread_id" if topic_type == "support" else "secrets_thread_id"
+    def _query():
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"UPDATE allowed_chats SET {col} = %s WHERE chat_id = %s", (thread_id, chat_id))
+    await asyncio.to_thread(_query)
+
+async def get_primary_admin_chat() -> int:
+    def _query():
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT chat_id FROM allowed_chats WHERE is_allowed = TRUE ORDER BY chat_id ASC LIMIT 1")
+                row = cur.fetchone()
+                return row[0] if row else ADMIN_CHAT_ID
+    try:
+        return await asyncio.to_thread(_query)
+    except Exception:
+        return ADMIN_CHAT_ID
+
 async def is_secret_publisher(user_id: int) -> bool:
     def _query():
         with get_db() as conn:
@@ -476,7 +512,8 @@ async def is_support_member(user_id: int) -> bool:
     if await is_main_admin(user_id):
         return True
     try:
-        member = await bot.get_chat_member(chat_id=ADMIN_CHAT_ID, user_id=user_id)
+        p_chat = await get_primary_admin_chat()
+        member = await bot.get_chat_member(chat_id=p_chat, user_id=user_id)
         if member.status in ["creator", "administrator", "member", "restricted"]:
             return True
     except Exception as e:
@@ -855,7 +892,8 @@ async def expire_secret_post(bot: Bot, post_id: int, channel_id: str, message_id
 
     if group_message_id:
         try:
-            await bot.edit_message_caption(chat_id=ADMIN_CHAT_ID, message_id=group_message_id, caption=final_text, parse_mode="HTML")
+            p_chat = await get_primary_admin_chat()
+            await bot.edit_message_caption(chat_id=p_chat, message_id=group_message_id, caption=final_text, parse_mode="HTML")
         except Exception as e:
             logging.error(f"Не удалось обновить истекший пост №{post_id} в теме секреток: {e}")
 
@@ -892,6 +930,7 @@ class Form(StatesGroup):
 
     add_main_admin_id = State()
     del_main_admin_id = State()
+    waiting_topic_link = State()
 
 class SecretPublisherStates(StatesGroup):
     waiting_for_channel = State()
@@ -1041,7 +1080,7 @@ def appeal_servers_kb():
     ])
 
 # ----------------------------------------------------------------------
-# ОТСЛЕЖИВАНИЕ ДОБАВЛЕНИЯ БОТА В ГРУППЫ (РЕГИСТРАЦИЯ И ОПОВЕЩЕНИЕ)
+# ОТСЛЕЖИВАНИЕ ДОБАВЛЕНИЯ БОТА В ГРУППЫ
 # ----------------------------------------------------------------------
 @router.my_chat_member(ChatMemberUpdatedFilter(member_status_changed=MEMBER | ADMINISTRATOR))
 async def bot_added_to_chat(event: ChatMemberUpdated):
@@ -1058,14 +1097,14 @@ async def bot_added_to_chat(event: ChatMemberUpdated):
                         f"🔔 <b>Бота добавили в новую группу!</b>\n\n"
                         f"📌 Название: <b>{html.escape(title)}</b>\n"
                         f"🆔 ID чата: <code>{chat_id}</code>\n\n"
-                        f"<i>Перейдите в Админ-панель ➔ '🛡 Админ чаты', чтобы разрешить или отклонить работу бота.</i>",
+                        f"<i>Перейдите в Админ-панель ➔ '🛡 Админ чаты', чтобы настроить доступ и темы.</i>",
                         parse_mode="HTML"
                     )
                 except Exception:
                     pass
 
 # ----------------------------------------------------------------------
-# ОТПРАВКА БИЛЕТА С МЕДИА В ТЕМУ ПОДДЕРЖКИ (TOPIC_SUPPORT_ID = 2)
+# ОТПРАВКА БИЛЕТА С МЕДИА В ДИНАМИЧЕСКУЮ ТЕМУ ПОДДЕРЖКИ
 # ----------------------------------------------------------------------
 async def dispatch_ticket_to_admin(user_id: int, user, category: str, text: str, photos: List[str]):
     user_mention = get_user_mention(user)
@@ -1096,14 +1135,17 @@ async def dispatch_ticket_to_admin(user_id: int, user, category: str, text: str,
                 cur.execute("UPDATE tickets SET card_text = %s WHERE ticket_id = %s", (admin_card_text, ticket_id))
     await asyncio.to_thread(_save_card_txt)
 
+    target_chat = await get_primary_admin_chat()
+    support_tid, _ = await get_chat_topics(target_chat)
+
     if photos:
         if len(photos) == 1:
             sent = await bot.send_photo(
-                ADMIN_CHAT_ID,
+                target_chat,
                 photo=photos[0],
                 caption=admin_card_text,
                 reply_markup=take_ticket_kb(ticket_id),
-                message_thread_id=TOPIC_SUPPORT_ID,
+                message_thread_id=support_tid,
                 parse_mode="HTML"
             )
             await map_message(sent.message_id, user_id, ticket_id)
@@ -1112,24 +1154,24 @@ async def dispatch_ticket_to_admin(user_id: int, user, category: str, text: str,
             for p in photos[1:]:
                 media.append(InputMediaPhoto(media=p))
             
-            sent_group = await bot.send_media_group(ADMIN_CHAT_ID, media=media, message_thread_id=TOPIC_SUPPORT_ID)
+            sent_group = await bot.send_media_group(target_chat, media=media, message_thread_id=support_tid)
             for m in sent_group:
                 await map_message(m.message_id, user_id, ticket_id)
             
             ctrl_msg = await bot.send_message(
-                ADMIN_CHAT_ID,
+                target_chat,
                 f"👆 <i>Управление заявкой №{ticket_id} (прикреплено {len(photos)} фото):</i>",
                 reply_markup=take_ticket_kb(ticket_id),
-                message_thread_id=TOPIC_SUPPORT_ID,
+                message_thread_id=support_tid,
                 parse_mode="HTML"
             )
             await map_message(ctrl_msg.message_id, user_id, ticket_id)
     else:
         sent = await bot.send_message(
-            ADMIN_CHAT_ID,
+            target_chat,
             admin_card_text,
             reply_markup=take_ticket_kb(ticket_id),
-            message_thread_id=TOPIC_SUPPORT_ID,
+            message_thread_id=support_tid,
             parse_mode="HTML"
         )
         await map_message(sent.message_id, user_id, ticket_id)
@@ -1137,7 +1179,7 @@ async def dispatch_ticket_to_admin(user_id: int, user, category: str, text: str,
     return ticket_id
 
 # ----------------------------------------------------------------------
-# СТАРТ И МЕНЮ
+# СТАРТ И МЕНЮ (ОБНОВЛЕННОЕ ФОТО)
 # ----------------------------------------------------------------------
 WELCOME_PHOTO_ID = "AgACAgEAAxkBAAEve3JqxS3FVKxgKBPRqUofbs2nWRcbvgACVQ1rG3XiKEaSw3QnafbGtgEAAwIAA3kAAz0E"
 
@@ -1323,7 +1365,7 @@ async def process_del_main_admin(message: Message, state: FSMContext):
         await message.answer(f"{ICON_CROSS} Введите числовой Telegram ID:", parse_mode="HTML")
 
 # ----------------------------------------------------------------------
-# УПРАВЛЕНИЕ АДМИН-ЧАТАМИ В АДМИН-ПАНЕЛИ
+# УПРАВЛЕНИЕ АДМИН-ЧАТАМИ И ДИНАМИЧЕСКИМИ ТЕМАМИ В ПАНЕЛИ
 # ----------------------------------------------------------------------
 @router.callback_query(F.data == "manage_admin_chats")
 async def manage_admin_chats_handler(call: CallbackQuery):
@@ -1332,7 +1374,7 @@ async def manage_admin_chats_handler(call: CallbackQuery):
         return
 
     chats = await get_all_managed_chats()
-    text = "🛡 <b>Управление доступом к админ-чатам:</b>\n\nВыберите группу для настройки доступа бота:\n"
+    text = "🛡 <b>Управление доступом к админ-чатам и темам:</b>\n\nВыберите группу для настройки:\n"
 
     buttons = []
     if chats:
@@ -1355,30 +1397,94 @@ async def adm_chat_info_handler(call: CallbackQuery):
     def _query():
         with get_db() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT title, is_allowed FROM allowed_chats WHERE chat_id = %s", (target_chat_id,))
+                cur.execute("SELECT title, is_allowed, support_thread_id, secrets_thread_id FROM allowed_chats WHERE chat_id = %s", (target_chat_id,))
                 return cur.fetchone()
     row = await asyncio.to_thread(_query)
     if not row:
         await call.answer("Чат не найден в базе данных!", show_alert=True)
         return
 
-    title, is_allowed = row
+    title, is_allowed, sup_tid, sec_tid = row
     status_str = "🟢 Доступ разрешён (Бот активен)" if is_allowed else "🔴 Доступ закрыт / Ожидает решения"
+    sup_str = f"ID: <code>{sup_tid}</code>" if sup_tid else "⚠️ <i>Не назначена</i>"
+    sec_str = f"ID: <code>{sec_tid}</code>" if sec_tid else "⚠️ <i>Не назначена</i>"
 
     text = (
         f"🛡 <b>Настройка группы:</b> <b>{html.escape(title)}</b>\n"
         f"🆔 ID чата: <code>{target_chat_id}</code>\n"
         f"Текущий статус: <b>{status_str}</b>\n\n"
-        "Выберите действие:"
+        f"💬 Тема поддержки: {sup_str}\n"
+        f"🔮 Тема секреток: {sec_str}\n\n"
+        "Выберите действие или настройте привязку тем ссылкой:"
     )
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"💬 Привязать Поддержку", callback_data=f"settopic_{target_chat_id}_support"),
+         InlineKeyboardButton(text=f"🔮 Привязать Секретки", callback_data=f"settopic_{target_chat_id}_secrets")],
         [InlineKeyboardButton(text="🟢 Разрешить работу бота", callback_data=f"chat_allow_{target_chat_id}")],
         [InlineKeyboardButton(text="🔴 Запретить и выйти из чата", callback_data=f"chat_disallow_{target_chat_id}")],
         [InlineKeyboardButton(text="🔙 Назад к списку", callback_data="manage_admin_chats")]
     ])
     await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     await call.answer()
+
+@router.callback_query(F.data.startswith("settopic_"))
+async def prompt_set_topic(call: CallbackQuery, state: FSMContext):
+    if not await is_main_admin(call.from_user.id): return
+    _, c_id_str, t_type = call.data.split("_")
+    chat_id = int(c_id_str)
+
+    await state.update_data(bind_chat_id=chat_id, bind_topic_type=t_type)
+    await state.set_state(Form.waiting_topic_link)
+
+    type_name = "Поддержки" if t_type == "support" else "Секреток"
+    await call.message.answer(
+        f"🔗 <b>Привязка темы {type_name}:</b>\n\n"
+        f"Отправьте <b>ссылку на тему</b> (например: <code>https://t.me/c/3995930989/2</code>) "
+        f"либо просто перешлите сюда любое сообщение из нужной темы этой группы.",
+        parse_mode="HTML"
+    )
+    await call.answer()
+
+@router.message(Form.waiting_topic_link, F.chat.type == "private")
+async def process_topic_link(message: Message, state: FSMContext):
+    if not await is_main_admin(message.from_user.id): return
+    data = await state.get_data()
+    chat_id = data.get("bind_chat_id")
+    topic_type = data.get("bind_topic_type")
+
+    extracted_thread_id = None
+
+    # Вариант 1: пересланное сообщение из темы
+    if message.forward_from_chat and message.is_topic_message:
+        extracted_thread_id = message.message_thread_id
+    elif message.text:
+        # Вариант 2: ссылка вида t.me/c/123456789/4 или просто цифра
+        text_clean = message.text.strip()
+        match = re.search(r"/(\d+)$", text_clean)
+        if match:
+            extracted_thread_id = int(match.group(1))
+        elif text_clean.isdigit():
+            extracted_thread_id = int(text_clean)
+
+    if not extracted_thread_id:
+        await message.answer(
+            f"{ICON_CROSS} Не удалось определить тему!\n"
+            "Отправьте корректную ссылку на тему из Telegram или перешлите сообщение из неё:",
+            parse_mode="HTML"
+        )
+        return
+
+    await set_chat_topic(chat_id, topic_type, extracted_thread_id)
+    await state.clear()
+
+    type_ru = "Поддержки" if topic_type == "support" else "Секреток"
+    kb = await main_keyboard(message.from_user.id)
+    await message.answer(
+        f"{ICON_CHECK} Тема <b>{type_ru}</b> успешно установлена: ID <code>{extracted_thread_id}</code>!",
+        reply_markup=kb,
+        parse_mode="HTML"
+    )
 
 @router.callback_query(F.data.startswith("chat_allow_"))
 async def chat_allow_action(call: CallbackQuery):
@@ -1808,7 +1914,7 @@ async def sec_rmspec_proc(call: CallbackQuery):
     await call.answer()
 
 # ----------------------------------------------------------------------
-# ПУБЛИКАЦИЯ СЕКРЕТОК (ТОПИК СЕКРЕТОК ➔ КАНАЛ ЧЕРЕЗ 30 СЕКУНД)
+# ПУБЛИКАЦИЯ СЕКРЕТОК (ДИНАМИЧЕСКИЙ ТОПИК СЕКРЕТОК ➔ КАНАЛ ЧЕРЕЗ 30 СЕКУНД)
 # ----------------------------------------------------------------------
 async def publish_to_channel_delayed(post_id: int, channel_id: str, photo_id: str, caption_text: str):
     await asyncio.sleep(30)
@@ -2087,16 +2193,17 @@ async def pub_confirm(call: CallbackQuery, state: FSMContext):
                 )
 
             try:
-                # 1. Отправляем в тему секреток (ID = 4)
+                target_chat = await get_primary_admin_chat()
+                _, secrets_tid = await get_chat_topics(target_chat)
+
                 group_post = await bot.send_photo(
-                    chat_id=ADMIN_CHAT_ID,
+                    chat_id=target_chat,
                     photo=data["photo_id"],
                     caption=final_txt,
-                    message_thread_id=TOPIC_SECRETS_ID,
+                    message_thread_id=secrets_tid,
                     parse_mode="HTML"
                 )
 
-                # 2. Фиксируем в БД (таймер стартует прямо сейчас)
                 def _save_post():
                     with get_db() as conn:
                         with conn.cursor() as cur:
@@ -2108,8 +2215,6 @@ async def pub_confirm(call: CallbackQuery, state: FSMContext):
                             return cur.fetchone()[0]
 
                 new_post_id = await asyncio.to_thread(_save_post)
-
-                # 3. Запускаем публикацию в канал через 30 секунд
                 asyncio.create_task(publish_to_channel_delayed(new_post_id, ch_id, data["photo_id"], final_txt))
 
                 try:
@@ -2196,11 +2301,14 @@ async def process_helper_why(message: Message, state: FSMContext):
         f"4. <b>Почему к нам:</b> {html.escape(why_text)}"
     )
 
+    target_chat = await get_primary_admin_chat()
+    support_tid, _ = await get_chat_topics(target_chat)
+
     sent = await bot.send_message(
-        ADMIN_CHAT_ID,
+        target_chat,
         admin_text,
         reply_markup=helper_decision_kb(user.id),
-        message_thread_id=TOPIC_SUPPORT_ID,
+        message_thread_id=support_tid,
         parse_mode="HTML"
     )
     await map_message(sent.message_id, user.id, 0)
@@ -2293,11 +2401,14 @@ async def process_secret_why(message: Message, state: FSMContext):
         f"5. <b>Почему к нам:</b> {html.escape(why_text)}"
     )
 
+    target_chat = await get_primary_admin_chat()
+    support_tid, _ = await get_chat_topics(target_chat)
+
     sent = await bot.send_message(
-        ADMIN_CHAT_ID,
+        target_chat,
         admin_text,
         reply_markup=secret_decision_kb(user.id),
-        message_thread_id=TOPIC_SUPPORT_ID,
+        message_thread_id=support_tid,
         parse_mode="HTML"
     )
     await map_message(sent.message_id, user.id, 0)
@@ -2679,8 +2790,8 @@ async def process_a_photo(message: Message, state: FSMContext):
             text = (
                 f"Ник: {profile_str}\n"
                 f"Сервер бана: {html.escape(cur_data.get('a_place', ''))}\n"
-                f"Время публикации поста: {html.escape(cur_data.get('a_time', ''))}\n"
-                f"Причина разбана: {html.escape(cur_data.get('a_reason', ''))}"
+                f"Время публикации поста: {html.escape(data.get('a_time', ''))}\n"
+                f"Причина разбана: {html.escape(data.get('a_reason', ''))}"
             )
             ticket_id = await dispatch_ticket_to_admin(message.from_user.id, message.from_user, "appeal", text, photos)
             await state.clear()
@@ -2863,10 +2974,13 @@ async def reject_ticket_handler(call: CallbackQuery):
     await call.answer()
     base_text = ticket_info[3] if ticket_info[3] else (call.message.caption or call.message.text or f"Заявка №{ticket_id}")
 
+    target_chat = call.message.chat.id
+    support_tid, _ = await get_chat_topics(target_chat)
+
     prompt_msg = await bot.send_message(
-        ADMIN_CHAT_ID,
+        target_chat,
         f"❓ <b>Укажите причину отказа для заявки №{ticket_id}:</b>\n<i>(Ответьте Reply на это сообщение)</i>",
-        message_thread_id=TOPIC_SUPPORT_ID,
+        message_thread_id=support_tid,
         parse_mode="HTML"
     )
     await add_pending_rejection(prompt_msg.message_id, ticket_id, call.message.message_id, base_text)
@@ -2881,7 +2995,7 @@ async def close_ticket_handler(call: CallbackQuery):
     ticket_info = await get_ticket_info(ticket_id)
     
     if not ticket_info or ticket_info[2] == 'closed':
-        await call.answer("⚠️️ Заявка уже закрыта!", show_alert=False)
+        await call.answer("⚠️ Заявка уже закрыта!", show_alert=False)
         try:
             await call.message.edit_reply_markup(reply_markup=None)
         except Exception:
@@ -2957,7 +3071,7 @@ async def process_rating(call: CallbackQuery):
         await call.message.edit_text(f"{ICON_STAR} Спасибо за оценку ({score}/5)! Ваше мнение учтено.", parse_mode="HTML")
 
 # ----------------------------------------------------------------------
-# ДИАЛОГ В ЛС С ПОЛЬЗОВАТЕЛЕМ (ОТПРАВКА В ТЕМУ ПОДДЕРЖКИ)
+# ДИАЛОГ В ЛС С ПОЛЬЗОВАТЕЛЕМ (ОТПРАВКА В ДИНАМИЧЕСКУЮ ТЕМУ ПОДДЕРЖКИ)
 # ----------------------------------------------------------------------
 @router.message(F.chat.type == "private")
 async def user_private_message(message: Message, state: FSMContext):
@@ -2974,19 +3088,22 @@ async def user_private_message(message: Message, state: FSMContext):
         user_mention = get_user_mention(message.from_user)
         text_to_group = f"📩 <b>Сообщение по заявке №{active_ticket[0]} от {user_mention} | ID: <code>{message.from_user.id}</code>:</b>\n\n{html.escape(message.text or message.caption or '')}"
         
+        target_chat = await get_primary_admin_chat()
+        support_tid, _ = await get_chat_topics(target_chat)
+
         if message.photo:
             sent = await bot.send_photo(
-                ADMIN_CHAT_ID,
+                target_chat,
                 photo=message.photo[-1].file_id,
                 caption=text_to_group,
-                message_thread_id=TOPIC_SUPPORT_ID,
+                message_thread_id=support_tid,
                 parse_mode="HTML"
             )
         else:
             sent = await bot.send_message(
-                ADMIN_CHAT_ID,
+                target_chat,
                 text_to_group,
-                message_thread_id=TOPIC_SUPPORT_ID,
+                message_thread_id=support_tid,
                 parse_mode="HTML"
             )
         await map_message(sent.message_id, message.from_user.id, active_ticket[0])
@@ -3060,7 +3177,7 @@ async def cmd_my_stats(message: Message):
                     FROM ratings 
                     WHERE admin_id = %s 
                       AND user_id != %s 
-                      AND user_id NOT IN (SELECT admin_id FROM main_admins)
+                      AND user_id NOT IN (SELECT admin_id FROM main_admins) 
                       AND user_id NOT IN (SELECT admin_id FROM admin_agents)
                 """, (admin_id, OWNER_ID))
                 avg_score = cur.fetchone()[0]
@@ -3615,9 +3732,9 @@ async def cmd_unban(message: Message):
     await message.answer(f"✅ Пользователь с ID <code>{user_id}</code> успешно разблокирован.", message_thread_id=message.message_thread_id, parse_mode="HTML")
 
 # ----------------------------------------------------------------------
-# ОБРАБОТЧИК СООБЩЕНИЙ В ГРУППЕ (ДИСПЕТЧЕР ТЕМ: ПОДДЕРЖКА / СЕКРЕТКИ)
+# ОБРАБОТЧИК СООБЩЕНИЙ В ГРУППЕ (ДИСПЕТЧЕР ДИНАМИЧЕСКИХ ТЕМ)
 # ----------------------------------------------------------------------
-async def handle_admin_reply_logic(message: Message):
+async def handle_admin_reply_logic(message: Message, support_thread_id: int):
     replied_msg_id = message.reply_to_message.message_id
     pending_data = await get_pending_rejection(replied_msg_id)
 
@@ -3651,7 +3768,7 @@ async def handle_admin_reply_logic(message: Message):
                 
                 try:
                     await bot.edit_message_text(
-                        chat_id=ADMIN_CHAT_ID,
+                        chat_id=message.chat.id,
                         message_id=card_message_id,
                         text=new_text,
                         reply_markup=None,
@@ -3660,7 +3777,7 @@ async def handle_admin_reply_logic(message: Message):
                 except TelegramBadRequest:
                     try:
                         await bot.edit_message_caption(
-                            chat_id=ADMIN_CHAT_ID,
+                            chat_id=message.chat.id,
                             message_id=card_message_id,
                             caption=new_text,
                             reply_markup=None,
@@ -3672,12 +3789,12 @@ async def handle_admin_reply_logic(message: Message):
                     logging.error(f"Не удалось обновить текст карточки: {e}")
 
         try:
-            await bot.delete_message(chat_id=ADMIN_CHAT_ID, message_id=replied_msg_id)
+            await bot.delete_message(chat_id=message.chat.id, message_id=replied_msg_id)
         except Exception:
             pass
 
         await delete_pending_rejection(replied_msg_id)
-        await message.answer(f"✅ Отказ по заявке №{pending_ticket_id} отправлен.", message_thread_id=TOPIC_SUPPORT_ID)
+        await message.answer(f"✅ Отказ по заявке №{pending_ticket_id} отправлен.", message_thread_id=support_thread_id)
         return
 
     mapping = await get_user_by_group_msg(replied_msg_id)
@@ -3687,7 +3804,7 @@ async def handle_admin_reply_logic(message: Message):
 
         if ticket_info and ticket_info[2] == 'active':
             if ticket_info[1] != message.from_user.id and not await is_main_admin(message.from_user.id):
-                await message.answer("❌ Этот тикет ведет другой администратор. Вы не можете в него отвечать!", message_thread_id=TOPIC_SUPPORT_ID)
+                await message.answer("❌ Этот тикет ведет другой администратор. Вы не можете в него отвечать!", message_thread_id=support_thread_id)
                 return
 
             await touch_ticket(ticket_id, actor='admin')
@@ -3702,50 +3819,49 @@ async def handle_admin_reply_logic(message: Message):
                 await message.react([{"type": "emoji", "emoji": "👍"}])
                 await map_message(message.message_id, user_id, ticket_id)
             except Exception as e:
-                await message.answer(f"❌ Ошибка отправки: {e}", message_thread_id=TOPIC_SUPPORT_ID)
+                await message.answer(f"❌ Ошибка отправки: {e}", message_thread_id=support_thread_id)
 
 @router.message(F.chat.type.in_({"group", "supergroup"}))
 async def group_topics_router(message: Message):
-    # ПРОВЕРКА: Разрешён ли боту этот чат вообще?
     if not await is_chat_allowed(message.chat.id):
-        # Если чат не одобрен — бот полностью молчит и игнорирует активность
         return
 
     thread_id = message.message_thread_id
+    support_tid, secrets_tid = await get_chat_topics(message.chat.id)
 
-    # 1. ТЕМА СЕКРЕТОК (TOPIC_SECRETS_ID = 4)
-    if thread_id == TOPIC_SECRETS_ID:
+    # 1. ТЕМА СЕКРЕТОК
+    if secrets_tid and thread_id == secrets_tid:
         if await is_main_admin(message.from_user.id):
-            return  # Главным админам писать разрешено
+            return  # Главным админам писать разрешено (для зазывалы)
         try:
             await message.delete()
         except Exception:
             pass
         return
 
-    # 2. ТЕМА ПОДДЕРЖКИ (TOPIC_SUPPORT_ID = 2)
-    if thread_id == TOPIC_SUPPORT_ID:
+    # 2. ТЕМА ПОДДЕРЖКИ
+    if support_tid and thread_id == support_tid:
         raw_text = (message.text or message.caption or "").strip()
 
-        # Служебная команда /c: доступна всем участникам чата
+        # Служебная команда /c
         if raw_text.startswith("/c ") or raw_text == "/c":
-            return  # Сообщение остаётся в теме, игроку не уходит
+            return
 
-        # Системные команды бота (/note, /ban, /unban и т.д.)
+        # Системные команды бота
         if raw_text.startswith("/"):
             return
 
-        # Если есть Reply на сообщение тикета
+        # Ответ Reply на тикет
         if message.reply_to_message:
-            await handle_admin_reply_logic(message)
+            await handle_admin_reply_logic(message, support_tid)
             return
 
-        # Написано без Reply и без /c: удаляем и даём временное предупреждение
+        # Оффтоп без Reply и без /c
         try:
             await message.delete()
             warn = await message.answer(
                 f"⚠️ {message.from_user.mention_html()}, пишите в ответ (Reply) на тикет либо через <code>/c текст</code>!",
-                message_thread_id=TOPIC_SUPPORT_ID,
+                message_thread_id=support_tid,
                 parse_mode="HTML"
             )
             await asyncio.sleep(4)
@@ -3828,6 +3944,9 @@ async def reminder_worker():
 
             unassigned_tickets, idle_tickets, expired_active = await asyncio.to_thread(_check)
 
+            target_chat = await get_primary_admin_chat()
+            support_tid, _ = await get_chat_topics(target_chat)
+
             # Напоминание по неразобранным тикетам каждые 2 часа
             for t_id, cat, u_id, hrs in unassigned_tickets:
                 hours_str = f"{int(hrs)} ч." if hrs else "2+ ч."
@@ -3839,9 +3958,9 @@ async def reminder_worker():
                 )
                 try:
                     sent = await bot.send_message(
-                        ADMIN_CHAT_ID,
+                        target_chat,
                         alert_text,
-                        message_thread_id=TOPIC_SUPPORT_ID,
+                        message_thread_id=support_tid,
                         parse_mode="HTML"
                     )
                     await map_message(sent.message_id, u_id, t_id)
@@ -3892,9 +4011,9 @@ async def reminder_worker():
                     )
                     try:
                         sent = await bot.send_message(
-                            ADMIN_CHAT_ID,
+                            target_chat,
                             admin_alert,
-                            message_thread_id=TOPIC_SUPPORT_ID,
+                            message_thread_id=support_tid,
                             parse_mode="HTML"
                         )
                         await map_message(sent.message_id, u_id, t_id)
@@ -3922,9 +4041,9 @@ async def reminder_worker():
                         reply_markup=rating_kb(t_id)
                     )
                     await bot.send_message(
-                        ADMIN_CHAT_ID,
+                        target_chat,
                         f"⏱ <b>Тикет №{t_id} автоматически закрыт</b> (пользователь не отвечал более 24 часов).",
-                        message_thread_id=TOPIC_SUPPORT_ID,
+                        message_thread_id=support_tid,
                         parse_mode="HTML"
                     )
                 except Exception as ex:
