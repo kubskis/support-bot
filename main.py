@@ -30,9 +30,12 @@ from aiogram.types import (
 # ----------------------------------------------------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
-ADMIN_CHAT_ID = -1003945292994  # ID группы поддержки
-OWNER_ID = int(os.getenv("ADMIN_ID", "0"))  # Главный создатель бота
+ADMIN_CHAT_ID = -1003945292994
+OWNER_ID = int(os.getenv("ADMIN_ID", "0"))
 MSK_TZ = timezone(timedelta(hours=3))
+
+# Постоянная ссылка на фото с Imgur
+WELCOME_PHOTO_URL = "https://i.imgur.com/8Qj8mC1.jpeg"
 
 if not BOT_TOKEN:
     raise ValueError("ОШИБКА: Токен бота не найден! Укажите BOT_TOKEN в Environment Variables.")
@@ -54,10 +57,6 @@ NUM_2 = "<tg-emoji emoji-id='5287236502382724614'>🔥</tg-emoji>"
 NUM_3 = "<tg-emoji emoji-id='5287361241117911628'>🔥</tg-emoji>"
 NUM_4 = "<tg-emoji emoji-id='5287402803516427365'>🔥</tg-emoji>"
 NUM_5 = "<tg-emoji emoji-id='5285444878250033485'>🔥</tg-emoji>"
-NUM_6 = "<tg-emoji emoji-id='5285078586259161715'>🔥</tg-emoji>"
-NUM_7 = "<tg-emoji emoji-id='5287334204298773700'>🔥</tg-emoji>"
-NUM_8 = "<tg-emoji emoji-id='5287337962395158575'>🔥</tg-emoji>"
-NUM_9 = "<tg-emoji emoji-id='5287610387875775295'>🔥</tg-emoji>"
 
 # Кастомные TGP иконки
 ICON_CHECK = "<tg-emoji emoji-id='5346300789558101141'>🔥</tg-emoji>"
@@ -110,7 +109,7 @@ async def check_roblox_username(username: str) -> dict | None:
 # АНТИФЛУД МИДЛВАРЬ
 # ----------------------------------------------------------------------
 class ThrottlingMiddleware(BaseMiddleware):
-    def __init__(self, limit: float = 0.6):
+    def __init__(self, limit: float = 0.5):
         self.limit = limit
         self.users: Dict[int, float] = {}
 
@@ -138,8 +137,8 @@ class ThrottlingMiddleware(BaseMiddleware):
 
         return await handler(event, data)
 
-dp.message.middleware(ThrottlingMiddleware(limit=0.6))
-dp.callback_query.middleware(ThrottlingMiddleware(limit=0.6))
+dp.message.middleware(ThrottlingMiddleware(limit=0.5))
+dp.callback_query.middleware(ThrottlingMiddleware(limit=0.5))
 dp.include_router(router)
 
 # ----------------------------------------------------------------------
@@ -276,7 +275,6 @@ def _init_db_sync():
                     (OWNER_ID,)
                 )
 
-            # Очищаем все тестовые оценки от владельца, главных админов и зарегистрированных агентов
             cursor.execute("""
                 DELETE FROM ratings 
                 WHERE user_id IN (SELECT admin_id FROM main_admins)
@@ -355,7 +353,6 @@ def _init_db_sync():
 _init_db_sync()
 
 async def setup_bot_commands(bot: Bot):
-    """Регистрирует подсказки команд в Telegram для ЛС и всех групп"""
     try:
         default_commands = [
             BotCommand(command="start", description="🔄 Главное меню поддержки"),
@@ -376,7 +373,6 @@ async def setup_bot_commands(bot: Bot):
         ]
         await bot.set_my_commands(admin_commands, scope=BotCommandScopeAllGroupChats())
         await bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=ADMIN_CHAT_ID))
-        logging.info("Подсказки команд Telegram успешно зарегистрированы.")
     except Exception as e:
         logging.warning(f"Ошибка настройки подсказок команд: {e}")
 
@@ -411,8 +407,7 @@ async def is_support_member(user_id: int) -> bool:
         member = await bot.get_chat_member(chat_id=ADMIN_CHAT_ID, user_id=user_id)
         if member.status in ["creator", "administrator", "member", "restricted"]:
             return True
-    except Exception as e:
-        logging.error(f"Ошибка проверки статуса участника {user_id}: {e}")
+    except Exception:
         return True
     return False
 
@@ -500,8 +495,8 @@ async def register_user(user_id: int):
                 cur.execute("INSERT INTO users (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING", (user_id,))
     try:
         await asyncio.to_thread(_query)
-    except Exception as e:
-        logging.error(f"Ошибка регистрации пользователя: {e}")
+    except Exception:
+        pass
 
 async def get_all_users_count() -> int:
     def _query():
@@ -610,14 +605,6 @@ async def get_user_by_group_msg(group_msg_id: int):
                 return cur.fetchone()
     return await asyncio.to_thread(_query)
 
-async def get_ticket_messages(ticket_id: int) -> list:
-    def _query():
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT group_message_id FROM message_map WHERE ticket_id = %s", (ticket_id,))
-                return [row[0] for row in cur.fetchall()]
-    return await asyncio.to_thread(_query)
-
 async def get_ticket_info(ticket_id: int):
     def _query():
         with get_db() as conn:
@@ -637,7 +624,10 @@ async def get_active_ticket(user_id: int):
                     (user_id,)
                 )
                 return cur.fetchone()
-    return await asyncio.to_thread(_query)
+    try:
+        return await asyncio.to_thread(_query)
+    except Exception:
+        return None
 
 async def activate_ticket(ticket_id: int, admin_id: int):
     def _query():
@@ -811,13 +801,11 @@ class Form(StatesGroup):
     question_content = State()
     set_friend_nick = State()
     
-    # Поддержка (4 шага)
     helper_name = State()
     helper_age = State()
     helper_time = State()
     helper_why = State()
 
-    # Искатель секреток (5 шагов)
     secret_name = State()
     secret_age = State()
     secret_vip = State()
@@ -850,30 +838,26 @@ class SecretAdminStates(StatesGroup):
 # ----------------------------------------------------------------------
 # КЛАВИАТУРЫ
 # ----------------------------------------------------------------------
-BTN_COMPLAINT = "🚨 Жалоба на игрока"
-BTN_APPEAL = "😡 Обжалование бана"
-BTN_FRIENDS = "👯‍♀️ Добавление в друзья (VIP)"
-BTN_QUESTION = "❓ Задать вопрос"
-BTN_HELPER_APPLY = "📝 Подать заявку на хелпера"
-BTN_SECRET_APPLY = "🔍 Набор в искатели секреток"
-BTN_ADMIN_PANEL = "⚙️️ Админ-панель"
-BTN_REFRESH = "🔄 Перезагрузить меню"
-BTN_SECRETS = "🔮 Секретки"
-
 async def main_keyboard(user_id: int):
     keyboard = [
-        [KeyboardButton(text=BTN_COMPLAINT), KeyboardButton(text=BTN_APPEAL)],
-        [KeyboardButton(text=BTN_FRIENDS), KeyboardButton(text=BTN_QUESTION)],
-        [KeyboardButton(text=BTN_HELPER_APPLY), KeyboardButton(text=BTN_SECRET_APPLY)]
+        [KeyboardButton(text="🚨 Жалоба на игрока"), KeyboardButton(text="😡 Обжалование бана")],
+        [KeyboardButton(text="👯‍♀️ Добавление в друзья (VIP)"), KeyboardButton(text="❓ Задать вопрос")],
+        [KeyboardButton(text="📝 Подать заявку на хелпера"), KeyboardButton(text="🔍 Набор в искатели секреток")]
     ]
     
-    if await is_secret_publisher(user_id):
-        keyboard.append([KeyboardButton(text=BTN_SECRETS)])
+    try:
+        if await is_secret_publisher(user_id):
+            keyboard.append([KeyboardButton(text="🔮 Секретки")])
+    except Exception:
+        pass
 
-    keyboard.append([KeyboardButton(text=BTN_REFRESH)])
+    keyboard.append([KeyboardButton(text="🔄 Перезагрузить меню")])
 
-    if await is_main_admin(user_id):
-        keyboard.append([KeyboardButton(text=BTN_ADMIN_PANEL)])
+    try:
+        if await is_main_admin(user_id):
+            keyboard.append([KeyboardButton(text="⚙️ Админ-панель")])
+    except Exception:
+        pass
 
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True, persistent=True)
 
@@ -974,7 +958,7 @@ def appeal_servers_kb():
     ])
 
 # ----------------------------------------------------------------------
-# ОТПРАВКА БИЛЕТА С МЕДИА (ДО 5 ФОТО)
+# ОТПРАВКА БИЛЕТА
 # ----------------------------------------------------------------------
 async def dispatch_ticket_to_admin(user_id: int, user, category: str, text: str, photos: List[str]):
     user_mention = get_user_mention(user)
@@ -1043,23 +1027,33 @@ async def dispatch_ticket_to_admin(user_id: int, user, category: str, text: str,
     return ticket_id
 
 # ----------------------------------------------------------------------
-# СТАРТ И МЕНЮ
+# СТАРТ И ОБРАБОТКА МЕНЮ
 # ----------------------------------------------------------------------
-WELCOME_PHOTO_ID = "AgACAgEAAxkBAAEvN2dquXGC1nw3HqPjB8OP9hp-L17WGwACrwxrG6FryEX933FL88L6GwEAAwIAA3kAAz0E"
-
 @router.message(CommandStart(), F.chat.type == "private")
 async def start_cmd(message: Message, state: FSMContext):
-    await register_user(message.from_user.id)
-    banned = await is_banned(message.from_user.id)
-    if banned:
-        await message.answer(
-            f"{ICON_CROSS} Вы заблокированы в поддержке.\n<b>Причина:</b> {html.escape(banned[0])}",
-            parse_mode="HTML"
-        )
-        return
+    try:
+        await register_user(message.from_user.id)
+    except Exception as e:
+        logging.error(f"Ошибка регистрации: {e}")
+
+    try:
+        banned = await is_banned(message.from_user.id)
+        if banned:
+            await message.answer(
+                f"{ICON_CROSS} Вы заблокированы в поддержке.\n<b>Причина:</b> {html.escape(banned[0])}",
+                parse_mode="HTML"
+            )
+            return
+    except Exception:
+        pass
 
     await state.clear()
-    kb = await main_keyboard(message.from_user.id)
+
+    try:
+        kb = await main_keyboard(message.from_user.id)
+    except Exception as e:
+        logging.error(f"Ошибка получения клавиатуры: {e}")
+        kb = None
 
     welcome_caption = (
         '<tg-emoji emoji-id="5206693654990717395">🔥</tg-emoji>'
@@ -1069,14 +1063,22 @@ async def start_cmd(message: Message, state: FSMContext):
         '<i>Выберите нужный раздел на клавиатуре ниже</i>'
     )
 
-    await message.answer_photo(
-        photo=WELCOME_PHOTO_ID,
-        caption=welcome_caption,
-        reply_markup=kb,
-        parse_mode="HTML"
-    )
+    try:
+        await message.answer_photo(
+            photo=WELCOME_PHOTO_URL,
+            caption=welcome_caption,
+            reply_markup=kb,
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logging.warning(f"Не удалось отправить фото приветствия ({e}), отправляем текстом")
+        await message.answer(
+            text=welcome_caption,
+            reply_markup=kb,
+            parse_mode="HTML"
+        )
 
-@router.message(F.text.contains("Перезагрузить меню"), F.chat.type == "private")
+@router.message(F.text.regexp(r"(?i)перезагруз"), F.chat.type == "private")
 async def refresh_menu_handler(message: Message, state: FSMContext):
     await register_user(message.from_user.id)
     if await is_banned(message.from_user.id): return
@@ -1084,7 +1086,7 @@ async def refresh_menu_handler(message: Message, state: FSMContext):
     kb = await main_keyboard(message.from_user.id)
     await message.answer("<tg-emoji emoji-id='5346269127059196142'>🔥</tg-emoji> <b>Меню обновлено!</b>", reply_markup=kb, parse_mode="HTML")
 
-@router.message(F.text.contains("Админ-панель"), F.chat.type == "private")
+@router.message(F.text.regexp(r"(?i)админ-панел"), F.chat.type == "private")
 async def open_admin_panel(message: Message, state: FSMContext):
     if not await is_main_admin(message.from_user.id):
         return
@@ -1092,1032 +1094,8 @@ async def open_admin_panel(message: Message, state: FSMContext):
     kb = await admin_panel_kb()
     await message.answer("<tg-emoji emoji-id='5348292765325212780'>🔥</tg-emoji> <b>Панель администратора</b>", reply_markup=kb, parse_mode="HTML")
 
-@router.callback_query(F.data == "adm_stats")
-async def callback_stats(call: CallbackQuery):
-    if not await is_main_admin(call.from_user.id):
-        await call.answer("❌ Нет доступа", show_alert=True)
-        return
-    users_count = await get_all_users_count()
-    total, closed, rejected, avg_rating = await get_tickets_stats()
-
-    stats_text = (
-        "<tg-emoji emoji-id='5346267671065281783'>🔥</tg-emoji> <b>Общая статистика поддержки:</b>\n\n"
-        f"{ICON_USERS} Активных пользователей: <code>{users_count}</code>\n"
-        f"<tg-emoji emoji-id='5348348681504441752'>🔥</tg-emoji> Всего тикетов: <code>{total}</code>\n"
-        f"{ICON_CHECK} Успешно закрыто: <code>{closed}</code>\n"
-        f"{ICON_CROSS} Отклонено: <code>{rejected}</code>\n"
-        f"{ICON_STAR} Общая оценка саппорта: <code>{avg_rating} / 5.0</code>"
-    )
-    kb = await admin_panel_kb()
-    await call.message.edit_text(stats_text, reply_markup=kb, parse_mode="HTML")
-    await call.answer()
-
-@router.callback_query(F.data == "adm_list_stats")
-async def callback_admin_list_stats(call: CallbackQuery):
-    if not await is_main_admin(call.from_user.id):
-        await call.answer("❌ Нет доступа", show_alert=True)
-        return
-    
-    rows = await get_admin_list_stats()
-    if not rows:
-        text = f"{ICON_USERS} <b>Статистика по администраторам:</b>\n\nПока нет закрытых тикетов у админов."
-    else:
-        text = f"{ICON_USERS} <b>Статистика по администраторам:</b>\n\n"
-        for admin_id, closed_cnt, avg_score, agent_no in rows:
-            try:
-                chat_member = await bot.get_chat(admin_id)
-                name = chat_member.full_name
-            except Exception:
-                name = f"ID: {admin_id}"
-            agent_str = f" [Агент #{agent_no}]" if agent_no else ""
-            text += f"{ICON_USERS} <b>{html.escape(name)}</b>{agent_str} (<code>{admin_id}</code>)\n"
-            text += f"   • Закрыто тикетов: <code>{closed_cnt}</code>\n"
-            text += f"   • Средняя оценка: <code>{round(float(avg_score), 2)} / 5.0</code>\n\n"
-
-    back_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_adm")]])
-    await call.message.edit_text(text, reply_markup=back_kb, parse_mode="HTML")
-    await call.answer()
-
-@router.callback_query(F.data == "back_to_adm")
-async def back_to_admin_panel(call: CallbackQuery):
-    if not await is_main_admin(call.from_user.id): return
-    kb = await admin_panel_kb()
-    await call.message.edit_text("<tg-emoji emoji-id='5348292765325212780'>🔥</tg-emoji> <b>Панель администратора</b>", reply_markup=kb, parse_mode="HTML")
-    await call.answer()
-
-@router.callback_query(F.data == "manage_main_admins")
-async def manage_main_admins_callback(call: CallbackQuery):
-    if OWNER_ID and call.from_user.id != OWNER_ID:
-        await call.answer("❌ Только создатель бота может управлять главными админами!", show_alert=True)
-        return
-    
-    def _query():
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT admin_id FROM main_admins")
-                return cur.fetchall()
-    try:
-        res = await asyncio.to_thread(_query)
-    except Exception:
-        res = []
-
-    text = "<tg-emoji emoji-id='5345880664447140673'>🔥</tg-emoji> <b>Главные администраторы бота:</b>\n\n"
-    for r in res:
-        text += f"• <code>{r[0]}</code>\n"
-    
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Добавить главного админа", callback_data="add_main_admin_start")],
-        [InlineKeyboardButton(text="➖ Удалить главного админа", callback_data="del_main_admin_start")],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_adm")]
-    ])
-    await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-    await call.answer()
-
-@router.callback_query(F.data == "add_main_admin_start")
-async def add_main_admin_start(call: CallbackQuery, state: FSMContext):
-    if OWNER_ID and call.from_user.id != OWNER_ID:
-        await call.answer("❌ Доступно только создателю бота!", show_alert=True)
-        return
-    await state.set_state(Form.add_main_admin_id)
-    await call.message.answer("<tg-emoji emoji-id='5346004239246183111'>🔥</tg-emoji> Введите <b>Telegram ID</b> пользователя, которого хотите сделать главным администратором:", parse_mode="HTML")
-    await call.answer()
-
-@router.message(Form.add_main_admin_id, F.chat.type == "private")
-async def process_add_main_admin(message: Message, state: FSMContext):
-    if OWNER_ID and message.from_user.id != OWNER_ID:
-        return
-    try:
-        new_id = int(message.text.strip())
-        def _query():
-            with get_db() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("INSERT INTO main_admins (admin_id) VALUES (%s) ON CONFLICT (admin_id) DO NOTHING", (new_id,))
-        await asyncio.to_thread(_query)
-        await state.clear()
-        kb = await main_keyboard(message.from_user.id)
-        await message.answer(f"{ICON_CHECK} Пользователь <code>{new_id}</code> успешно назначен главным администратором!", reply_markup=kb, parse_mode="HTML")
-    except ValueError:
-        await message.answer(f"{ICON_CROSS} Неверный формат ID. Введите числовой Telegram ID:", parse_mode="HTML")
-
-@router.callback_query(F.data == "del_main_admin_start")
-async def del_main_admin_start(call: CallbackQuery, state: FSMContext):
-    if OWNER_ID and call.from_user.id != OWNER_ID:
-        await call.answer("❌ Доступно только создателю бота!", show_alert=True)
-        return
-    await state.set_state(Form.del_main_admin_id)
-    await call.message.answer("<tg-emoji emoji-id='5346176879751612829'>🔥</tg-emoji> Введите <b>Telegram ID</b> главного администратора, которого хотите снять:", parse_mode="HTML")
-    await call.answer()
-
-@router.message(Form.del_main_admin_id, F.chat.type == "private")
-async def process_del_main_admin(message: Message, state: FSMContext):
-    if OWNER_ID and message.from_user.id != OWNER_ID:
-        return
-    try:
-        del_id = int(message.text.strip())
-        if OWNER_ID and del_id == OWNER_ID:
-            await message.answer(f"{ICON_CROSS} Нельзя удалить создателя бота!", parse_mode="HTML")
-            return
-        def _query():
-            with get_db() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("DELETE FROM main_admins WHERE admin_id = %s", (del_id,))
-        await asyncio.to_thread(_query)
-        await state.clear()
-        kb = await main_keyboard(message.from_user.id)
-        await message.answer(f"{ICON_CHECK} Пользователь <code>{del_id}</code> снят с поста главного администратора.", reply_markup=kb, parse_mode="HTML")
-    except ValueError:
-        await message.answer(f"{ICON_CROSS} Введите числовой Telegram ID:", parse_mode="HTML")
-
-@router.callback_query(F.data == "toggle_friend")
-async def toggle_friend_callback(call: CallbackQuery):
-    if not await is_main_admin(call.from_user.id): return
-    current = await get_setting("friend_active", "false")
-    new_val = "false" if current == "true" else "true"
-    await set_setting("friend_active", new_val)
-    await call.answer("Статус изменен")
-    kb = await admin_panel_kb()
-    await call.message.edit_reply_markup(reply_markup=kb)
-
-@router.callback_query(F.data == "toggle_helper")
-async def toggle_helper_callback(call: CallbackQuery):
-    if not await is_main_admin(call.from_user.id): return
-    current = await get_setting("helper_recruitment", "true")
-    new_val = "false" if current == "true" else "true"
-    await set_setting("helper_recruitment", new_val)
-    await call.answer("Статус набора хелперов изменен")
-    kb = await admin_panel_kb()
-    await call.message.edit_reply_markup(reply_markup=kb)
-
-@router.callback_query(F.data == "toggle_secret")
-async def toggle_secret_callback(call: CallbackQuery):
-    if not await is_main_admin(call.from_user.id): return
-    current = await get_setting("secret_recruitment", "true")
-    new_val = "false" if current == "true" else "true"
-    await set_setting("secret_recruitment", new_val)
-    await call.answer("Статус набора в искатели изменен")
-    kb = await admin_panel_kb()
-    await call.message.edit_reply_markup(reply_markup=kb)
-
-@router.callback_query(F.data == "change_friend_nick")
-async def change_friend_nick_callback(call: CallbackQuery, state: FSMContext):
-    if not await is_main_admin(call.from_user.id): return
-    await state.set_state(Form.set_friend_nick)
-    current_nick = await get_setting("friend_nickname", "Не задан")
-    await call.message.answer(f"{ICON_PENCIL} Введите новый ник для друзей. Текущий: <code>{html.escape(current_nick)}</code>", parse_mode="HTML")
-    await call.answer()
-
-@router.message(Form.set_friend_nick)
-async def save_friend_nick(message: Message, state: FSMContext):
-    if not await is_main_admin(message.from_user.id): return
-    await set_setting("friend_nickname", message.text.strip())
-    await state.clear()
-    kb = await main_keyboard(message.from_user.id)
-    await message.answer(f"{ICON_CHECK} Ник успешно изменен!", reply_markup=kb, parse_mode="HTML")
-
-# ----------------------------------------------------------------------
-# АДМИН-ПАНЕЛЬ: УПРАВЛЕНИЕ СЕКРЕТКАМИ
-# ----------------------------------------------------------------------
-@router.callback_query(F.data == "adm_secret_panel")
-async def adm_secret_panel(call: CallbackQuery):
-    if not await is_main_admin(call.from_user.id): return
-    dur = await get_setting("timer_seconds", "510")
-    dur_int = int(dur) if dur.isdigit() else 510
-    m, s = dur_int // 60, dur_int % 60
-    text = (
-        f"{ICON_BALL} <b>Панель управления секретками</b>\n\n"
-        f"{ICON_TIMER} Таймер удаления ссылки: <b>{m} мин. {s} сек.</b> (<code>{dur_int}</code> сек.)\n"
-        f"Настройте нужные параметры ниже:"
-    )
-    await call.message.edit_text(text, reply_markup=secret_admin_kb(), parse_mode="HTML")
-    await call.answer()
-
-@router.callback_query(F.data == "sec_manage_pubs")
-async def sec_manage_pubs(call: CallbackQuery):
-    if not await is_main_admin(call.from_user.id): return
-    def _query():
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT user_id FROM secret_publishers ORDER BY user_id")
-                return [r[0] for r in cur.fetchall()]
-    pubs = await asyncio.to_thread(_query)
-    text = f"{ICON_USERS} <b>Список публикаторов секреток:</b>\n\n"
-    if pubs:
-        for idx, p_id in enumerate(pubs, 1):
-            name_display = "Неизвестно"
-            try:
-                chat_info = await bot.get_chat(p_id)
-                if chat_info.username:
-                    name_display = f"@{chat_info.username}"
-                elif chat_info.full_name:
-                    name_display = html.escape(chat_info.full_name)
-            except Exception:
-                pass
-            text += f"{idx}. <a href='tg://openmessage?user_id={p_id}'>{p_id}</a> - {name_display}\n"
-    else:
-        text += "<i>Список пуст (кнопка 'Секретки' никому не видна).</i>\n"
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Добавить публикатора", callback_data="sec_add_pub")],
-        [InlineKeyboardButton(text="➖ Удалить публикатора", callback_data="sec_del_pub")],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="adm_secret_panel")]
-    ])
-    await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
-    await call.answer()
-
-@router.callback_query(F.data == "sec_add_pub")
-async def sec_add_pub_prompt(call: CallbackQuery, state: FSMContext):
-    if not await is_main_admin(call.from_user.id): return
-    await state.set_state(SecretAdminStates.add_publisher_id)
-    await call.message.answer(f"{ICON_USERS} Введите <b>Telegram ID</b> пользователя, которому хотите выдать доступ к секреткам:", parse_mode="HTML")
-    await call.answer()
-
-@router.message(SecretAdminStates.add_publisher_id)
-async def sec_add_pub_proc(message: Message, state: FSMContext):
-    if not await is_main_admin(message.from_user.id): return
-    try:
-        t_id = int(message.text.strip())
-        def _q():
-            with get_db() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("INSERT INTO secret_publishers (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING", (t_id,))
-        await asyncio.to_thread(_q)
-        await state.clear()
-        kb = await main_keyboard(message.from_user.id)
-        await message.answer(f"{ICON_CHECK} Пользователь <code>{t_id}</code> добавлен в публикаторы! У него появится кнопка '🔮 Секретки'.", reply_markup=kb, parse_mode="HTML")
-    except ValueError:
-        await message.answer(f"{ICON_CROSS} Введите корректный числовой ID.", parse_mode="HTML")
-
-@router.callback_query(F.data == "sec_del_pub")
-async def sec_del_pub_prompt(call: CallbackQuery, state: FSMContext):
-    if not await is_main_admin(call.from_user.id): return
-    await state.set_state(SecretAdminStates.del_publisher_id)
-    await call.message.answer(f"{ICON_USERS} Введите <b>Telegram ID</b> пользователя для отзыва прав публикатора:", parse_mode="HTML")
-    await call.answer()
-
-@router.message(SecretAdminStates.del_publisher_id)
-async def sec_del_pub_proc(message: Message, state: FSMContext):
-    if not await is_main_admin(message.from_user.id): return
-    try:
-        t_id = int(message.text.strip())
-        def _q():
-            with get_db() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("DELETE FROM secret_publishers WHERE user_id = %s", (t_id,))
-        await asyncio.to_thread(_q)
-        await state.clear()
-        kb = await main_keyboard(message.from_user.id)
-        await message.answer(f"{ICON_CHECK} Пользователь <code>{t_id}</code> удален из публикаторов.", reply_markup=kb, parse_mode="HTML")
-    except ValueError:
-        await message.answer(f"{ICON_CROSS} Введите корректный числовой ID.", parse_mode="HTML")
-
-@router.callback_query(F.data == "sec_stats")
-async def sec_stats(call: CallbackQuery):
-    if not await is_main_admin(call.from_user.id): return
-    def _query():
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT user_id, channel_id, message_id, secret_type, created_at
-                    FROM secret_posts
-                    WHERE created_at >= CURRENT_TIMESTAMP - INTERVAL '24 hours'
-                    ORDER BY created_at DESC
-                """)
-                return cur.fetchall()
-                
-    posts = await asyncio.to_thread(_query)
-    
-    if not posts:
-        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="adm_secret_panel")]])
-        await call.message.edit_text(f"{ICON_BALL} <b>Статистика публикаций за последние 24 часа:</b>\n\n<i>За последние 24 часа постов не публиковалось.</i>", reply_markup=kb, parse_mode="HTML")
-        await call.answer()
-        return
-
-    user_posts_map = {}
-    for u_id, ch_id, mid, stype, c_time in posts:
-        if u_id not in user_posts_map:
-            user_posts_map[u_id] = []
-        user_posts_map[u_id].append((ch_id, mid, stype, c_time))
-
-    text = f"{ICON_BALL} <b>Статистика публикаций за последние 24 часа (МСК):</b>\n\n"
-    
-    pub_index = 1
-    for u_id, p_list in user_posts_map.items():
-        name_display = "Неизвестно"
-        try:
-            chat_info = await bot.get_chat(u_id)
-            if chat_info.username:
-                name_display = f"@{chat_info.username}"
-            elif chat_info.full_name:
-                name_display = html.escape(chat_info.full_name)
-        except Exception:
-            pass
-            
-        posts_count = len(p_list)
-        text += f"{pub_index}. <a href='tg://openmessage?user_id={u_id}'>{u_id}</a> - {name_display} - <b>{posts_count} пост(ов)</b>:\n"
-        
-        for post_idx, (ch_id, mid, stype, c_time) in enumerate(p_list, 1):
-            msk_time = c_time.astimezone(MSK_TZ)
-            time_str = msk_time.strftime("%H:%M:%S %d.%m.%Y")
-            
-            clean_ch = ch_id.replace("@", "")
-            if clean_ch.startswith("https://t.me/"):
-                post_url = f"{clean_ch}/{mid}"
-            else:
-                post_url = f"https://t.me/{clean_ch}/{mid}"
-                
-            text += f"   {post_idx}. {time_str} ({html.escape(stype)}) — <a href='{post_url}'>ссылка</a>\n"
-            
-        text += "\n"
-        pub_index += 1
-
-    if len(text) > 4000:
-        text = text[:3950] + "\n... <i>(список сокращен из-за лимита длины)</i>"
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="adm_secret_panel")]])
-    await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
-    await call.answer()
-
-@router.callback_query(F.data == "sec_set_timer")
-async def sec_set_timer(call: CallbackQuery, state: FSMContext):
-    if not await is_main_admin(call.from_user.id): return
-    await state.set_state(SecretAdminStates.set_timer)
-    await call.message.answer(f"{ICON_TIMER} Введите новое время таймера <b>в секундах</b> (например, <code>510</code> для 8.5 минут):", parse_mode="HTML")
-    await call.answer()
-
-@router.message(SecretAdminStates.set_timer)
-async def sec_set_timer_proc(message: Message, state: FSMContext):
-    if not await is_main_admin(message.from_user.id): return
-    if not message.text.isdigit():
-        await message.answer(f"{ICON_CROSS} Введите число секунд:", parse_mode="HTML")
-        return
-    await set_setting("timer_seconds", message.text.strip())
-    await state.clear()
-    kb = await main_keyboard(message.from_user.id)
-    await message.answer(f"{ICON_CHECK} Время таймера установлено на <code>{message.text.strip()}</code> сек!", reply_markup=kb, parse_mode="HTML")
-
-@router.callback_query(F.data == "sec_templates")
-async def sec_templates(call: CallbackQuery):
-    if not await is_main_admin(call.from_user.id): return
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✏️ Обычный активный пост", callback_data="sec_tmpl_act")],
-        [InlineKeyboardButton(text="🌾 Шаблон фарм-секретки", callback_data="sec_tmpl_farm")],
-        [InlineKeyboardButton(text="✏ Истекший пост", callback_data="sec_tmpl_exp")],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="adm_secret_panel")]
-    ])
-    await call.message.edit_text(f"{ICON_PENCIL} <b>Редактирование шаблонов:</b>\n\nВыберите нужный шаблон:", reply_markup=kb, parse_mode="HTML")
-    await call.answer()
-
-@router.callback_query(F.data == "sec_tmpl_act")
-async def sec_tmpl_act(call: CallbackQuery, state: FSMContext):
-    if not await is_main_admin(call.from_user.id): return
-    tmpl = await get_setting("template_active")
-    await state.set_state(SecretAdminStates.template_active)
-    await call.message.answer(f"{ICON_PENCIL} <b>Текущий шаблон активного поста:</b>\n\n<pre>{html.escape(tmpl)}</pre>\n\nОтправьте новый текст (доступны теги <code>[Тип_Секретки]</code>, <code>[Склоненный_Тип]</code>, <code>[Ссылка]</code>):", parse_mode="HTML")
-    await call.answer()
-
-@router.message(SecretAdminStates.template_active)
-async def sec_tmpl_act_proc(message: Message, state: FSMContext):
-    if not await is_main_admin(message.from_user.id): return
-    await set_setting("template_active", message.text)
-    await state.clear()
-    kb = await main_keyboard(message.from_user.id)
-    await message.answer(f"{ICON_CHECK} Шаблон активного поста обновлен!", reply_markup=kb, parse_mode="HTML")
-
-@router.callback_query(F.data == "sec_tmpl_farm")
-async def sec_tmpl_farm(call: CallbackQuery, state: FSMContext):
-    if not await is_main_admin(call.from_user.id): return
-    tmpl = await get_setting("template_farm")
-    await state.set_state(SecretAdminStates.template_farm)
-    await call.message.answer(f"{ICON_PENCIL} <b>Текущий шаблон фарм-секретки:</b>\n\n<pre>{html.escape(tmpl)}</pre>\n\nОтправьте новый текст (доступны теги <code>[Тип_Особенной_Секретки]</code>, <code>[Ссылка]</code>):", parse_mode="HTML")
-    await call.answer()
-
-@router.message(SecretAdminStates.template_farm)
-async def sec_tmpl_farm_proc(message: Message, state: FSMContext):
-    if not await is_main_admin(message.from_user.id): return
-    await set_setting("template_farm", message.text)
-    await state.clear()
-    kb = await main_keyboard(message.from_user.id)
-    await message.answer(f"{ICON_CHECK} Шаблон фарм-секретки обновлен!", reply_markup=kb, parse_mode="HTML")
-
-@router.callback_query(F.data == "sec_tmpl_exp")
-async def sec_tmpl_exp(call: CallbackQuery, state: FSMContext):
-    if not await is_main_admin(call.from_user.id): return
-    tmpl = await get_setting("template_expired")
-    await state.set_state(SecretAdminStates.template_expired)
-    await call.message.answer(f"{ICON_PENCIL} <b>Текущий шаблон истекшего поста:</b>\n\n<pre>{html.escape(tmpl)}</pre>\n\nОтправьте новый текст (доступен тег <code>[Тип_Секретки]</code>):", parse_mode="HTML")
-    await call.answer()
-
-@router.message(SecretAdminStates.template_expired)
-async def sec_tmpl_exp_proc(message: Message, state: FSMContext):
-    if not await is_main_admin(message.from_user.id): return
-    await set_setting("template_expired", message.text)
-    await state.clear()
-    kb = await main_keyboard(message.from_user.id)
-    await message.answer(f"{ICON_CHECK} Шаблон истекшего поста обновлен!", reply_markup=kb, parse_mode="HTML")
-
-@router.callback_query(F.data == "sec_add_type")
-async def sec_add_type(call: CallbackQuery, state: FSMContext):
-    if not await is_main_admin(call.from_user.id): return
-    await state.set_state(SecretAdminStates.add_type_name)
-    await call.message.answer(f"{ICON_BALL} Введите название нового типа (например, <code>Звезда</code>):", parse_mode="HTML")
-    await call.answer()
-
-@router.message(SecretAdminStates.add_type_name)
-async def sec_add_type_name_proc(message: Message, state: FSMContext):
-    if not await is_main_admin(message.from_user.id): return
-    await state.update_data(new_t_name=message.text.strip())
-    await state.set_state(SecretAdminStates.add_type_declined)
-    await message.answer("Введите форму родительного падежа (например, <code>звезды</code>):", parse_mode="HTML")
-
-@router.message(SecretAdminStates.add_type_declined)
-async def sec_add_type_dec_proc(message: Message, state: FSMContext):
-    if not await is_main_admin(message.from_user.id): return
-    data = await state.get_data()
-    t_name = data["new_t_name"]
-    t_dec = message.text.strip()
-    def _q():
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute("INSERT INTO secret_types (name, declined) VALUES (%s, %s) ON CONFLICT (name) DO UPDATE SET declined = EXCLUDED.declined", (t_name, t_dec))
-    await asyncio.to_thread(_q)
-    await state.clear()
-    kb = await main_keyboard(message.from_user.id)
-    await message.answer(f"{ICON_CHECK} Тип секретки <b>{t_name}</b> успешно добавлен!", reply_markup=kb, parse_mode="HTML")
-
-@router.callback_query(F.data == "sec_del_type")
-async def sec_del_type(call: CallbackQuery):
-    if not await is_main_admin(call.from_user.id): return
-    types_d = await get_secret_types_dict()
-    buttons = []
-    for k in types_d.keys():
-        buttons.append([InlineKeyboardButton(text=f"🗑 {k}", callback_data=f"sec_rmtype_{k}")])
-    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="adm_secret_panel")])
-    await call.message.edit_text("🗑 Выберите обычный тип секретки для удаления:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
-    await call.answer()
-
-@router.callback_query(F.data.startswith("sec_rmtype_"))
-async def sec_rmtype_proc(call: CallbackQuery):
-    if not await is_main_admin(call.from_user.id): return
-    t_name = call.data.split("_", 2)[2]
-    def _q():
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute("DELETE FROM secret_types WHERE name = %s", (t_name,))
-    await asyncio.to_thread(_q)
-    await call.message.edit_text(f"{ICON_CHECK} Тип секретки <b>{t_name}</b> удален.", parse_mode="HTML")
-    await call.answer()
-
-@router.callback_query(F.data == "sec_add_spec_type")
-async def sec_add_spec_type_prompt(call: CallbackQuery, state: FSMContext):
-    if not await is_main_admin(call.from_user.id): return
-    await state.set_state(SecretAdminStates.add_special_type_name)
-    await call.message.answer(f"{ICON_BALL} Введите название нового <b>особого типа</b> (например, <code>Фарм монет</code>):", parse_mode="HTML")
-    await call.answer()
-
-@router.message(SecretAdminStates.add_special_type_name)
-async def sec_add_spec_type_proc(message: Message, state: FSMContext):
-    if not await is_main_admin(message.from_user.id): return
-    t_name = message.text.strip()
-    def _q():
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute("INSERT INTO special_secret_types (name) VALUES (%s) ON CONFLICT (name) DO NOTHING", (t_name,))
-    await asyncio.to_thread(_q)
-    await state.clear()
-    kb = await main_keyboard(message.from_user.id)
-    await message.answer(f"{ICON_CHECK} Особый тип <b>{t_name}</b> успешно добавлен!", reply_markup=kb, parse_mode="HTML")
-
-@router.callback_query(F.data == "sec_del_spec_type")
-async def sec_del_spec_type(call: CallbackQuery):
-    if not await is_main_admin(call.from_user.id): return
-    spec_list = await get_special_secret_types()
-    if not spec_list:
-        await call.answer("Особых типов пока нет!", show_alert=True)
-        return
-    buttons = []
-    for k in spec_list:
-        buttons.append([InlineKeyboardButton(text=f"🗑 {k}", callback_data=f"sec_rmspec_{k}")])
-    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="adm_secret_panel")])
-    await call.message.edit_text("🗑 Выберите особый тип секретки для удаления:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
-    await call.answer()
-
-@router.callback_query(F.data.startswith("sec_rmspec_"))
-async def sec_rmspec_proc(call: CallbackQuery):
-    if not await is_main_admin(call.from_user.id): return
-    t_name = call.data.split("_", 2)[2]
-    def _q():
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute("DELETE FROM special_secret_types WHERE name = %s", (t_name,))
-    await asyncio.to_thread(_q)
-    await call.message.edit_text(f"{ICON_CHECK} Особый тип <b>{t_name}</b> удален.", parse_mode="HTML")
-    await call.answer()
-
-# ----------------------------------------------------------------------
-# ПУБЛИКАЦИЯ СЕКРЕТОК (ОБЫЧНЫЕ + ФАРМ) С ЗАЩИТОЙ ОТ ДАБЛ-КЛИКА
-# ----------------------------------------------------------------------
-@router.message(F.text.contains("Секретки"), F.chat.type == "private")
-async def open_secrets_menu(message: Message, state: FSMContext):
-    if not await is_secret_publisher(message.from_user.id):
-        return
-    await state.clear()
-    await message.answer(
-        f"{ICON_BALL} <b>Панель публикации секреток</b>\n\nВыберите нужное действие:",
-        reply_markup=publisher_menu_kb(),
-        parse_mode="HTML"
-    )
-
-@router.callback_query(F.data == "pub_bind_channel")
-async def pub_bind_channel_prompt(call: CallbackQuery, state: FSMContext):
-    if not await is_secret_publisher(call.from_user.id): return
-    await state.set_state(SecretPublisherStates.waiting_for_channel)
-    await call.message.answer(
-        f"{ICON_HORN} Отправьте <b>@username</b> канала (например, <code>@my_channel</code>).\n"
-        "<i>Убедитесь, что бот добавлен туда администратором с правом публикации!</i>",
-        parse_mode="HTML"
-    )
-    await call.answer()
-
-@router.message(SecretPublisherStates.waiting_for_channel)
-async def pub_bind_channel_proc(message: Message, state: FSMContext):
-    if not await is_secret_publisher(message.from_user.id): return
-    ch_input = message.text.strip()
-    user_id = message.from_user.id
-    try:
-        b_mem = await bot.get_chat_member(chat_id=ch_input, user_id=bot.id)
-        if b_mem.status not in ["administrator", "creator"]:
-            await message.answer(f"{ICON_CROSS} Бот не является админом в этом канале!", parse_mode="HTML")
-            return
-        u_mem = await bot.get_chat_member(chat_id=ch_input, user_id=user_id)
-        if u_mem.status not in ["administrator", "creator"]:
-            await message.answer(f"{ICON_CROSS} Вы не админ этого канала!", parse_mode="HTML")
-            return
-        def _q():
-            with get_db() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "INSERT INTO secret_channels (user_id, channel_id) VALUES (%s, %s) "
-                        "ON CONFLICT (user_id) DO UPDATE SET channel_id = EXCLUDED.channel_id",
-                        (user_id, ch_input)
-                    )
-        await asyncio.to_thread(_q)
-        await state.clear()
-        kb = await main_keyboard(user_id)
-        await message.answer(f"{ICON_CHECK} Канал <b>{ch_input}</b> успешно привязан!", reply_markup=kb, parse_mode="HTML")
-    except Exception as e:
-        await message.answer(f"{ICON_CROSS} Ошибка проверки канала: {e}", parse_mode="HTML")
-
-@router.callback_query(F.data == "pub_my_posts")
-async def pub_my_posts(call: CallbackQuery):
-    if not await is_secret_publisher(call.from_user.id): return
-    def _q():
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT id, secret_type, message_id FROM secret_posts "
-                    "WHERE user_id = %s AND is_expired = FALSE ORDER BY id DESC",
-                    (call.from_user.id,)
-                )
-                return cur.fetchall()
-    posts = await asyncio.to_thread(_q)
-    if not posts:
-        await call.message.answer("📭 У вас нет активных опубликованных постов.")
-        await call.answer()
-        return
-    kb_bts = []
-    for pid, stype, mid in posts:
-        kb_bts.append([InlineKeyboardButton(text=f"📌 {stype} (ID: {mid}) — Завершить", callback_data=f"pub_close_{pid}")])
-    await call.message.answer("📋 Ваши активные посты:\nНажмите, чтобы досрочно удалить ссылку в канале:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_bts))
-    await call.answer()
-
-@router.callback_query(F.data.startswith("pub_close_"))
-async def pub_close_post(call: CallbackQuery):
-    if not await is_secret_publisher(call.from_user.id): return
-    pid = int(call.data.split("_")[2])
-    def _q():
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT channel_id, message_id, secret_type, is_expired FROM secret_posts WHERE id = %s", (pid,))
-                return cur.fetchone()
-    row = await asyncio.to_thread(_q)
-    if not row or row[3]:
-        await call.answer("⚠️ Пост уже завершен или не найден!", show_alert=True)
-        return
-    await expire_secret_post(bot, pid, row[0], row[1], row[2])
-    await call.message.edit_text(f"{ICON_CHECK} Пост закрыт досрочно (ссылка стёрта).", parse_mode="HTML")
-    await call.answer()
-
-@router.callback_query(F.data == "pub_send_secret")
-async def pub_send_secret(call: CallbackQuery, state: FSMContext):
-    if not await is_secret_publisher(call.from_user.id): return
-    ch_id = await check_channel_rights(bot, call.from_user.id)
-    if not ch_id:
-        await call.message.answer(f"{ICON_CROSS} Сначала привяжите канал через меню секреток!", reply_markup=publisher_menu_kb(), parse_mode="HTML")
-        await call.answer()
-        return
-    
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔮 Обычная секретка", callback_data="pub_mode_normal")],
-        [InlineKeyboardButton(text="🌾 Фарм секретка", callback_data="pub_mode_farm")]
-    ])
-    await call.message.edit_text("<b>Выберите категорию публикации:</b>", reply_markup=kb, parse_mode="HTML")
-    await state.set_state(SecretPublisherStates.waiting_for_mode)
-    await call.answer()
-
-@router.callback_query(SecretPublisherStates.waiting_for_mode, F.data == "pub_mode_normal")
-async def pub_mode_normal(call: CallbackQuery, state: FSMContext):
-    await state.update_data(is_farm=False)
-    types_d = await get_secret_types_dict()
-    if not types_d:
-        await call.message.answer(f"{ICON_CROSS} В базе нет типов секреток. Обратитесь к создателю.", parse_mode="HTML")
-        await call.answer()
-        return
-    buttons = []
-    for s_name in types_d.keys():
-        buttons.append([InlineKeyboardButton(text=f"🔹 {s_name}", callback_data=f"pub_settype_{s_name}")])
-    await call.message.edit_text("Выберите тип секретки:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
-    await state.set_state(SecretPublisherStates.waiting_for_type)
-    await call.answer()
-
-@router.callback_query(SecretPublisherStates.waiting_for_mode, F.data == "pub_mode_farm")
-async def pub_mode_farm(call: CallbackQuery, state: FSMContext):
-    await state.update_data(is_farm=True)
-    spec_list = await get_special_secret_types()
-    if not spec_list:
-        await call.message.answer(f"{ICON_CROSS} В базе нет особых типов секреток. Добавьте их в админ-панели!", parse_mode="HTML")
-        await call.answer()
-        return
-    buttons = []
-    for k in spec_list:
-        buttons.append([InlineKeyboardButton(text=f"🌾 {k}", callback_data=f"pub_farm_sel_{k}")])
-    await call.message.edit_text("🌾 <b>Выбран режим: Фарм секретка</b>\n\nВыберите тип фарма кнопкой ниже:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
-    await state.set_state(SecretPublisherStates.waiting_for_farm_choice)
-    await call.answer()
-
-@router.callback_query(SecretPublisherStates.waiting_for_farm_choice, F.data.startswith("pub_farm_sel_"))
-async def pub_farm_choice_selected(call: CallbackQuery, state: FSMContext):
-    f_type = call.data.split("_", 3)[3]
-    await state.update_data(secret_type=f_type)
-    await call.message.edit_text(f"Выбран тип: <b>{html.escape(f_type)}</b>\n\nТеперь отправьте <b>фотографию</b> секретки:", parse_mode="HTML")
-    await state.set_state(SecretPublisherStates.waiting_for_photo)
-    await call.answer()
-
-@router.callback_query(SecretPublisherStates.waiting_for_type, F.data.startswith("pub_settype_"))
-async def pub_settype(call: CallbackQuery, state: FSMContext):
-    stype = call.data.split("_", 2)[2]
-    await state.update_data(secret_type=stype)
-    await call.message.edit_text(f"Выбрано: <b>{stype}</b>\n\nТеперь отправьте <b>фотографию</b> секретки:", parse_mode="HTML")
-    await state.set_state(SecretPublisherStates.waiting_for_photo)
-    await call.answer()
-
-@router.message(SecretPublisherStates.waiting_for_photo, F.photo)
-async def pub_photo(message: Message, state: FSMContext):
-    await state.update_data(photo_id=message.photo[-1].file_id)
-    await message.answer("Отлично! Теперь отправьте <b>ссылку на VIP-сервер</b> Roblox:", parse_mode="HTML")
-    await state.set_state(SecretPublisherStates.waiting_for_link)
-
-@router.message(SecretPublisherStates.waiting_for_link, F.text)
-async def pub_link(message: Message, state: FSMContext):
-    raw = message.text.strip()
-    clean = re.sub(r'\s+', '', raw)
-    clean_lower = clean.lower()
-
-    is_roblox = "roblox.com" in clean_lower
-    is_vip = ("privateserverlinkcode=" in clean_lower) or ("share?code=" in clean_lower)
-
-    if not (is_roblox and is_vip):
-        await message.answer(
-            f"{ICON_CROSS} <b>Некорректная ссылка на VIP-сервер!</b>\n\n"
-            "Бот принимает ссылки на VIP-сервера Roblox:\n"
-            "• С ПК: <code>...roblox.com/games/...?privateServerLinkCode=...</code>\n"
-            "• С телефона: <code>...roblox.com/share?code=...</code>",
-            parse_mode="HTML"
-        )
-        return
-
-    await state.update_data(link=clean)
-    data = await state.get_data()
-    stype = data["secret_type"]
-    is_farm = data.get("is_farm", False)
-
-    if is_farm:
-        tmpl = await get_setting("template_farm")
-        preview = (
-            tmpl.replace("[Тип_Особенной_Секретки]", stype)
-                .replace("[Ссылка]", clean)
-        )
-    else:
-        types_d = await get_secret_types_dict()
-        dec = types_d.get(stype, stype)
-        tmpl = await get_setting("template_active")
-        preview = (
-            tmpl.replace("[Тип_Секретки]", stype)
-                .replace("[Склоненный_Тип]", dec)
-                .replace("[Ссылка]", clean)
-        )
-        
-    conf_kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Опубликовать", callback_data="pub_conf_yes"),
-        InlineKeyboardButton(text="❌ Отмена", callback_data="pub_conf_no")
-    ]])
-    await message.answer("Предпросмотр поста:")
-    await message.answer_photo(photo=data["photo_id"], caption=preview, reply_markup=conf_kb, parse_mode="HTML")
-    await state.set_state(SecretPublisherStates.waiting_for_confirm)
-
-@router.callback_query(SecretPublisherStates.waiting_for_confirm, F.data.startswith("pub_conf_"))
-async def pub_confirm(call: CallbackQuery, state: FSMContext):
-    action = call.data.split("_")[2]
-    
-    if action == "yes":
-        try:
-            await call.message.edit_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-
-        async with publish_lock:
-            data = await state.get_data()
-            if not data or "secret_type" not in data:
-                await call.answer()
-                return
-
-            ch_id = await check_channel_rights(bot, call.from_user.id)
-            if not ch_id:
-                try:
-                    await call.message.edit_caption(caption=f"{ICON_CROSS} Ошибка: нет доступа к привязанному каналу!", reply_markup=None, parse_mode="HTML")
-                except Exception:
-                    pass
-                await state.clear()
-                await call.answer()
-                return
-
-            stype = data["secret_type"]
-            is_farm = data.get("is_farm", False)
-
-            if is_farm:
-                tmpl = await get_setting("template_farm")
-                final_txt = (
-                    tmpl.replace("[Тип_Особенной_Секретки]", stype)
-                        .replace("[Ссылка]", data["link"])
-                )
-            else:
-                types_d = await get_secret_types_dict()
-                dec = types_d.get(stype, stype)
-                tmpl = await get_setting("template_active")
-                final_txt = (
-                    tmpl.replace("[Тип_Секретки]", stype)
-                        .replace("[Склоненный_Тип]", dec)
-                        .replace("[Ссылка]", data["link"])
-                )
-
-            try:
-                sent = await bot.send_photo(chat_id=ch_id, photo=data["photo_id"], caption=final_txt, parse_mode="HTML")
-                def _save():
-                    with get_db() as conn:
-                        with conn.cursor() as cur:
-                            cur.execute(
-                                "INSERT INTO secret_posts (user_id, channel_id, message_id, secret_type, base_text) "
-                                "VALUES (%s, %s, %s, %s, %s) RETURNING id",
-                                (call.from_user.id, ch_id, sent.message_id, stype, final_txt)
-                            )
-                            return cur.fetchone()[0]
-                await asyncio.to_thread(_save)
-                
-                try:
-                    await call.message.edit_caption(caption=f"{ICON_CHECK} Пост успешно опубликован в канале!", reply_markup=None, parse_mode="HTML")
-                except TelegramBadRequest:
-                    pass
-            except Exception as e:
-                try:
-                    await call.message.edit_caption(caption=f"{ICON_CROSS} Ошибка публикации: {e}", reply_markup=None, parse_mode="HTML")
-                except TelegramBadRequest:
-                    pass
-            finally:
-                await state.clear()
-    else:
-        try:
-            await call.message.edit_caption(caption=f"{ICON_CROSS} Публикация отменена.", reply_markup=None, parse_mode="HTML")
-        except TelegramBadRequest:
-            pass
-        await state.clear()
-
-    await call.answer()
-
-# ----------------------------------------------------------------------
-# СИСТЕМА НАБОРА В ХЕЛПЕРЫ И ИСКАТЕЛИ СЕКРЕТОВ (ОБНОВЛЕННЫЕ ШАБЛОНЫ + ПРОВЕРКА ЮЗЕРНЕЙМА)
-# ----------------------------------------------------------------------
-
-# --- НАБОР В ХЕЛПЕРЫ (ПОДДЕРЖКА) ---
-@router.message(F.text.contains("Подать заявку на хелпера"), F.chat.type == "private")
-async def start_helper_apply(message: Message, state: FSMContext):
-    await register_user(message.from_user.id)
-    if await is_banned(message.from_user.id): return
-    if await get_setting("helper_recruitment", "true") != "true":
-        await message.answer(f"{ICON_WARN} Набор в команду поддержки в данный момент закрыт.", parse_mode="HTML")
-        return
-    await state.clear()
-    await state.set_state(Form.helper_name)
-    await message.answer(f"<tg-emoji emoji-id='5346192285799302524'>🔥</tg-emoji> <b>Заявка в команду поддержки (Хелперы)</b>\n\n{NUM_1} Ваше имя:", parse_mode="HTML")
-
-@router.message(Form.helper_name)
-async def process_helper_name(message: Message, state: FSMContext):
-    await state.update_data(helper_name=message.text.strip())
-    await state.set_state(Form.helper_age)
-    await message.answer(f"{NUM_2} Ваш возраст:", parse_mode="HTML")
-
-@router.message(Form.helper_age)
-async def process_helper_age(message: Message, state: FSMContext):
-    await state.update_data(helper_age=message.text.strip())
-    await state.set_state(Form.helper_time)
-    await message.answer(f"{NUM_3} Сколько времени вы готовы уделять на ответы в поддержке?", parse_mode="HTML")
-
-@router.message(Form.helper_time)
-async def process_helper_time(message: Message, state: FSMContext):
-    await state.update_data(helper_time=message.text.strip())
-    await state.set_state(Form.helper_why)
-    await message.answer(f"{NUM_4} Почему вы хотите именно к нам?", parse_mode="HTML")
-
-@router.message(Form.helper_why)
-async def process_helper_why(message: Message, state: FSMContext):
-    if not message.from_user.username:
-        await message.answer(
-            f"{ICON_WARN} <b>У вас не установлен @username в профиле Telegram!</b>\n\n"
-            "Для отправки анкеты и связи с администрацией обязательно иметь юзернейм.\n"
-            "Пожалуйста, установите его в настройках Telegram (Настройки ➔ Изменить профиль ➔ Имя пользователя) "
-            "и затем <b>отправьте ответ на 4-й пункт ещё раз</b>.",
-            parse_mode="HTML"
-        )
-        return
-
-    why_text = message.text.strip()
-    data = await state.get_data()
-    user = message.from_user
-    user_mention = get_user_mention(user)
-
-    admin_text = (
-        f"📝 <b>Новая заявка в команду поддержки (Хелперы)!</b>\n\n"
-        f"👤 От: {user_mention}\n"
-        f"🆔 ID: <code>{user.id}</code>\n"
-        f"👤 Username: @{user.username}\n\n"
-        f"1. <b>Имя:</b> {html.escape(data.get('helper_name', 'Не указано'))}\n"
-        f"2. <b>Возраст:</b> {html.escape(data.get('helper_age', 'Не указан'))}\n"
-        f"3. <b>Время на поддержку:</b> {html.escape(data.get('helper_time', 'Не указано'))}\n"
-        f"4. <b>Почему к нам:</b> {html.escape(why_text)}"
-    )
-
-    sent = await bot.send_message(ADMIN_CHAT_ID, admin_text, reply_markup=helper_decision_kb(user.id), parse_mode="HTML")
-    await map_message(sent.message_id, user.id, 0)
-    kb = await main_keyboard(user.id)
-    night_txt = get_night_notice()
-    await message.answer(f"{ICON_CHECK} Ваша анкета успешно отправлена администрации! Ожидайте ответа.{night_txt}", reply_markup=kb, parse_mode="HTML")
-    await state.clear()
-
-@router.callback_query(F.data.startswith("helper_accept_"))
-async def helper_accept_callback(call: CallbackQuery):
-    if not await is_support_member(call.from_user.id):
-        await call.answer("❌ У вас нет прав!", show_alert=True)
-        return
-    user_id = int(call.data.split("_")[2])
-    try:
-        await bot.send_message(user_id, "<tg-emoji emoji-id='5346038654819123712'>🔥</tg-emoji> <b>Поздравляем! Ваша заявка на хелпера принята!</b> Администрация свяжется с вами в ближайшее время.", parse_mode="HTML")
-    except Exception:
-        pass
-    await call.message.edit_text(call.message.text + "\n\n🟢 <b>Статус:</b> Одобрено ✅", parse_mode="HTML")
-    await call.answer("Заявка принята!")
-
-@router.callback_query(F.data.startswith("helper_reject_"))
-async def helper_reject_callback(call: CallbackQuery):
-    if not await is_support_member(call.from_user.id):
-        await call.answer("❌ У вас нет прав!", show_alert=True)
-        return
-    user_id = int(call.data.split("_")[2])
-    try:
-        await bot.send_message(user_id, f"{ICON_CROSS} К сожалению, ваша заявка на хелпера была отклонена.", parse_mode="HTML")
-    except Exception:
-        pass
-    await call.message.edit_text(call.message.text + "\n\n🔴 <b>Статус:</b> Отклонено ❌", parse_mode="HTML")
-    await call.answer("Заявка отклонена!")
-
-# --- НАБОР В ИСКАТЕЛИ СЕКРЕТОК ---
-@router.message(F.text.contains("Набор в искатели секреток"), F.chat.type == "private")
-async def start_secret_apply(message: Message, state: FSMContext):
-    await register_user(message.from_user.id)
-    if await is_banned(message.from_user.id): return
-    if await get_setting("secret_recruitment", "true") != "true":
-        await message.answer(f"{ICON_WARN} Набор в искатели секреток в данный момент закрыт.", parse_mode="HTML")
-        return
-    await state.clear()
-    await state.set_state(Form.secret_name)
-    await message.answer(f"<tg-emoji emoji-id='5345840270279724328'>🔥</tg-emoji> <b>Заявка в искатели секреток</b>\n\n{NUM_1} Ваше имя:", parse_mode="HTML")
-
-@router.message(Form.secret_name)
-async def process_secret_name(message: Message, state: FSMContext):
-    await state.update_data(secret_name=message.text.strip())
-    await state.set_state(Form.secret_age)
-    await message.answer(f"{NUM_2} Ваш возраст:", parse_mode="HTML")
-
-@router.message(Form.secret_age)
-async def process_secret_age(message: Message, state: FSMContext):
-    await state.update_data(secret_age=message.text.strip())
-    await state.set_state(Form.secret_vip)
-    await message.answer(f"{NUM_3} Есть ли у вас вип сервер в Tower Of Hell?", parse_mode="HTML")
-
-@router.message(Form.secret_vip)
-async def process_secret_vip(message: Message, state: FSMContext):
-    await state.update_data(secret_vip=message.text.strip())
-    await state.set_state(Form.secret_time)
-    await message.answer(f"{NUM_4} Сколько вы готовы уделять времени поиску секреток?", parse_mode="HTML")
-
-@router.message(Form.secret_time)
-async def process_secret_time(message: Message, state: FSMContext):
-    await state.update_data(secret_time=message.text.strip())
-    await state.set_state(Form.secret_why)
-    await message.answer(f"{NUM_5} Почему вы хотите именно к нам?", parse_mode="HTML")
-
-@router.message(Form.secret_why)
-async def process_secret_why(message: Message, state: FSMContext):
-    if not message.from_user.username:
-        await message.answer(
-            f"{ICON_WARN} <b>У вас не установлен @username в профиле Telegram!</b>\n\n"
-            "Для отправки анкеты и связи с администрацией обязательно иметь юзернейм.\n"
-            "Пожалуйста, установите его в настройках Telegram (Настройки ➔ Изменить профиль ➔ Имя пользователя) "
-            "и затем <b>отправьте ответ на 5-й пункт ещё раз</b>.",
-            parse_mode="HTML"
-        )
-        return
-
-    why_text = message.text.strip()
-    data = await state.get_data()
-    user = message.from_user
-    user_mention = get_user_mention(user)
-
-    admin_text = (
-        f"🔍 <b>Новая заявка в искатели секреток!</b>\n\n"
-        f"👤 От: {user_mention}\n"
-        f"🆔 ID: <code>{user.id}</code>\n"
-        f"👤 Username: @{user.username}\n\n"
-        f"1. <b>Имя:</b> {html.escape(data.get('secret_name', 'Не указано'))}\n"
-        f"2. <b>Возраст:</b> {html.escape(data.get('secret_age', 'Не указан'))}\n"
-        f"3. <b>VIP сервер в ToH:</b> {html.escape(data.get('secret_vip', 'Не указано'))}\n"
-        f"4. <b>Время на поиск:</b> {html.escape(data.get('secret_time', 'Не указано'))}\n"
-        f"5. <b>Почему к нам:</b> {html.escape(why_text)}"
-    )
-
-    sent = await bot.send_message(ADMIN_CHAT_ID, admin_text, reply_markup=secret_decision_kb(user.id), parse_mode="HTML")
-    await map_message(sent.message_id, user.id, 0)
-    kb = await main_keyboard(user.id)
-    night_txt = get_night_notice()
-    await message.answer(f"{ICON_CHECK} Ваша заявка в искатели секреток успешно отправлена! Ожидайте ответа.{night_txt}", reply_markup=kb, parse_mode="HTML")
-    await state.clear()
-
-@router.callback_query(F.data.startswith("secret_accept_"))
-async def secret_accept_callback(call: CallbackQuery):
-    if not await is_support_member(call.from_user.id):
-        await call.answer("❌ У вас нет прав!", show_alert=True)
-        return
-    user_id = int(call.data.split("_")[2])
-    try:
-        await bot.send_message(user_id, "<tg-emoji emoji-id='5346038654819123712'>🔥</tg-emoji> <b>Поздравляем! Ваша заявка в искатели секреток принята!</b> Администрация свяжется с вами в ближайшее время.", parse_mode="HTML")
-    except Exception:
-        pass
-    await call.message.edit_text(call.message.text + "\n\n🟢 <b>Статус:</b> Одобрено ✅", parse_mode="HTML")
-    await call.answer("Заявка принята!")
-
-@router.callback_query(F.data.startswith("secret_reject_"))
-async def secret_reject_callback(call: CallbackQuery):
-    if not await is_support_member(call.from_user.id):
-        await call.answer("❌ У вас нет прав!", show_alert=True)
-        return
-    user_id = int(call.data.split("_")[2])
-    try:
-        await bot.send_message(user_id, f"{ICON_CROSS} К сожалению, ваша заявка в искатели секреток была отклонена.", parse_mode="HTML")
-    except Exception:
-        pass
-    await call.message.edit_text(call.message.text + "\n\n🔴 <b>Статус:</b> Отклонено ❌", parse_mode="HTML")
-    await call.answer("Заявка отклонена!")
-
-# ----------------------------------------------------------------------
-# СОЗДАНИЕ ТИКЕТОВ С МЕДИА-БУФЕРОМ (ДО 5 ФОТО)
-# ----------------------------------------------------------------------
-async def check_active_ticket(message: Message) -> bool:
-    active = await get_active_ticket(message.from_user.id)
-    if active:
-        await message.answer(
-            f"{ICON_WARN} У вас уже есть активный тикет <b>№{active[0]}</b>.\nДождитесь ответа или закройте его, прежде чем открывать новый.",
-            parse_mode="HTML"
-        )
-        return True
-    return False
-
-async def collect_media_photos(message: Message, state: FSMContext, key: str = "photos") -> list:
-    data = await state.get_data()
-    photos = data.get(key, [])
-    if message.photo:
-        photos.append(message.photo[-1].file_id)
-        await state.update_data({key: photos})
-    return photos
-
 # --- 1. ЖАЛОБА ---
-@router.message(F.text.contains("Жалоба на игрока"), F.chat.type == "private")
+@router.message(F.text.regexp(r"(?i)жалоб"), F.chat.type == "private")
 async def start_complaint(message: Message, state: FSMContext):
     await register_user(message.from_user.id)
     if await is_banned(message.from_user.id) or await check_active_ticket(message): return
@@ -2130,6 +1108,80 @@ async def start_complaint(message: Message, state: FSMContext):
         parse_mode="HTML"
     )
 
+# --- 2. ОБЖАЛОВАНИЕ ---
+@router.message(F.text.regexp(r"(?i)обжалован"), F.chat.type == "private")
+async def start_appeal(message: Message, state: FSMContext):
+    await register_user(message.from_user.id)
+    if await is_banned(message.from_user.id) or await check_active_ticket(message): return
+    await state.clear()
+    await state.set_state(Form.appeal_nickname)
+    await message.answer(
+        f"{NUM_1} <b>Ваш ник в игре:</b>\n"
+        "<i>(Укажите ваш точный никнейм в Roblox, на который был выдан бан)</i>",
+        parse_mode="HTML"
+    )
+
+# --- 3. ВОПРОС ---
+@router.message(F.text.regexp(r"(?i)вопрос"), F.chat.type == "private")
+async def start_question(message: Message, state: FSMContext):
+    await register_user(message.from_user.id)
+    if await is_banned(message.from_user.id) or await check_active_ticket(message): return
+    await state.clear()
+    await state.set_state(Form.question_content)
+    await message.answer(f"<tg-emoji emoji-id='5348435310994802643'>🔥</tg-emoji> Задайте ваш вопрос (можно отправить текст или до 5 фото с описанием):", parse_mode="HTML")
+
+# --- 4. ДРУЗЬЯ ---
+@router.message(F.text.regexp(r"(?i)друг"), F.chat.type == "private")
+async def start_friends(message: Message, state: FSMContext):
+    await register_user(message.from_user.id)
+    if await is_banned(message.from_user.id) or await check_active_ticket(message): return
+    if await get_setting("friend_active", "false") != "true":
+        await message.answer(f"{ICON_WARN} Раздел добавления в друзья временно закрыт на технические работы.", parse_mode="HTML")
+        return
+    await state.clear()
+    friend_nick = await get_setting("friend_nickname", "Администратор")
+    await state.set_state(Form.friends_nickname)
+    await message.answer(f"{ICON_USERS} Добавьтесь в друзья к игроку: <code>{html.escape(friend_nick)}</code>\n\n{NUM_1} Укажите ваш ник в игре:", parse_mode="HTML")
+
+# --- 5. ХЕЛПЕР ---
+@router.message(F.text.regexp(r"(?i)хелпер"), F.chat.type == "private")
+async def start_helper_apply(message: Message, state: FSMContext):
+    await register_user(message.from_user.id)
+    if await is_banned(message.from_user.id): return
+    if await get_setting("helper_recruitment", "true") != "true":
+        await message.answer(f"{ICON_WARN} Набор в команду поддержки в данный момент закрыт.", parse_mode="HTML")
+        return
+    await state.clear()
+    await state.set_state(Form.helper_name)
+    await message.answer(f"<tg-emoji emoji-id='5346192285799302524'>🔥</tg-emoji> <b>Заявка в команду поддержки (Хелперы)</b>\n\n{NUM_1} Ваше имя:", parse_mode="HTML")
+
+# --- 6. ИСКАТЕЛИ СЕКРЕТОК ---
+@router.message(F.text.regexp(r"(?i)искател"), F.chat.type == "private")
+async def start_secret_apply(message: Message, state: FSMContext):
+    await register_user(message.from_user.id)
+    if await is_banned(message.from_user.id): return
+    if await get_setting("secret_recruitment", "true") != "true":
+        await message.answer(f"{ICON_WARN} Набор в искатели секреток в данный момент закрыт.", parse_mode="HTML")
+        return
+    await state.clear()
+    await state.set_state(Form.secret_name)
+    await message.answer(f"<tg-emoji emoji-id='5345840270279724328'>🔥</tg-emoji> <b>Заявка в искатели секреток</b>\n\n{NUM_1} Ваше имя:", parse_mode="HTML")
+
+# --- 7. СЕКРЕТКИ ---
+@router.message(F.text.regexp(r"(?i)секретк"), F.chat.type == "private")
+async def open_secrets_menu(message: Message, state: FSMContext):
+    if not await is_secret_publisher(message.from_user.id):
+        return
+    await state.clear()
+    await message.answer(
+        f"{ICON_BALL} <b>Панель публикации секреток</b>\n\nВыберите нужное действие:",
+        reply_markup=publisher_menu_kb(),
+        parse_mode="HTML"
+    )
+
+# ----------------------------------------------------------------------
+# ШАГИ ФОРМ
+# ----------------------------------------------------------------------
 @router.message(Form.complaint_nicknames, F.text)
 async def process_c_nicknames(message: Message, state: FSMContext):
     new_nick = message.text.strip()
@@ -2315,19 +1367,6 @@ async def process_c_photo(message: Message, state: FSMContext):
         night_txt = get_night_notice()
         await message.answer(f"{ICON_CHECK} Жалоба №{ticket_id} отправлена! (Прикреплено фото: {len(photos)}){night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
 
-# --- 2. ОБЖАЛОВАНИЕ (С ПРОВЕРКОЙ ROBLOX) ---
-@router.message(F.text.contains("Обжалование бана"), F.chat.type == "private")
-async def start_appeal(message: Message, state: FSMContext):
-    await register_user(message.from_user.id)
-    if await is_banned(message.from_user.id) or await check_active_ticket(message): return
-    await state.clear()
-    await state.set_state(Form.appeal_nickname)
-    await message.answer(
-        f"{NUM_1} <b>Ваш ник в игре:</b>\n"
-        "<i>(Укажите ваш точный никнейм в Roblox, на который был выдан бан)</i>",
-        parse_mode="HTML"
-    )
-
 @router.message(Form.appeal_nickname, F.text)
 async def process_a_nickname(message: Message, state: FSMContext):
     nick_input = message.text.strip()
@@ -2474,15 +1513,6 @@ async def process_a_photo(message: Message, state: FSMContext):
         night_txt = get_night_notice()
         await message.answer(f"{ICON_CHECK} Обжалование №{ticket_id} отправлено! (Прикреплено фото: {len(photos)}){night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
 
-# --- 3. ВОПРОС ---
-@router.message(F.text.contains("Задать вопрос"), F.chat.type == "private")
-async def start_question(message: Message, state: FSMContext):
-    await register_user(message.from_user.id)
-    if await is_banned(message.from_user.id) or await check_active_ticket(message): return
-    await state.clear()
-    await state.set_state(Form.question_content)
-    await message.answer(f"<tg-emoji emoji-id='5348435310994802643'>🔥</tg-emoji> Задайте ваш вопрос (можно отправить текст или до 5 фото с описанием):", parse_mode="HTML")
-
 @router.message(Form.question_content, F.photo | F.text)
 async def process_question(message: Message, state: FSMContext):
     if await check_active_ticket(message):
@@ -2551,19 +1581,6 @@ async def process_question(message: Message, state: FSMContext):
             night_txt = get_night_notice()
             await message.answer(f"{ICON_CHECK} Вопрос №{ticket_id} отправлен!{night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
 
-# --- 4. ДРУЗЬЯ ---
-@router.message(F.text.contains("Добавление в друзья"), F.chat.type == "private")
-async def start_friends(message: Message, state: FSMContext):
-    await register_user(message.from_user.id)
-    if await is_banned(message.from_user.id) or await check_active_ticket(message): return
-    if await get_setting("friend_active", "false") != "true":
-        await message.answer(f"{ICON_WARN} Раздел добавления в друзья временно закрыт на технические работы.", parse_mode="HTML")
-        return
-    await state.clear()
-    friend_nick = await get_setting("friend_nickname", "Администратор")
-    await state.set_state(Form.friends_nickname)
-    await message.answer(f"{ICON_USERS} Добавьтесь в друзья к игроку: <code>{html.escape(friend_nick)}</code>\n\n{NUM_1} Укажите ваш ник в игре:", parse_mode="HTML")
-
 @router.message(Form.friends_nickname)
 async def process_friends_nickname(message: Message, state: FSMContext):
     async with creation_lock:
@@ -2576,8 +1593,152 @@ async def process_friends_nickname(message: Message, state: FSMContext):
         await message.answer(f"{ICON_CHECK} Заявка №{ticket_id} создана!{night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
         await state.clear()
 
+@router.message(Form.helper_name)
+async def process_helper_name(message: Message, state: FSMContext):
+    await state.update_data(helper_name=message.text.strip())
+    await state.set_state(Form.helper_age)
+    await message.answer(f"{NUM_2} Ваш возраст:", parse_mode="HTML")
+
+@router.message(Form.helper_age)
+async def process_helper_age(message: Message, state: FSMContext):
+    await state.update_data(helper_age=message.text.strip())
+    await state.set_state(Form.helper_time)
+    await message.answer(f"{NUM_3} Сколько времени вы готовы уделять на ответы в поддержке?", parse_mode="HTML")
+
+@router.message(Form.helper_time)
+async def process_helper_time(message: Message, state: FSMContext):
+    await state.update_data(helper_time=message.text.strip())
+    await state.set_state(Form.helper_why)
+    await message.answer(f"{NUM_4} Почему вы хотите именно к нам?", parse_mode="HTML")
+
+@router.message(Form.helper_why)
+async def process_helper_why(message: Message, state: FSMContext):
+    if not message.from_user.username:
+        await message.answer(
+            f"{ICON_WARN} <b>У вас не установлен @username в профиле Telegram!</b>\n\n"
+            "Для отправки анкеты и связи с администрацией обязательно иметь юзернейм.\n"
+            "Пожалуйста, установите его в настройках Telegram (Настройки ➔ Изменить профиль ➔ Имя пользователя) "
+            "и затем <b>отправьте ответ на 4-й пункт ещё раз</b>.",
+            parse_mode="HTML"
+        )
+        return
+
+    why_text = message.text.strip()
+    data = await state.get_data()
+    user = message.from_user
+    user_mention = get_user_mention(user)
+
+    admin_text = (
+        f"📝 <b>Новая заявка в команду поддержки (Хелперы)!</b>\n\n"
+        f"👤 От: {user_mention}\n"
+        f"🆔 ID: <code>{user.id}</code>\n"
+        f"👤 Username: @{user.username}\n\n"
+        f"1. <b>Имя:</b> {html.escape(data.get('helper_name', 'Не указано'))}\n"
+        f"2. <b>Возраст:</b> {html.escape(data.get('helper_age', 'Не указан'))}\n"
+        f"3. <b>Время на поддержку:</b> {html.escape(data.get('helper_time', 'Не указано'))}\n"
+        f"4. <b>Почему к нам:</b> {html.escape(why_text)}"
+    )
+
+    sent = await bot.send_message(ADMIN_CHAT_ID, admin_text, reply_markup=helper_decision_kb(user.id), parse_mode="HTML")
+    await map_message(sent.message_id, user.id, 0)
+    kb = await main_keyboard(user.id)
+    night_txt = get_night_notice()
+    await message.answer(f"{ICON_CHECK} Ваша анкета успешно отправлена администрации! Ожидайте ответа.{night_txt}", reply_markup=kb, parse_mode="HTML")
+    await state.clear()
+
+@router.message(Form.secret_name)
+async def process_secret_name(message: Message, state: FSMContext):
+    await state.update_data(secret_name=message.text.strip())
+    await state.set_state(Form.secret_age)
+    await message.answer(f"{NUM_2} Ваш возраст:", parse_mode="HTML")
+
+@router.message(Form.secret_age)
+async def process_secret_age(message: Message, state: FSMContext):
+    await state.update_data(secret_age=message.text.strip())
+    await state.set_state(Form.secret_vip)
+    await message.answer(f"{NUM_3} Есть ли у вас вип сервер в Tower Of Hell?", parse_mode="HTML")
+
+@router.message(Form.secret_vip)
+async def process_secret_vip(message: Message, state: FSMContext):
+    await state.update_data(secret_vip=message.text.strip())
+    await state.set_state(Form.secret_time)
+    await message.answer(f"{NUM_4} Сколько вы готовы уделять времени поиску секреток?", parse_mode="HTML")
+
+@router.message(Form.secret_time)
+async def process_secret_time(message: Message, state: FSMContext):
+    await state.update_data(secret_time=message.text.strip())
+    await state.set_state(Form.secret_why)
+    await message.answer(f"{NUM_5} Почему вы хотите именно к нам?", parse_mode="HTML")
+
+@router.message(Form.secret_why)
+async def process_secret_why(message: Message, state: FSMContext):
+    if not message.from_user.username:
+        await message.answer(
+            f"{ICON_WARN} <b>У вас не установлен @username в профиле Telegram!</b>\n\n"
+            "Для отправки анкеты и связи с администрацией обязательно иметь юзернейм.\n"
+            "Пожалуйста, установите его в настройках Telegram (Настройки ➔ Изменить профиль ➔ Имя пользователя) "
+            "и затем <b>отправьте ответ на 5-й пункт ещё раз</b>.",
+            parse_mode="HTML"
+        )
+        return
+
+    why_text = message.text.strip()
+    data = await state.get_data()
+    user = message.from_user
+    user_mention = get_user_mention(user)
+
+    admin_text = (
+        f"🔍 <b>Новая заявка в искатели секреток!</b>\n\n"
+        f"👤 От: {user_mention}\n"
+        f"🆔 ID: <code>{user.id}</code>\n"
+        f"👤 Username: @{user.username}\n\n"
+        f"1. <b>Имя:</b> {html.escape(data.get('secret_name', 'Не указано'))}\n"
+        f"2. <b>Возраст:</b> {html.escape(data.get('secret_age', 'Не указан'))}\n"
+        f"3. <b>VIP сервер в ToH:</b> {html.escape(data.get('secret_vip', 'Не указано'))}\n"
+        f"4. <b>Время на поиск:</b> {html.escape(data.get('secret_time', 'Не указано'))}\n"
+        f"5. <b>Почему к нам:</b> {html.escape(why_text)}"
+    )
+
+    sent = await bot.send_message(ADMIN_CHAT_ID, admin_text, reply_markup=secret_decision_kb(user.id), parse_mode="HTML")
+    await map_message(sent.message_id, user.id, 0)
+    kb = await main_keyboard(user.id)
+    night_txt = get_night_notice()
+    await message.answer(f"{ICON_CHECK} Ваша заявка в искатели секреток успешно отправлена! Ожидайте ответа.{night_txt}", reply_markup=kb, parse_mode="HTML")
+    await state.clear()
+
 # ----------------------------------------------------------------------
-# КНОПКИ УПРАВЛЕНИЯ ТИКЕТАМИ (ИСПРАВЛЕНО ВЗЯТИЕ И ОТКЛОНЕНИЕ)
+# УНИВЕРСАЛЬНЫЙ ХЭНДЛЕР ЛИЧНЫХ СООБЩЕНИЙ
+# ----------------------------------------------------------------------
+@router.message(
+    F.chat.type == "private",
+    ~F.text.regexp(r"(?i)(жалоб|обжалован|вопрос|друг|хелпер|искател|секретк|перезагруз|админ-панел)")
+)
+async def user_private_message(message: Message, state: FSMContext):
+    await register_user(message.from_user.id)
+    if await is_banned(message.from_user.id): return
+
+    current_state = await state.get_state()
+    if current_state is not None:
+        return
+
+    active_ticket = await get_active_ticket(message.from_user.id)
+    if active_ticket and active_ticket[2] == 'active':
+        await touch_ticket(active_ticket[0], actor='user')
+        user_mention = get_user_mention(message.from_user)
+        text_to_group = f"📩 <b>Сообщение по заявке №{active_ticket[0]} от {user_mention} | ID: <code>{message.from_user.id}</code>:</b>\n\n{html.escape(message.text or message.caption or '')}"
+        
+        if message.photo:
+            sent = await bot.send_photo(ADMIN_CHAT_ID, photo=message.photo[-1].file_id, caption=text_to_group, parse_mode="HTML")
+        else:
+            sent = await bot.send_message(ADMIN_CHAT_ID, text_to_group, parse_mode="HTML")
+        await map_message(sent.message_id, message.from_user.id, active_ticket[0])
+        return
+
+    kb = await main_keyboard(message.from_user.id)
+    await message.answer(f"{ICON_WARN} Пожалуйста, выберите нужный пункт меню для обращения.", reply_markup=kb, parse_mode="HTML")
+
+# ----------------------------------------------------------------------
+# КНОПКИ УПРАВЛЕНИЯ ТИКЕТАМИ
 # ----------------------------------------------------------------------
 @router.callback_query(F.data.startswith("take_"))
 async def take_ticket_handler(call: CallbackQuery):
@@ -2713,9 +1874,6 @@ async def user_cancel_ticket(call: CallbackQuery):
     else:
         await call.answer("❌ Заявка уже взята в работу или закрыта, отмена недоступна.", show_alert=True)
 
-# ----------------------------------------------------------------------
-# СИСТЕМА ОЦЕНОК (СТРОГИЙ ЗАПРЕТ ОЦЕНОК ОТ СТАФФА)
-# ----------------------------------------------------------------------
 @router.callback_query(F.data.startswith("rate_"))
 async def process_rating(call: CallbackQuery):
     await call.answer()
@@ -2736,80 +1894,102 @@ async def process_rating(call: CallbackQuery):
         await call.message.edit_text(f"{ICON_STAR} Спасибо за оценку ({score}/5)! Ваше мнение учтено.", parse_mode="HTML")
 
 # ----------------------------------------------------------------------
-# ДИАЛОГ В ЛС С ПОЛЬЗОВАТЕЛЕМ (БЕЗ КОНФЛИКТА С МЕНЮ)
+# ОТВЕТ ХЕЛПЕРА В ГРУППЕ
 # ----------------------------------------------------------------------
-@router.message(F.chat.type == "private")
-async def user_private_message(message: Message, state: FSMContext):
-    await register_user(message.from_user.id)
-    if await is_banned(message.from_user.id): return
-
-    current_state = await state.get_state()
-    if current_state is not None:
+@router.message(F.chat.id == ADMIN_CHAT_ID, F.reply_to_message)
+async def admin_reply_in_group(message: Message):
+    if message.text and message.text.startswith("/"):
         return
 
-    active_ticket = await get_active_ticket(message.from_user.id)
-    if active_ticket and active_ticket[2] == 'active':
-        await touch_ticket(active_ticket[0], actor='user')
-        user_mention = get_user_mention(message.from_user)
-        text_to_group = f"📩 <b>Сообщение по заявке №{active_ticket[0]} от {user_mention} | ID: <code>{message.from_user.id}</code>:</b>\n\n{html.escape(message.text or message.caption or '')}"
-        
-        if message.photo:
-            sent = await bot.send_photo(ADMIN_CHAT_ID, photo=message.photo[-1].file_id, caption=text_to_group, parse_mode="HTML")
-        else:
-            sent = await bot.send_message(ADMIN_CHAT_ID, text_to_group, parse_mode="HTML")
-        await map_message(sent.message_id, message.from_user.id, active_ticket[0])
+    replied_msg_id = message.reply_to_message.message_id
+    pending_data = await get_pending_rejection(replied_msg_id)
+
+    if pending_data:
+        pending_ticket_id, card_message_id, saved_card_text = pending_data
+        ticket_info = await get_ticket_info(pending_ticket_id)
+        if ticket_info:
+            reason = html.escape(message.text or message.caption or "Без причины")
+            agent_no = await get_or_create_agent_number(message.from_user.id)
+            await close_ticket_db(pending_ticket_id, 'rejected', admin_id=message.from_user.id)
+            
+            try:
+                user_kb = await main_keyboard(ticket_info[0])
+                await bot.send_message(
+                    ticket_info[0],
+                    f"{ICON_CROSS} Заявка <b>№{pending_ticket_id}</b> отклонена.\n<b>Причина:</b> {reason}",
+                    parse_mode="HTML",
+                    reply_markup=user_kb
+                )
+            except Exception:
+                pass
+            
+            if card_message_id:
+                base = saved_card_text or ticket_info[3] or f"Заявка <b>№{pending_ticket_id}</b>"
+                new_text = (
+                    f"{base}\n\n"
+                    f"🔴 <b>Заявка №{pending_ticket_id} отклонена</b> "
+                    f"администратором {message.from_user.mention_html()} (Агент #{agent_no}).\n"
+                    f"<b>Причина:</b> {reason}"
+                )
+                
+                try:
+                    await bot.edit_message_text(
+                        chat_id=ADMIN_CHAT_ID,
+                        message_id=card_message_id,
+                        text=new_text,
+                        reply_markup=None,
+                        parse_mode="HTML"
+                    )
+                except TelegramBadRequest:
+                    try:
+                        await bot.edit_message_caption(
+                            chat_id=ADMIN_CHAT_ID,
+                            message_id=card_message_id,
+                            caption=new_text,
+                            reply_markup=None,
+                            parse_mode="HTML"
+                        )
+                    except Exception as e:
+                        logging.error(f"Не удалось обновить подпись карточки: {e}")
+                except Exception as e:
+                    logging.error(f"Не удалось обновить текст карточки: {e}")
+
+        try:
+            await bot.delete_message(chat_id=ADMIN_CHAT_ID, message_id=replied_msg_id)
+        except Exception:
+            pass
+
+        await delete_pending_rejection(replied_msg_id)
+        await message.answer(f"✅ Отказ по заявке №{pending_ticket_id} отправлен.")
         return
 
-    kb = await main_keyboard(message.from_user.id)
-    await message.answer(f"{ICON_WARN} Пожалуйста, выберите нужный пункт меню для обращения.", reply_markup=kb, parse_mode="HTML")
+    mapping = await get_user_by_group_msg(replied_msg_id)
+    if mapping:
+        user_id, ticket_id = mapping[0], mapping[1]
+        ticket_info = await get_ticket_info(ticket_id)
+
+        if ticket_info and ticket_info[2] == 'active':
+            if ticket_info[1] != message.from_user.id and not await is_main_admin(message.from_user.id):
+                await message.answer("❌ Этот тикет ведет другой администратор. Вы не можете в него отвечать!")
+                return
+
+            await touch_ticket(ticket_id, actor='admin')
+            agent_no = await get_or_create_agent_number(message.from_user.id)
+            
+            client_text = f"👨‍💻 <b>Ответ поддержки (Агент #{agent_no}):</b>\n\n{html.escape(message.text or message.caption or '')}"
+            try:
+                if message.photo:
+                    await bot.send_photo(user_id, photo=message.photo[-1].file_id, caption=client_text, parse_mode="HTML")
+                else:
+                    await bot.send_message(user_id, client_text, parse_mode="HTML")
+                await message.react([{"type": "emoji", "emoji": "👍"}])
+                await map_message(message.message_id, user_id, ticket_id)
+            except Exception as e:
+                await message.answer(f"❌ Ошибка отправки: {e}")
 
 # ----------------------------------------------------------------------
-# КОМАНДЫ В АДМИН-ЧАТЕ (/note, /deletenote, /mystats, /secstats, /supptop, /sectop, /news, /ban, /unban, /opentickets)
+# КОМАНДЫ
 # ----------------------------------------------------------------------
-@router.message(Command("opentickets"), F.chat.id == ADMIN_CHAT_ID)
-async def cmd_open_tickets(message: Message):
-    if not await is_main_admin(message.from_user.id):
-        await message.answer("❌ Только главные администраторы могут просматривать список открытых заявок!", parse_mode="HTML")
-        return
-
-    def _query():
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT ticket_id, category, user_id,
-                           EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - created_at))/60 as mins_passed
-                    FROM tickets
-                    WHERE status = 'pending'
-                    ORDER BY ticket_id ASC
-                """)
-                return cur.fetchall()
-
-    try:
-        pending_list = await asyncio.to_thread(_query)
-    except Exception as e:
-        await message.answer(f"❌ Ошибка получения тикетов из БД: {e}")
-        return
-
-    if not pending_list:
-        await message.answer("🟢 <b>Все заявки обработаны!</b> В данный момент нет открытых тикетов, ожидающих взятия.", parse_mode="HTML")
-        return
-
-    cat_names = {
-        "complaint": "Жалоба",
-        "appeal": "Обжалование",
-        "question": "Вопрос",
-        "friends": "Друзья"
-    }
-
-    text = f"📋 <b>Список неразобранных заявок (ожидают хелперов): {len(pending_list)}</b>\n\n"
-    for t_id, cat, u_id, mins in pending_list:
-        m = int(mins)
-        time_str = f"{m // 60} ч. {m % 60} мин." if m >= 60 else f"{m} мин."
-        cat_str = cat_names.get(cat, cat)
-        text += f"• <b>Заявка №{t_id}</b> ({cat_str}) — ждет <code>{time_str}</code> | Игрок: <code>{u_id}</code>\n"
-
-    await message.answer(text, parse_mode="HTML")
-
 @router.message(Command("mystats"), F.chat.id == ADMIN_CHAT_ID)
 async def cmd_my_stats(message: Message):
     if not await is_support_member(message.from_user.id) and not await is_main_admin(message.from_user.id):
@@ -2821,11 +2001,9 @@ async def cmd_my_stats(message: Message):
     def _query_mystats():
         with get_db() as conn:
             with conn.cursor() as cur:
-                # 1. Закрытые тикеты агента
                 cur.execute("SELECT COUNT(*) FROM tickets WHERE admin_id = %s AND status = 'closed'", (admin_id,))
                 closed_count = cur.fetchone()[0]
 
-                # 2. Средняя оценка агента без оценок стаффа
                 cur.execute("""
                     SELECT COALESCE(AVG(score), 0) 
                     FROM ratings 
@@ -2836,7 +2014,6 @@ async def cmd_my_stats(message: Message):
                 """, (admin_id, OWNER_ID))
                 avg_score = cur.fetchone()[0]
 
-                # 3. Честный топ: сначала по средней оценке (DESC), затем по количеству тикетов (DESC)
                 cur.execute("""
                     SELECT 
                         t.admin_id,
@@ -2937,7 +2114,6 @@ async def cmd_sec_stats(message: Message):
 
 @router.message(Command("supptop"), F.chat.id == ADMIN_CHAT_ID)
 async def cmd_supp_top(message: Message):
-    """Общий рейтинг агентов поддержки (Только для гл. админов)"""
     if not await is_main_admin(message.from_user.id):
         await message.answer("❌ Только главные администраторы могут просматривать общий рейтинг поддержки!", parse_mode="HTML")
         return
@@ -2998,7 +2174,6 @@ async def cmd_supp_top(message: Message):
 
 @router.message(Command("sectop"), F.chat.id == ADMIN_CHAT_ID)
 async def cmd_sec_top(message: Message):
-    """Общий рейтинг искателей секреток за ВСЁ время (Только для гл. админов)"""
     if not await is_main_admin(message.from_user.id):
         await message.answer("❌ Только главные администраторы могут просматривать общий рейтинг искателей секреток!", parse_mode="HTML")
         return
@@ -3383,104 +2558,9 @@ async def cmd_unban(message: Message):
     await message.answer(f"✅ Пользователь с ID <code>{user_id}</code> успешно разблокирован.", parse_mode="HTML")
 
 # ----------------------------------------------------------------------
-# ОТВЕТ ХЕЛПЕРА В ГРУППЕ (ОТКАЗ И ДИАЛОГ)
-# ----------------------------------------------------------------------
-@router.message(F.chat.id == ADMIN_CHAT_ID, F.reply_to_message)
-async def admin_reply_in_group(message: Message):
-    if message.text and message.text.startswith("/"):
-        return
-
-    replied_msg_id = message.reply_to_message.message_id
-    pending_data = await get_pending_rejection(replied_msg_id)
-
-    if pending_data:
-        pending_ticket_id, card_message_id, saved_card_text = pending_data
-        ticket_info = await get_ticket_info(pending_ticket_id)
-        if ticket_info:
-            reason = html.escape(message.text or message.caption or "Без причины")
-            agent_no = await get_or_create_agent_number(message.from_user.id)
-            await close_ticket_db(pending_ticket_id, 'rejected', admin_id=message.from_user.id)
-            
-            try:
-                user_kb = await main_keyboard(ticket_info[0])
-                await bot.send_message(
-                    ticket_info[0],
-                    f"{ICON_CROSS} Заявка <b>№{pending_ticket_id}</b> отклонена.\n<b>Причина:</b> {reason}",
-                    parse_mode="HTML",
-                    reply_markup=user_kb
-                )
-            except Exception:
-                pass
-            
-            if card_message_id:
-                base = saved_card_text or ticket_info[3] or f"Заявка <b>№{pending_ticket_id}</b>"
-                new_text = (
-                    f"{base}\n\n"
-                    f"🔴 <b>Заявка №{pending_ticket_id} отклонена</b> "
-                    f"администратором {message.from_user.mention_html()} (Агент #{agent_no}).\n"
-                    f"<b>Причина:</b> {reason}"
-                )
-                
-                try:
-                    await bot.edit_message_text(
-                        chat_id=ADMIN_CHAT_ID,
-                        message_id=card_message_id,
-                        text=new_text,
-                        reply_markup=None,
-                        parse_mode="HTML"
-                    )
-                except TelegramBadRequest:
-                    try:
-                        await bot.edit_message_caption(
-                            chat_id=ADMIN_CHAT_ID,
-                            message_id=card_message_id,
-                            caption=new_text,
-                            reply_markup=None,
-                            parse_mode="HTML"
-                        )
-                    except Exception as e:
-                        logging.error(f"Не удалось обновить подпись карточки: {e}")
-                except Exception as e:
-                    logging.error(f"Не удалось обновить текст карточки: {e}")
-
-        try:
-            await bot.delete_message(chat_id=ADMIN_CHAT_ID, message_id=replied_msg_id)
-        except Exception:
-            pass
-
-        await delete_pending_rejection(replied_msg_id)
-        await message.answer(f"✅ Отказ по заявке №{pending_ticket_id} отправлен.")
-        return
-
-    mapping = await get_user_by_group_msg(replied_msg_id)
-    if mapping:
-        user_id, ticket_id = mapping[0], mapping[1]
-        ticket_info = await get_ticket_info(ticket_id)
-
-        if ticket_info and ticket_info[2] == 'active':
-            if ticket_info[1] != message.from_user.id and not await is_main_admin(message.from_user.id):
-                await message.answer("❌ Этот тикет ведет другой администратор. Вы не можете в него отвечать!")
-                return
-
-            await touch_ticket(ticket_id, actor='admin')
-            agent_no = await get_or_create_agent_number(message.from_user.id)
-            
-            client_text = f"👨‍💻 <b>Ответ поддержки (Агент #{agent_no}):</b>\n\n{html.escape(message.text or message.caption or '')}"
-            try:
-                if message.photo:
-                    await bot.send_photo(user_id, photo=message.photo[-1].file_id, caption=client_text, parse_mode="HTML")
-                else:
-                    await bot.send_message(user_id, client_text, parse_mode="HTML")
-                await message.react([{"type": "emoji", "emoji": "👍"}])
-                await map_message(message.message_id, user_id, ticket_id)
-            except Exception as e:
-                await message.answer(f"❌ Ошибка отправки: {e}")
-
-# ----------------------------------------------------------------------
-# ФОНОВЫЕ ВОРКЕРЫ: НАПОМИНАНИЯ, СЕКРЕТКИ И АВТОЗАКРЫТИЕ (24 ЧАСА)
+# ФОНОВЫЕ ВОРКЕРЫ
 # ----------------------------------------------------------------------
 async def secret_timer_worker():
-    logging.info("Фоновый воркер секреток запущен.")
     while True:
         try:
             timer_sec = await get_setting("timer_seconds", "510")
@@ -3507,13 +2587,11 @@ async def secret_timer_worker():
         await asyncio.sleep(15)
 
 async def reminder_worker():
-    logging.info("Фоновый воркер напоминаний запущен.")
     while True:
         try:
             def _check():
                 with get_db() as conn:
                     with conn.cursor() as cur:
-                        # Тикеты, которые ждут взятия более 2 часов с момента создания ИЛИ предыдущего напоминания
                         cur.execute("""
                             SELECT ticket_id, category, user_id, 
                                    EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - created_at))/3600 as hours_total
@@ -3523,9 +2601,6 @@ async def reminder_worker():
                         """)
                         unassigned = cur.fetchall()
 
-                        # Тикеты в работе:
-                        # 1. Первое напоминание через 20 минут тишины от последнего ответа другой стороны (reminded_idle = FALSE)
-                        # 2. Последующие напоминания каждый 1 час после предыдущего напоминания (reminded_idle = TRUE)
                         cur.execute("""
                             SELECT t.ticket_id, t.admin_id, t.user_id,
                                    EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - t.updated_at))/60 as mins_passed,
@@ -3541,7 +2616,6 @@ async def reminder_worker():
                         """)
                         idle = cur.fetchall()
 
-                        # Автозакрытие: активный тикет без ответа пользователя 24 часа после сообщения админа
                         cur.execute("""
                             SELECT ticket_id, user_id, admin_id, card_text
                             FROM tickets
@@ -3555,7 +2629,6 @@ async def reminder_worker():
 
             unassigned_tickets, idle_tickets, expired_active = await asyncio.to_thread(_check)
 
-            # Напоминание по неразобранным тикетам каждые 2 часа
             for t_id, cat, u_id, hrs in unassigned_tickets:
                 hours_str = f"{int(hrs)} ч." if hrs else "2+ ч."
                 alert_text = (
@@ -3573,9 +2646,8 @@ async def reminder_worker():
                                 cur.execute("UPDATE tickets SET last_unassigned_remind = CURRENT_TIMESTAMP WHERE ticket_id = %s", (t_id,))
                     await asyncio.to_thread(_update_last_remind)
                 except Exception as e:
-                    logging.error(f"Ошибка отправки напоминания о заявке №{t_id}: {e}")
+                    logging.error(f"Ошибка напоминания: {e}")
 
-            # Напоминание о простое тикета: через 20 минут, затем каждый 1 час
             for t_id, adm_id, u_id, mins, agent_no, last_act, was_reminded in idle_tickets:
                 if last_act == 'admin':
                     client_alert = (
@@ -3594,8 +2666,8 @@ async def reminder_worker():
                                         WHERE ticket_id = %s
                                     """, (t_id,))
                         await asyncio.to_thread(_mark_user_reminded)
-                    except Exception as e:
-                        logging.error(f"Ошибка отправки напоминания пользователю по тикету №{t_id}: {e}")
+                    except Exception:
+                        pass
                 else:
                     agent_str = f"Агент #{agent_no}" if agent_no else f"ID {adm_id}"
                     admin_mention = agent_str
@@ -3627,7 +2699,6 @@ async def reminder_worker():
                     except Exception as e:
                         logging.error(f"Ошибка отправки напоминания хелперу по тикету №{t_id}: {e}")
 
-            # Автозакрытие через 24 часа
             for t_id, u_id, adm_id, c_txt in expired_active:
                 try:
                     await close_ticket_db(t_id, status='closed', admin_id=adm_id)
@@ -3644,7 +2715,7 @@ async def reminder_worker():
                         parse_mode="HTML"
                     )
                 except Exception as ex:
-                    logging.error(f"Ошибка автозакрытия тикета №{t_id}: {ex}")
+                    logging.error(f"Ошибка автозакрытия: {ex}")
 
         except Exception as err:
             logging.error(f"Ошибка в цикле reminder_worker: {err}")
@@ -3665,7 +2736,6 @@ async def web_server():
     port = int(os.getenv("PORT", 10000))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    logging.info(f"Health-check сервер запущен на порту {port}")
 
 async def main():
     await web_server()
