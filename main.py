@@ -1,4 +1,4 @@
-Import asyncio
+import asyncio
 import logging
 import os
 import html
@@ -1045,7 +1045,7 @@ async def dispatch_ticket_to_admin(user_id: int, user, category: str, text: str,
 # ----------------------------------------------------------------------
 # СТАРТ И МЕНЮ
 # ----------------------------------------------------------------------
-WELCOME_PHOTO_ID = "AgACAgEAAxkBAAEvN2dquXGC1nw3HqPjB8OP9hp-L17WGwACrwxrG6FryEX933FL88L6GwEAAwIAA3kAAz0E"
+WELCOME_PHOTO_ID = "AgACAgEAAxkBAAEve3JqxS3FVKxgKBPRqUofbs2nWRcbvgACVQ1rG3XiKEaSw3QnafbGtgEAAwIAA3kAAz0E"
 
 @router.message(CommandStart(), F.chat.type == "private")
 async def start_cmd(message: Message, state: FSMContext):
