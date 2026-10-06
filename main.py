@@ -21,8 +21,8 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton,
     InlineKeyboardMarkup, InlineKeyboardButton, TelegramObject,
-    LinkPreviewOptions, InputMediaPhoto, BotCommand, BotCommandScopeChat, 
-    BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats, ChatMemberUpdated
+    LinkPreviewOptions, InputMediaPhoto, BotCommand, BotCommandScopeAllGroupChats,
+    BotCommandScopeAllPrivateChats, ChatMemberUpdated
 )
 
 # ----------------------------------------------------------------------
@@ -402,7 +402,7 @@ async def is_main_admin(user_id: int) -> bool:
         return False
 
 # ----------------------------------------------------------------------
-# ДИНАМИЧЕСКИЕ НАСТРОЙКИ АДМИН-ЧАТОВ
+# ПРОВЕРКИ И УПРАВЛЕНИЕ АДМИН-ЧАТАМИ
 # ----------------------------------------------------------------------
 async def is_chat_allowed(chat_id: int) -> bool:
     def _query():
@@ -487,6 +487,17 @@ async def get_primary_admin_chat() -> int | None:
     except Exception:
         return None
 
+async def is_group_admin(chat_id: int, user_id: int) -> bool:
+    """Проверяет права: владелец бота, гл. админ из БД или системный админ группы"""
+    if await is_main_admin(user_id):
+        return True
+    try:
+        member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+        return member.status in ["creator", "administrator"]
+    except Exception as e:
+        logging.error(f"Ошибка проверки статуса участника {user_id} в чате {chat_id}: {e}")
+        return False
+
 async def is_secret_publisher(user_id: int) -> bool:
     def _query():
         with get_db() as conn:
@@ -509,7 +520,7 @@ async def is_support_member(user_id: int) -> bool:
         if member.status in ["creator", "administrator", "member", "restricted"]:
             return True
     except Exception as e:
-        logging.error(f"Ошибка проверки статуса участника {user_id}: {e}")
+        logging.error(f"Ошибка проверки статуса саппорта {user_id}: {e}")
         return False
     return False
 
@@ -1416,8 +1427,8 @@ async def adm_chat_info_handler(call: CallbackQuery):
     )
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"💬 Привязать Поддержку", callback_data=f"settopic_{target_chat_id}_support"),
-         InlineKeyboardButton(text=f"🔮 Привязать Секретки", callback_data=f"settopic_{target_chat_id}_secrets")],
+        [InlineKeyboardButton(text="💬 Привязать Поддержку", callback_data=f"settopic_{target_chat_id}_support"),
+         InlineKeyboardButton(text="🔮 Привязать Секретки", callback_data=f"settopic_{target_chat_id}_secrets")],
         [InlineKeyboardButton(text="🟢 Разрешить работу бота", callback_data=f"chat_allow_{target_chat_id}")],
         [InlineKeyboardButton(text="🔴 Запретить и выйти из чата", callback_data=f"chat_disallow_{target_chat_id}")],
         [InlineKeyboardButton(text="🔙 Назад к списку", callback_data="manage_admin_chats")]
@@ -1842,7 +1853,8 @@ async def sec_del_type(call: CallbackQuery):
     buttons = []
     for k in types_d.keys():
         buttons.append([InlineKeyboardButton(text=f"🗑 {k}", callback_data=f"sec_rmtype_{k}")])
-    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="adm_secret_panel")])
+    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="adm_secret_panel")]
+    )
     await call.message.edit_text("🗑 Выберите обычный тип секретки для удаления:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
     await call.answer()
 
@@ -1888,7 +1900,8 @@ async def sec_del_spec_type(call: CallbackQuery):
     buttons = []
     for k in spec_list:
         buttons.append([InlineKeyboardButton(text=f"🗑 {k}", callback_data=f"sec_rmspec_{k}")])
-    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="adm_secret_panel")])
+    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="adm_secret_panel")]
+    )
     await call.message.edit_text("🗑 Выберите особый тип секретки для удаления:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
     await call.answer()
 
@@ -2994,7 +3007,7 @@ async def close_ticket_handler(call: CallbackQuery):
     ticket_info = await get_ticket_info(ticket_id)
     
     if not ticket_info or ticket_info[2] == 'closed':
-        await call.answer("⚠️️ Заявка уже закрыта!", show_alert=False)
+        await call.answer("⚠️ Заявка уже закрыта!", show_alert=False)
         try:
             await call.message.edit_reply_markup(reply_markup=None)
         except Exception:
@@ -3830,19 +3843,25 @@ async def group_topics_router(message: Message):
 
     thread_id = message.message_thread_id
     support_tid, secrets_tid = await get_chat_topics(message.chat.id)
+    user_is_admin = await is_group_admin(message.chat.id, message.from_user.id)
 
     # 1. ТЕМА СЕКРЕТОК
     if secrets_tid and thread_id == secrets_tid:
-        if await is_main_admin(message.from_user.id):
+        if user_is_admin:
             return
         try:
             await message.delete()
-        except Exception:
-            pass
+        except Exception as e:
+            logging.error(f"Не удалось удалить сообщение в секретках: {e}")
         return
 
     # 2. ТЕМА ПОДДЕРЖКИ
     if support_tid and thread_id == support_tid:
+        if user_is_admin:
+            if message.reply_to_message:
+                await handle_admin_reply_logic(message, support_tid)
+            return
+
         raw_text = (message.text or message.caption or "").strip()
 
         if raw_text.startswith("/c ") or raw_text == "/c":
@@ -3864,8 +3883,8 @@ async def group_topics_router(message: Message):
             )
             await asyncio.sleep(4)
             await warn.delete()
-        except Exception:
-            pass
+        except Exception as e:
+            logging.error(f"Не удалось удалить сообщение в поддержке: {e}")
         return
 
 # ----------------------------------------------------------------------
