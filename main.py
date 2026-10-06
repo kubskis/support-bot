@@ -34,9 +34,6 @@ ADMIN_CHAT_ID = -1003945292994
 OWNER_ID = int(os.getenv("ADMIN_ID", "0"))
 MSK_TZ = timezone(timedelta(hours=3))
 
-# Постоянная ссылка на фото с Imgur
-WELCOME_PHOTO_URL = "https://i.imgur.com/8Qj8mC1.jpeg"
-
 if not BOT_TOKEN:
     raise ValueError("ОШИБКА: Токен бота не найден! Укажите BOT_TOKEN в Environment Variables.")
 if not DATABASE_URL:
@@ -624,10 +621,7 @@ async def get_active_ticket(user_id: int):
                     (user_id,)
                 )
                 return cur.fetchone()
-    try:
-        return await asyncio.to_thread(_query)
-    except Exception:
-        return None
+    return await asyncio.to_thread(_query)
 
 async def activate_ticket(ticket_id: int, admin_id: int):
     def _query():
@@ -782,60 +776,6 @@ async def expire_secret_post(bot: Bot, post_id: int, channel_id: str, message_id
         logging.error(f"Не удалось обновить истекший пост №{post_id}: {e}")
 
 # ----------------------------------------------------------------------
-# СОСТОЯНИЯ (FSM)
-# ----------------------------------------------------------------------
-class Form(StatesGroup):
-    complaint_nicknames = State()
-    complaint_place = State()
-    complaint_time = State()
-    complaint_reason = State()
-    complaint_photos = State()
-    
-    appeal_nickname = State()
-    appeal_place = State()
-    appeal_time = State()
-    appeal_reason = State()
-    appeal_photos = State()
-    
-    friends_nickname = State()
-    question_content = State()
-    set_friend_nick = State()
-    
-    helper_name = State()
-    helper_age = State()
-    helper_time = State()
-    helper_why = State()
-
-    secret_name = State()
-    secret_age = State()
-    secret_vip = State()
-    secret_time = State()
-    secret_why = State()
-
-    add_main_admin_id = State()
-    del_main_admin_id = State()
-
-class SecretPublisherStates(StatesGroup):
-    waiting_for_channel = State()
-    waiting_for_mode = State()
-    waiting_for_type = State()
-    waiting_for_farm_choice = State()
-    waiting_for_photo = State()
-    waiting_for_link = State()
-    waiting_for_confirm = State()
-
-class SecretAdminStates(StatesGroup):
-    add_publisher_id = State()
-    del_publisher_id = State()
-    add_type_name = State()
-    add_type_declined = State()
-    add_special_type_name = State()
-    set_timer = State()
-    template_active = State()
-    template_farm = State()
-    template_expired = State()
-
-# ----------------------------------------------------------------------
 # КЛАВИАТУРЫ
 # ----------------------------------------------------------------------
 async def main_keyboard(user_id: int):
@@ -845,19 +785,13 @@ async def main_keyboard(user_id: int):
         [KeyboardButton(text="📝 Подать заявку на хелпера"), KeyboardButton(text="🔍 Набор в искатели секреток")]
     ]
     
-    try:
-        if await is_secret_publisher(user_id):
-            keyboard.append([KeyboardButton(text="🔮 Секретки")])
-    except Exception:
-        pass
+    if await is_secret_publisher(user_id):
+        keyboard.append([KeyboardButton(text="🔮 Секретки")])
 
     keyboard.append([KeyboardButton(text="🔄 Перезагрузить меню")])
 
-    try:
-        if await is_main_admin(user_id):
-            keyboard.append([KeyboardButton(text="⚙️ Админ-панель")])
-    except Exception:
-        pass
+    if await is_main_admin(user_id):
+        keyboard.append([KeyboardButton(text="⚙️ Админ-панель")])
 
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True, persistent=True)
 
@@ -1027,33 +961,23 @@ async def dispatch_ticket_to_admin(user_id: int, user, category: str, text: str,
     return ticket_id
 
 # ----------------------------------------------------------------------
-# СТАРТ И ОБРАБОТКА МЕНЮ
+# СТАРТ И ОБРАБОТКА МЕНЮ (НАДЁЖНЫЕ РЕГУЛЯРНЫЕ ВЫРАЖЕНИЯ)
 # ----------------------------------------------------------------------
+WELCOME_PHOTO_ID = "AgACAgEAAxkBAAEvN2dquXGC1nw3HqPjB8OP9hp-L17WGwACrwxrG6FryEX933FL88L6GwEAAwIAA3kAAz0E"
+
 @router.message(CommandStart(), F.chat.type == "private")
 async def start_cmd(message: Message, state: FSMContext):
-    try:
-        await register_user(message.from_user.id)
-    except Exception as e:
-        logging.error(f"Ошибка регистрации: {e}")
-
-    try:
-        banned = await is_banned(message.from_user.id)
-        if banned:
-            await message.answer(
-                f"{ICON_CROSS} Вы заблокированы в поддержке.\n<b>Причина:</b> {html.escape(banned[0])}",
-                parse_mode="HTML"
-            )
-            return
-    except Exception:
-        pass
+    await register_user(message.from_user.id)
+    banned = await is_banned(message.from_user.id)
+    if banned:
+        await message.answer(
+            f"{ICON_CROSS} Вы заблокированы в поддержке.\n<b>Причина:</b> {html.escape(banned[0])}",
+            parse_mode="HTML"
+        )
+        return
 
     await state.clear()
-
-    try:
-        kb = await main_keyboard(message.from_user.id)
-    except Exception as e:
-        logging.error(f"Ошибка получения клавиатуры: {e}")
-        kb = None
+    kb = await main_keyboard(message.from_user.id)
 
     welcome_caption = (
         '<tg-emoji emoji-id="5206693654990717395">🔥</tg-emoji>'
@@ -1063,20 +987,12 @@ async def start_cmd(message: Message, state: FSMContext):
         '<i>Выберите нужный раздел на клавиатуре ниже</i>'
     )
 
-    try:
-        await message.answer_photo(
-            photo=WELCOME_PHOTO_URL,
-            caption=welcome_caption,
-            reply_markup=kb,
-            parse_mode="HTML"
-        )
-    except Exception as e:
-        logging.warning(f"Не удалось отправить фото приветствия ({e}), отправляем текстом")
-        await message.answer(
-            text=welcome_caption,
-            reply_markup=kb,
-            parse_mode="HTML"
-        )
+    await message.answer_photo(
+        photo=WELCOME_PHOTO_ID,
+        caption=welcome_caption,
+        reply_markup=kb,
+        parse_mode="HTML"
+    )
 
 @router.message(F.text.regexp(r"(?i)перезагруз"), F.chat.type == "private")
 async def refresh_menu_handler(message: Message, state: FSMContext):
@@ -1738,258 +1654,52 @@ async def user_private_message(message: Message, state: FSMContext):
     await message.answer(f"{ICON_WARN} Пожалуйста, выберите нужный пункт меню для обращения.", reply_markup=kb, parse_mode="HTML")
 
 # ----------------------------------------------------------------------
-# КНОПКИ УПРАВЛЕНИЯ ТИКЕТАМИ
+# КОМАНДЫ В АДМИН-ЧАТЕ
 # ----------------------------------------------------------------------
-@router.callback_query(F.data.startswith("take_"))
-async def take_ticket_handler(call: CallbackQuery):
-    ticket_id = int(call.data.split("_")[1])
-
-    if call.message.chat.id != ADMIN_CHAT_ID and not await is_support_member(call.from_user.id):
-        await call.answer("❌ У вас нет прав хелпера!", show_alert=True)
+@router.message(Command("opentickets"), F.chat.id == ADMIN_CHAT_ID)
+async def cmd_open_tickets(message: Message):
+    if not await is_main_admin(message.from_user.id):
+        await message.answer("❌ Только главные администраторы могут просматривать список открытых заявок!", parse_mode="HTML")
         return
 
-    ticket_info = await get_ticket_info(ticket_id)
-    if not ticket_info:
-        await call.answer("❌ Заявка не найдена в базе!", show_alert=True)
-        return
-
-    if ticket_info[2] not in ('pending', None, ''):
-        await call.answer("❌ Заявка уже занята или обработана!", show_alert=True)
-        return
-
-    agent_number = await get_or_create_agent_number(call.from_user.id)
-    await activate_ticket(ticket_id, call.from_user.id)
-    await call.answer("✅ Заявка взята в работу!")
+    def _query():
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT ticket_id, category, user_id,
+                           EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - created_at))/60 as mins_passed
+                    FROM tickets
+                    WHERE status = 'pending'
+                    ORDER BY ticket_id ASC
+                """)
+                return cur.fetchall()
 
     try:
-        await bot.send_message(
-            ticket_info[0],
-            f"👨‍💻 <b>Агент #{agent_number}</b> взял вашу заявку <b>№{ticket_id}</b> в работу!\nТеперь вы можете писать сюда сообщения.",
-            parse_mode="HTML"
-        )
+        pending_list = await asyncio.to_thread(_query)
     except Exception as e:
-        logging.warning(f"Не удалось уведомить пользователя {ticket_info[0]}: {e}")
-
-    base_text = ticket_info[3] if ticket_info[3] else (call.message.caption or call.message.text or f"Заявка №{ticket_id}")
-    new_text = base_text + f"\n\n🟢 <b>В работе у:</b> {call.from_user.mention_html()} (Агент #{agent_number})"
-    
-    try:
-        if call.message.photo:
-            await call.message.edit_caption(caption=new_text, reply_markup=close_ticket_kb(ticket_id, call.from_user.id), parse_mode="HTML")
-        else:
-            await call.message.edit_text(text=new_text, reply_markup=close_ticket_kb(ticket_id, call.from_user.id), parse_mode="HTML")
-    except Exception as e:
-        logging.error(f"Ошибка обновления карточки при взятии: {e}")
-
-@router.callback_query(F.data.startswith("reject_"))
-async def reject_ticket_handler(call: CallbackQuery):
-    ticket_id = int(call.data.split("_")[1])
-    
-    if call.message.chat.id != ADMIN_CHAT_ID and not await is_support_member(call.from_user.id):
-        await call.answer("❌ У вас нет прав хелпера!", show_alert=True)
+        await message.answer(f"❌ Ошибка получения тикетов из БД: {e}")
         return
 
-    ticket_info = await get_ticket_info(ticket_id)
-    if not ticket_info:
-        await call.answer("❌ Заявка не найдена в базе!", show_alert=True)
+    if not pending_list:
+        await message.answer("🟢 <b>Все заявки обработаны!</b> В данный момент нет открытых тикетов, ожидающих взятия.", parse_mode="HTML")
         return
 
-    if ticket_info[2] not in ('pending', None, ''):
-        await call.answer("❌ Заявка уже обработана!", show_alert=True)
-        return
+    cat_names = {
+        "complaint": "Жалоба",
+        "appeal": "Обжалование",
+        "question": "Вопрос",
+        "friends": "Друзья"
+    }
 
-    await call.answer()
-    base_text = ticket_info[3] if ticket_info[3] else (call.message.caption or call.message.text or f"Заявка №{ticket_id}")
+    text = f"📋 <b>Список неразобранных заявок (ожидают хелперов): {len(pending_list)}</b>\n\n"
+    for t_id, cat, u_id, mins in pending_list:
+        m = int(mins)
+        time_str = f"{m // 60} ч. {m % 60} мин." if m >= 60 else f"{m} мин."
+        cat_str = cat_names.get(cat, cat)
+        text += f"• <b>Заявка №{t_id}</b> ({cat_str}) — ждет <code>{time_str}</code> | Игрок: <code>{u_id}</code>\n"
 
-    prompt_msg = await bot.send_message(
-        ADMIN_CHAT_ID,
-        f"❓ <b>Укажите причину отказа для заявки №{ticket_id}:</b>\n<i>(Ответьте Reply на это сообщение)</i>",
-        parse_mode="HTML"
-    )
-    await add_pending_rejection(prompt_msg.message_id, ticket_id, call.message.message_id, base_text)
-    await map_message(prompt_msg.message_id, 0, ticket_id)
+    await message.answer(text, parse_mode="HTML")
 
-@router.callback_query(F.data.startswith("close_"))
-async def close_ticket_handler(call: CallbackQuery):
-    parts = call.data.split("_")
-    ticket_id = int(parts[1])
-    assigned_admin_id = int(parts[2])
-
-    ticket_info = await get_ticket_info(ticket_id)
-    
-    if not ticket_info or ticket_info[2] == 'closed':
-        await call.answer("⚠️ Заявка уже закрыта!", show_alert=False)
-        try:
-            await call.message.edit_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-        return
-
-    if call.from_user.id != assigned_admin_id and not await is_main_admin(call.from_user.id):
-        if not await is_support_member(call.from_user.id):
-            await call.answer("❌ Нет доступа!", show_alert=True)
-            return
-        await call.answer("❌ Закрыть тикет может только тот админ, который взял его в работу!", show_alert=True)
-        return
-
-    await call.answer("Заявка закрыта!")
-    agent_no = await get_or_create_agent_number(call.from_user.id)
-
-    await close_ticket_db(ticket_id, status='closed', admin_id=call.from_user.id)
-
-    try:
-        await bot.send_message(
-            ticket_info[0],
-            f"{ICON_LOCK} Ваша заявка <b>№{ticket_id}</b> закрыта поддержкой.\nОцените качество обслуживания:",
-            parse_mode="HTML",
-            reply_markup=rating_kb(ticket_id)
-        )
-    except Exception:
-        pass
-
-    base_text = ticket_info[3] or (call.message.caption or call.message.text or f"Заявка <b>№{ticket_id}</b>")
-    status_text = f"\n\n🔒 <b>Заявка №{ticket_id} закрыта</b> администратором {call.from_user.mention_html()} (Агент #{agent_no})."
-    new_content = base_text + status_text
-
-    try:
-        if call.message.photo:
-            await call.message.edit_caption(caption=new_content, reply_markup=None, parse_mode="HTML")
-        else:
-            await call.message.edit_text(text=new_content, reply_markup=None, parse_mode="HTML")
-    except Exception as e:
-        logging.error(f"Ошибка редактирования карточки при закрытии: {e}")
-        try:
-            await call.message.edit_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-
-@router.callback_query(F.data.startswith("user_cancel_"))
-async def user_cancel_ticket(call: CallbackQuery):
-    await call.answer()
-    ticket_id = int(call.data.split("_")[2])
-    ticket_info = await get_ticket_info(ticket_id)
-    if ticket_info and ticket_info[2] == 'pending':
-        await close_ticket_db(ticket_id, 'closed')
-        await call.message.edit_text(f"{ICON_CROSS} Заявка <b>№{ticket_id}</b> отменена вами.", parse_mode="HTML")
-    else:
-        await call.answer("❌ Заявка уже взята в работу или закрыта, отмена недоступна.", show_alert=True)
-
-@router.callback_query(F.data.startswith("rate_"))
-async def process_rating(call: CallbackQuery):
-    await call.answer()
-    parts = call.data.split("_")
-    ticket_id = int(parts[1])
-    score = int(parts[2])
-    user_id = call.from_user.id
-
-    ticket_info = await get_ticket_info(ticket_id)
-    admin_id = ticket_info[1] if ticket_info else 0
-
-    user_is_staff = await is_support_member(user_id) or await is_main_admin(user_id)
-
-    if user_is_staff:
-        await call.message.edit_text(f"{ICON_STAR} [СТАФФ] Вы являетесь администратором/хелпером. Оценка не учитывается в статистике.", parse_mode="HTML")
-    else:
-        await save_rating_db(ticket_id, user_id, admin_id, score)
-        await call.message.edit_text(f"{ICON_STAR} Спасибо за оценку ({score}/5)! Ваше мнение учтено.", parse_mode="HTML")
-
-# ----------------------------------------------------------------------
-# ОТВЕТ ХЕЛПЕРА В ГРУППЕ
-# ----------------------------------------------------------------------
-@router.message(F.chat.id == ADMIN_CHAT_ID, F.reply_to_message)
-async def admin_reply_in_group(message: Message):
-    if message.text and message.text.startswith("/"):
-        return
-
-    replied_msg_id = message.reply_to_message.message_id
-    pending_data = await get_pending_rejection(replied_msg_id)
-
-    if pending_data:
-        pending_ticket_id, card_message_id, saved_card_text = pending_data
-        ticket_info = await get_ticket_info(pending_ticket_id)
-        if ticket_info:
-            reason = html.escape(message.text or message.caption or "Без причины")
-            agent_no = await get_or_create_agent_number(message.from_user.id)
-            await close_ticket_db(pending_ticket_id, 'rejected', admin_id=message.from_user.id)
-            
-            try:
-                user_kb = await main_keyboard(ticket_info[0])
-                await bot.send_message(
-                    ticket_info[0],
-                    f"{ICON_CROSS} Заявка <b>№{pending_ticket_id}</b> отклонена.\n<b>Причина:</b> {reason}",
-                    parse_mode="HTML",
-                    reply_markup=user_kb
-                )
-            except Exception:
-                pass
-            
-            if card_message_id:
-                base = saved_card_text or ticket_info[3] or f"Заявка <b>№{pending_ticket_id}</b>"
-                new_text = (
-                    f"{base}\n\n"
-                    f"🔴 <b>Заявка №{pending_ticket_id} отклонена</b> "
-                    f"администратором {message.from_user.mention_html()} (Агент #{agent_no}).\n"
-                    f"<b>Причина:</b> {reason}"
-                )
-                
-                try:
-                    await bot.edit_message_text(
-                        chat_id=ADMIN_CHAT_ID,
-                        message_id=card_message_id,
-                        text=new_text,
-                        reply_markup=None,
-                        parse_mode="HTML"
-                    )
-                except TelegramBadRequest:
-                    try:
-                        await bot.edit_message_caption(
-                            chat_id=ADMIN_CHAT_ID,
-                            message_id=card_message_id,
-                            caption=new_text,
-                            reply_markup=None,
-                            parse_mode="HTML"
-                        )
-                    except Exception as e:
-                        logging.error(f"Не удалось обновить подпись карточки: {e}")
-                except Exception as e:
-                    logging.error(f"Не удалось обновить текст карточки: {e}")
-
-        try:
-            await bot.delete_message(chat_id=ADMIN_CHAT_ID, message_id=replied_msg_id)
-        except Exception:
-            pass
-
-        await delete_pending_rejection(replied_msg_id)
-        await message.answer(f"✅ Отказ по заявке №{pending_ticket_id} отправлен.")
-        return
-
-    mapping = await get_user_by_group_msg(replied_msg_id)
-    if mapping:
-        user_id, ticket_id = mapping[0], mapping[1]
-        ticket_info = await get_ticket_info(ticket_id)
-
-        if ticket_info and ticket_info[2] == 'active':
-            if ticket_info[1] != message.from_user.id and not await is_main_admin(message.from_user.id):
-                await message.answer("❌ Этот тикет ведет другой администратор. Вы не можете в него отвечать!")
-                return
-
-            await touch_ticket(ticket_id, actor='admin')
-            agent_no = await get_or_create_agent_number(message.from_user.id)
-            
-            client_text = f"👨‍💻 <b>Ответ поддержки (Агент #{agent_no}):</b>\n\n{html.escape(message.text or message.caption or '')}"
-            try:
-                if message.photo:
-                    await bot.send_photo(user_id, photo=message.photo[-1].file_id, caption=client_text, parse_mode="HTML")
-                else:
-                    await bot.send_message(user_id, client_text, parse_mode="HTML")
-                await message.react([{"type": "emoji", "emoji": "👍"}])
-                await map_message(message.message_id, user_id, ticket_id)
-            except Exception as e:
-                await message.answer(f"❌ Ошибка отправки: {e}")
-
-# ----------------------------------------------------------------------
-# КОМАНДЫ
-# ----------------------------------------------------------------------
 @router.message(Command("mystats"), F.chat.id == ADMIN_CHAT_ID)
 async def cmd_my_stats(message: Message):
     if not await is_support_member(message.from_user.id) and not await is_main_admin(message.from_user.id):
@@ -2558,6 +2268,100 @@ async def cmd_unban(message: Message):
     await message.answer(f"✅ Пользователь с ID <code>{user_id}</code> успешно разблокирован.", parse_mode="HTML")
 
 # ----------------------------------------------------------------------
+# ОТВЕТ ХЕЛПЕРА В ГРУППЕ (ОТКАЗ И ДИАЛОГ)
+# ----------------------------------------------------------------------
+@router.message(F.chat.id == ADMIN_CHAT_ID, F.reply_to_message)
+async def admin_reply_in_group(message: Message):
+    if message.text and message.text.startswith("/"):
+        return
+
+    replied_msg_id = message.reply_to_message.message_id
+    pending_data = await get_pending_rejection(replied_msg_id)
+
+    if pending_data:
+        pending_ticket_id, card_message_id, saved_card_text = pending_data
+        ticket_info = await get_ticket_info(pending_ticket_id)
+        if ticket_info:
+            reason = html.escape(message.text or message.caption or "Без причины")
+            agent_no = await get_or_create_agent_number(message.from_user.id)
+            await close_ticket_db(pending_ticket_id, 'rejected', admin_id=message.from_user.id)
+            
+            try:
+                user_kb = await main_keyboard(ticket_info[0])
+                await bot.send_message(
+                    ticket_info[0],
+                    f"{ICON_CROSS} Заявка <b>№{pending_ticket_id}</b> отклонена.\n<b>Причина:</b> {reason}",
+                    parse_mode="HTML",
+                    reply_markup=user_kb
+                )
+            except Exception:
+                pass
+            
+            if card_message_id:
+                base = saved_card_text or ticket_info[3] or f"Заявка <b>№{pending_ticket_id}</b>"
+                new_text = (
+                    f"{base}\n\n"
+                    f"🔴 <b>Заявка №{pending_ticket_id} отклонена</b> "
+                    f"администратором {message.from_user.mention_html()} (Агент #{agent_no}).\n"
+                    f"<b>Причина:</b> {reason}"
+                )
+                
+                try:
+                    await bot.edit_message_text(
+                        chat_id=ADMIN_CHAT_ID,
+                        message_id=card_message_id,
+                        text=new_text,
+                        reply_markup=None,
+                        parse_mode="HTML"
+                    )
+                except TelegramBadRequest:
+                    try:
+                        await bot.edit_message_caption(
+                            chat_id=ADMIN_CHAT_ID,
+                            message_id=card_message_id,
+                            caption=new_text,
+                            reply_markup=None,
+                            parse_mode="HTML"
+                        )
+                    except Exception as e:
+                        logging.error(f"Не удалось обновить подпись карточки: {e}")
+                except Exception as e:
+                    logging.error(f"Не удалось обновить текст карточки: {e}")
+
+        try:
+            await bot.delete_message(chat_id=ADMIN_CHAT_ID, message_id=replied_msg_id)
+        except Exception:
+            pass
+
+        await delete_pending_rejection(replied_msg_id)
+        await message.answer(f"✅ Отказ по заявке №{pending_ticket_id} отправлен.")
+        return
+
+    mapping = await get_user_by_group_msg(replied_msg_id)
+    if mapping:
+        user_id, ticket_id = mapping[0], mapping[1]
+        ticket_info = await get_ticket_info(ticket_id)
+
+        if ticket_info and ticket_info[2] == 'active':
+            if ticket_info[1] != message.from_user.id and not await is_main_admin(message.from_user.id):
+                await message.answer("❌ Этот тикет ведет другой администратор. Вы не можете в него отвечать!")
+                return
+
+            await touch_ticket(ticket_id, actor='admin')
+            agent_no = await get_or_create_agent_number(message.from_user.id)
+            
+            client_text = f"👨‍💻 <b>Ответ поддержки (Агент #{agent_no}):</b>\n\n{html.escape(message.text or message.caption or '')}"
+            try:
+                if message.photo:
+                    await bot.send_photo(user_id, photo=message.photo[-1].file_id, caption=client_text, parse_mode="HTML")
+                else:
+                    await bot.send_message(user_id, client_text, parse_mode="HTML")
+                await message.react([{"type": "emoji", "emoji": "👍"}])
+                await map_message(message.message_id, user_id, ticket_id)
+            except Exception as e:
+                await message.answer(f"❌ Ошибка отправки: {e}")
+
+# ----------------------------------------------------------------------
 # ФОНОВЫЕ ВОРКЕРЫ
 # ----------------------------------------------------------------------
 async def secret_timer_worker():
@@ -2696,8 +2500,8 @@ async def reminder_worker():
                                         WHERE ticket_id = %s
                                     """, (t_id,))
                         await asyncio.to_thread(_mark_admin_reminded)
-                    except Exception as e:
-                        logging.error(f"Ошибка отправки напоминания хелперу по тикету №{t_id}: {e}")
+                    except Exception:
+                        pass
 
             for t_id, u_id, adm_id, c_txt in expired_active:
                 try:
@@ -2718,7 +2522,7 @@ async def reminder_worker():
                     logging.error(f"Ошибка автозакрытия: {ex}")
 
         except Exception as err:
-            logging.error(f"Ошибка в цикле reminder_worker: {err}")
+            logging.error(f"Ошибка в reminder_worker: {err}")
 
         await asyncio.sleep(60)
 
