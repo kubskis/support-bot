@@ -1045,7 +1045,7 @@ async def dispatch_ticket_to_admin(user_id: int, user, category: str, text: str,
 # ----------------------------------------------------------------------
 # СТАРТ И МЕНЮ
 # ----------------------------------------------------------------------
-WELCOME_PHOTO_ID = "AgACAgEAAxkBAAEve3JqxS3FVKxgKBPRqUofbs2nWRcbvgACVQ1rG3XiKEaSw3QnafbGtgEAAwIAA3kAAz0E"
+WELCOME_PHOTO_ID = "AgACAgEAAxkBAAEvf5Nqxe_FpaUfJaoeYrXlQTCnDlhvUwACmgxrG9JkMUYj7HTFKc0d2AEAAwIAA3kAAz0E"
 
 @router.message(CommandStart(), F.chat.type == "private")
 async def start_cmd(message: Message, state: FSMContext):
