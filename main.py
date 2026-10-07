@@ -30,7 +30,7 @@ from aiogram.types import (
 # ----------------------------------------------------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
-ADMIN_CHAT_ID = -1003945292994  # ID группы поддержки
+ADMIN_CHAT_ID = -1003995930989  # ID группы поддержки
 OWNER_ID = int(os.getenv("ADMIN_ID", "0"))  # Главный создатель бота
 MSK_TZ = timezone(timedelta(hours=3))
 
