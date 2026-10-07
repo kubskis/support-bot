@@ -32,7 +32,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_CHAT_ID = -1003995930989  # ID группы поддержки
 OWNER_ID = int(os.getenv("ADMIN_ID", "0"))  # Главный создатель бота
 MSK_TZ = timezone(timedelta(hours=3))
-PHOTO_FILENAME = "supportphoto.jpg"
+PHOTO_FILENAME = "supportphoto1.jpg"
 
 # Конфигурация базы данных (BotHost / Supabase)
 DATABASE_URL = os.getenv("DATABASE_URL")
