@@ -22,22 +22,31 @@ from aiogram.types import (
     Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton,
     InlineKeyboardMarkup, InlineKeyboardButton, TelegramObject,
     LinkPreviewOptions, InputMediaPhoto, BotCommand, BotCommandScopeChat, 
-    BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats
+    BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats, FSInputFile
 )
 
 # ----------------------------------------------------------------------
 # НАСТРОЙКИ И ОКРУЖЕНИЕ
 # ----------------------------------------------------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")
 ADMIN_CHAT_ID = -1003995930989  # ID группы поддержки
 OWNER_ID = int(os.getenv("ADMIN_ID", "0"))  # Главный создатель бота
 MSK_TZ = timezone(timedelta(hours=3))
+PHOTO_FILENAME = "supportphoto.jpg"
+
+# Конфигурация базы данных (BotHost / Supabase)
+DATABASE_URL = os.getenv("DATABASE_URL")
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_PORT = os.getenv("DB_PORT", "5432")
+DB_NAME = os.getenv("DB_NAME", "postgres")
+DB_USER = os.getenv("DB_USER", "postgres")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "")
+DB_SSLMODE = os.getenv("DB_SSLMODE", "prefer")  # "prefer" подходит для BotHost, при необходимости можно передать "disable" или "require"
 
 if not BOT_TOKEN:
     raise ValueError("ОШИБКА: Токен бота не найден! Укажите BOT_TOKEN в Environment Variables.")
-if not DATABASE_URL:
-    raise ValueError("ОШИБКА: Строка подключения к БД не найдена! Укажите DATABASE_URL.")
+if not DATABASE_URL and not DB_HOST:
+    raise ValueError("ОШИБКА: Не указаны параметры подключения к базе данных!")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 bot = Bot(token=BOT_TOKEN)
@@ -126,6 +135,9 @@ class ThrottlingMiddleware(BaseMiddleware):
             current_time = time.time()
             last_time = self.users.get(user_id, 0.0)
 
+            if len(self.users) > 1500:
+                self.users = {uid: t for uid, t in self.users.items() if current_time - t < 60}
+
             if current_time - last_time < self.limit:
                 if isinstance(event, CallbackQuery):
                     try:
@@ -145,12 +157,24 @@ dp.include_router(router)
 # ----------------------------------------------------------------------
 # БАЗА ДАННЫХ
 # ----------------------------------------------------------------------
-db_pool = psycopg2.pool.ThreadedConnectionPool(
-    minconn=1,
-    maxconn=10,
-    dsn=DATABASE_URL,
-    sslmode="require"
-)
+if DATABASE_URL:
+    db_pool = psycopg2.pool.ThreadedConnectionPool(
+        minconn=2,
+        maxconn=20,
+        dsn=DATABASE_URL,
+        sslmode=DB_SSLMODE
+    )
+else:
+    db_pool = psycopg2.pool.ThreadedConnectionPool(
+        minconn=2,
+        maxconn=20,
+        host=DB_HOST,
+        port=DB_PORT,
+        dbname=DB_NAME,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        sslmode=DB_SSLMODE
+    )
 
 @contextmanager
 def get_db():
@@ -413,7 +437,7 @@ async def is_support_member(user_id: int) -> bool:
             return True
     except Exception as e:
         logging.error(f"Ошибка проверки статуса участника {user_id}: {e}")
-        return True
+        return False
     return False
 
 async def get_or_create_agent_number(admin_id: int) -> int:
@@ -856,7 +880,7 @@ BTN_FRIENDS = "👯‍♀️ Добавление в друзья (VIP)"
 BTN_QUESTION = "❓ Задать вопрос"
 BTN_HELPER_APPLY = "📝 Подать заявку на хелпера"
 BTN_SECRET_APPLY = "🔍 Набор в искатели секреток"
-BTN_ADMIN_PANEL = "⚙️️ Админ-панель"
+BTN_ADMIN_PANEL = "⚙ Админ-панель"
 BTN_REFRESH = "🔄 Перезагрузить меню"
 BTN_SECRETS = "🔮 Секретки"
 
@@ -1045,11 +1069,13 @@ async def dispatch_ticket_to_admin(user_id: int, user, category: str, text: str,
 # ----------------------------------------------------------------------
 # СТАРТ И МЕНЮ
 # ----------------------------------------------------------------------
-WELCOME_PHOTO_ID = "AgACAgEAAxkBAAEvf5Nqxe_FpaUfJaoeYrXlQTCnDlhvUwACmgxrG9JkMUYj7HTFKc0d2AEAAwIAA3kAAz0E"
-
 @router.message(CommandStart(), F.chat.type == "private")
 async def start_cmd(message: Message, state: FSMContext):
-    await register_user(message.from_user.id)
+    try:
+        await register_user(message.from_user.id)
+    except Exception as e:
+        logging.error(f"Ошибка при регистрации {message.from_user.id}: {e}")
+
     banned = await is_banned(message.from_user.id)
     if banned:
         await message.answer(
@@ -1069,9 +1095,21 @@ async def start_cmd(message: Message, state: FSMContext):
         '<i>Выберите нужный раздел на клавиатуре ниже</i>'
     )
 
-    await message.answer_photo(
-        photo=WELCOME_PHOTO_ID,
-        caption=welcome_caption,
+    if os.path.exists(PHOTO_FILENAME):
+        try:
+            photo_file = FSInputFile(PHOTO_FILENAME)
+            await message.answer_photo(
+                photo=photo_file,
+                caption=welcome_caption,
+                reply_markup=kb,
+                parse_mode="HTML"
+            )
+            return
+        except Exception as e:
+            logging.error(f"Не удалось отправить локальное фото {PHOTO_FILENAME}: {e}")
+
+    await message.answer(
+        text=welcome_caption,
         reply_markup=kb,
         parse_mode="HTML"
     )
@@ -1431,7 +1469,7 @@ async def sec_stats(call: CallbackQuery):
         pub_index += 1
 
     if len(text) > 4000:
-        text = text[:3950] + "\n... <i>(список сокращен из-за лимита длины)</i>"
+        text = text[:3900].rsplit("\n", 1)[0] + "\n... <i>(список сокращен)</i>"
 
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="adm_secret_panel")]])
     await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
@@ -1903,7 +1941,7 @@ async def pub_confirm(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 # ----------------------------------------------------------------------
-# СИСТЕМА НАБОРА В ХЕЛПЕРЫ И ИСКАТЕЛИ СЕКРЕТОВ (ОБНОВЛЕННЫЕ ШАБЛОНЫ + ПРОВЕРКА ЮЗЕРНЕЙМА)
+# СИСТЕМА НАБОРА В ХЕЛПЕРЫ И ИСКАТЕЛИ СЕКРЕТОВ
 # ----------------------------------------------------------------------
 
 # --- НАБОР В ХЕЛПЕРЫ (ПОДДЕРЖКА) ---
@@ -2285,7 +2323,7 @@ async def process_c_photo(message: Message, state: FSMContext):
                 f"Нарушитель(и): {nicks_formatted}\n"
                 f"Суть нарушения: {html.escape(cur_data.get('c_reason', ''))}\n"
                 f"Где произошло нарушение: {html.escape(cur_data.get('c_place', ''))}\n"
-                f"Время публикации поста: {html.escape(data.get('c_time', ''))}"
+                f"Время публикации поста: {html.escape(cur_data.get('c_time', ''))}"
             )
             ticket_id = await dispatch_ticket_to_admin(message.from_user.id, message.from_user, "complaint", text, photos)
             await state.clear()
@@ -2388,7 +2426,7 @@ async def process_a_reason(message: Message, state: FSMContext):
     await state.update_data(a_reason=message.text.strip())
     await state.set_state(Form.appeal_photos)
     await message.answer(
-        f"{NUM_5} {ICON_PHOTO} <b>Прикрепите доказательства или скриншоты (до 5 фото):</b>\n"
+        f"{NUM_5} {ICON_PHOTO} <b>Прикрепите доказательства или скриншоты (до 5 фото):</b>\n\n"
         "<i>(Если у вас есть доказательства невиновности — отправьте скриншоты, либо нажмите кнопку ниже)</i>",
         reply_markup=skip_photo_kb("appeal"),
         parse_mode="HTML"
@@ -2448,8 +2486,8 @@ async def process_a_photo(message: Message, state: FSMContext):
             text = (
                 f"Ник: {profile_str}\n"
                 f"Сервер бана: {html.escape(cur_data.get('a_place', ''))}\n"
-                f"Время публикации поста: {html.escape(data.get('a_time', ''))}\n"
-                f"Причина разбана: {html.escape(data.get('a_reason', ''))}"
+                f"Время публикации поста: {html.escape(cur_data.get('a_time', ''))}\n"
+                f"Причина разбана: {html.escape(cur_data.get('a_reason', ''))}"
             )
             ticket_id = await dispatch_ticket_to_admin(message.from_user.id, message.from_user, "appeal", text, photos)
             await state.clear()
@@ -2577,7 +2615,7 @@ async def process_friends_nickname(message: Message, state: FSMContext):
         await state.clear()
 
 # ----------------------------------------------------------------------
-# КНОПКИ УПРАВЛЕНИЯ ТИКЕТАМИ (ИСПРАВЛЕНО ВЗЯТИЕ И ОТКЛОНЕНИЕ)
+# КНОПКИ УПРАВЛЕНИЯ ТИКЕТАМИ
 # ----------------------------------------------------------------------
 @router.callback_query(F.data.startswith("take_"))
 async def take_ticket_handler(call: CallbackQuery):
