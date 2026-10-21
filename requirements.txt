@@ -1,6 +1,4 @@
-fastapi>=0.110.0
-uvicorn>=0.28.0
-aiogram==3.31.0
-aiofiles==25.1.0
-psycopg2-binary==2.9.13
-# ... other requirements
+aiogram>=3.13,<4
+aiohttp>=3.9
+psycopg2-binary>=2.9
+telethon>=1.36
