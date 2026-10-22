@@ -177,3 +177,26 @@ ol.rlist{margin-inline:auto}
 .pill.off{color:var(--amber);border-color:rgba(255,180,84,.5)}
 .closed-note{color:var(--muted);font-size:14.5px}
 .closed-note a{color:var(--accent)}
+
+/* лента секреток */
+.feed{list-style:none;max-width:720px;margin:0 auto 20px;padding:0;display:grid;gap:10px}
+.feed li{display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:12px 16px;min-height:56px}
+.feed li.open{border-color:var(--line2);box-shadow:0 0 18px rgba(194,17,31,.25)}
+.feed .ft{font-weight:700;flex:1 1 140px;min-width:0;overflow-wrap:anywhere}
+.feed .fs{font-size:13px;padding:3px 10px;border-radius:999px;border:1px solid var(--line2);white-space:nowrap;color:var(--muted)}
+.feed li.open .fs{color:var(--ok);border-color:rgba(74,222,128,.45)}
+.feed .fa{color:var(--muted);font-size:13px;white-space:nowrap}
+.feed-empty,.shop-empty{text-align:center;color:var(--muted);margin:0 auto 20px;max-width:560px}
+.shop-empty a{color:var(--accent)}
+.live-stats{display:flex;flex-wrap:wrap;gap:10px;justify-content:center;margin:0 0 20px}
+.live-stats span{background:var(--card);border:1px solid var(--line);border-radius:999px;padding:6px 14px;font-size:14px;color:var(--muted)}
+.live-stats b{color:var(--text)}
+#live .btns{justify-content:center}
+/* витрина услуг */
+#shop{padding-bottom:8px}
+.shop-grid .card h3{margin:0}
+.shop-grid .desc{white-space:pre-line;color:var(--muted);font-size:15px}
+.tariffs{list-style:none;margin:0;padding:0;display:grid;gap:8px}
+.tariffs li{display:flex;justify-content:space-between;gap:12px;border-top:1px solid var(--line);padding-top:8px;color:var(--muted)}
+.tariffs b{color:var(--amber);white-space:nowrap}
+.shop-grid .btn{margin-top:auto}
