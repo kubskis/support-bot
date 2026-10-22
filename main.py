@@ -2949,8 +2949,16 @@ async def start_cmd(message: Message, state: FSMContext, command: CommandObject)
     # реферальная ссылка t.me/бот?start=ref_ID: записываем до проверки подписки
     if payload.lower().startswith("ref_"):
         await _ref_register(message.from_user.id, payload[4:])
+    # ссылка с сайта t.me/бот?start=go_question: запоминаем, куда человек шёл, до проверки подписки
+    go_key = _go_key(payload)
+    if go_key:
+        _go_remember(message.from_user.id, go_key)
     # без подписки на канал дальше не пускаем (кроме стаффа)
     if not await _gate_for_start(message):
+        return
+    if go_key:
+        _GO_PENDING.pop(message.from_user.id, None)
+        await _go_run(message, state, go_key)
         return
     await _start_welcome(message, state)
     # ссылка-приглашение с промокодом: t.me/бот?start=promo_КОД
@@ -2960,6 +2968,69 @@ async def start_cmd(message: Message, state: FSMContext, command: CommandObject)
                 await _promo_redeem_reply(message, payload[6:])
         except Exception as e:
             logging.error(f"Ошибка активации промокода по ссылке: {e}", exc_info=True)
+
+# ---------- переходы с сайта: t.me/бот?start=go_<раздел> ----------
+# Сайт ведёт человека сразу в нужную анкету. Если он не подписан на канал, бот просит подписаться,
+# а после «Я подписался» сам запускает ту же анкету (раздел запоминается на час).
+_GO_TITLES = {
+    "helper": "Заявка в хелперы",
+    "seeker": "Заявка в искатели секреток",
+    "complaint": "Жалоба на игрока",
+    "appeal": "Обжалование бана",
+    "question": "Вопрос поддержке",
+}
+_GO_PENDING: Dict[int, tuple] = {}
+_GO_TTL = 3600
+
+def _go_key(payload: str) -> str:
+    p = (payload or "").strip().lower()
+    if p.startswith("go_") and p[3:] in _GO_TITLES:
+        return p[3:]
+    return ""
+
+def _go_remember(uid: int, key: str):
+    if len(_GO_PENDING) > 20000:
+        _GO_PENDING.clear()
+    _GO_PENDING[uid] = (key, time.time())
+
+def _go_starter(key: str):
+    # функции анкет определены ниже по файлу, поэтому берём их в момент вызова
+    return {
+        "helper": start_helper_apply,
+        "seeker": start_secret_apply,
+        "complaint": start_complaint,
+        "appeal": start_appeal,
+        "question": start_question,
+    }.get(key)
+
+async def _go_run(message: Message, state: FSMContext, key: str):
+    """Запускает анкету, выбранную на сайте. message.from_user должен быть самим пользователем."""
+    uid = message.from_user.id
+    starter = _go_starter(key)
+    if starter is None:
+        await _start_welcome(message, state)
+        return
+    try:
+        await register_user(uid)
+    except Exception as e:
+        logging.error(f"Ошибка при регистрации {uid}: {e}")
+    banned = await is_banned(uid)
+    if banned:
+        await message.answer(
+            f"{ICON_CROSS} Вы заблокированы в поддержке.\n<b>Причина:</b> {html.escape(banned[0])}",
+            parse_mode="HTML"
+        )
+        return
+    await state.clear()
+    try:
+        # короткое сообщение заодно ставит главное меню (клавиатуру), чтобы оно не пропало
+        await message.answer(
+            f"🌐 Переход с сайта: <b>{_GO_TITLES[key]}</b>",
+            reply_markup=await main_keyboard(uid), parse_mode="HTML"
+        )
+    except Exception as e:
+        logging.warning(f"Переход с сайта: не удалось отправить меню {uid}: {e}")
+    await starter(message, state)
 
 async def _start_welcome(message: Message, state: FSMContext):
     try:
@@ -6618,7 +6689,7 @@ async def _gate_for_start(message: Message) -> bool:
     return True
 
 @router.callback_query(F.data == "subchk")
-async def sub_check_cb(call: CallbackQuery):
+async def sub_check_cb(call: CallbackQuery, state: FSMContext):
     uid = call.from_user.id
     ok = await check_subscription(uid, fresh=True)
     if ok is False:
@@ -6631,6 +6702,15 @@ async def sub_check_cb(call: CallbackQuery):
     except Exception:
         pass
     await call.answer()
+    # человек пришёл с сайта в конкретный раздел: продолжаем с того места, где он остановился
+    pend = _GO_PENDING.pop(uid, None)
+    if pend and time.time() - pend[1] < _GO_TTL:
+        try:
+            fake = call.message.model_copy(update={"from_user": call.from_user}).as_(bot)
+            await _go_run(fake, state, pend[0])
+            return
+        except Exception as e:
+            logging.error(f"Не удалось продолжить переход с сайта ({pend[0]}) для {uid}: {e}", exc_info=True)
     try:
         await bot.send_message(uid, "Выберите нужный раздел на клавиатуре ниже.", reply_markup=await main_keyboard(uid))
     except Exception:
