@@ -2642,6 +2642,8 @@ class Form(StatesGroup):
     secret_time = State()
     secret_why = State()
 
+    rating_comment = State()
+
     add_main_admin_id = State()
     del_main_admin_id = State()
 
@@ -2731,7 +2733,6 @@ class SecretAdminStates(StatesGroup):
     call_command = State()
     test_channel = State()
     prelink_duration = State()
-    rating_comment = State()
 
 # ----------------------------------------------------------------------
 # КЛАВИАТУРЫ
