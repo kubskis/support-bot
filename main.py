@@ -2973,6 +2973,7 @@ async def start_cmd(message: Message, state: FSMContext, command: CommandObject)
 # Сайт ведёт человека сразу в нужную анкету. Если он не подписан на канал, бот просит подписаться,
 # а после «Я подписался» сам запускает ту же анкету (раздел запоминается на час).
 _GO_TITLES = {
+    "shop": "Платные услуги",
     "helper": "Заявка в хелперы",
     "seeker": "Заявка в искатели секреток",
     "complaint": "Жалоба на игрока",
@@ -2984,8 +2985,11 @@ _GO_TTL = 3600
 
 def _go_key(payload: str) -> str:
     p = (payload or "").strip().lower()
-    if p.startswith("go_") and p[3:] in _GO_TITLES:
-        return p[3:]
+    if not p.startswith("go_"):
+        return ""
+    k = p[3:]
+    if k in _GO_TITLES or re.fullmatch(r"shop_\d{1,9}", k):
+        return k          # shop_12 = конкретная услуга магазина
     return ""
 
 def _go_remember(uid: int, key: str):
@@ -3007,7 +3011,7 @@ async def _go_run(message: Message, state: FSMContext, key: str):
     """Запускает анкету, выбранную на сайте. message.from_user должен быть самим пользователем."""
     uid = message.from_user.id
     starter = _go_starter(key)
-    if starter is None:
+    if starter is None and not key.startswith("shop"):
         await _start_welcome(message, state)
         return
     try:
@@ -3025,12 +3029,26 @@ async def _go_run(message: Message, state: FSMContext, key: str):
     try:
         # короткое сообщение заодно ставит главное меню (клавиатуру), чтобы оно не пропало
         await message.answer(
-            f"🌐 Переход с сайта: <b>{_GO_TITLES[key]}</b>",
+            f"🌐 Переход с сайта: <b>{_GO_TITLES[key.split('_')[0]]}</b>",
             reply_markup=await main_keyboard(uid), parse_mode="HTML"
         )
     except Exception as e:
         logging.warning(f"Переход с сайта: не удалось отправить меню {uid}: {e}")
+    if key.startswith("shop"):
+        await _go_shop(message, int(key[5:]) if key.startswith("shop_") else 0)
+        return
     await starter(message, state)
+
+async def _go_shop(message: Message, sid: int):
+    """Сайт → бот: открывает витрину магазина или конкретную услугу."""
+    if sid:
+        screen = await _shop_service_screen(message.from_user.id, sid)
+        if screen:
+            await message.answer(screen[0], reply_markup=screen[1], parse_mode="HTML")
+            return
+        await message.answer("Эта услуга сейчас недоступна. Вот актуальный список:")
+    text, kb = await _shop_home_screen()
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
 
 async def _start_welcome(message: Message, state: FSMContext):
     try:
@@ -7344,28 +7362,23 @@ async def shop_home(call: CallbackQuery):
     await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     await call.answer()
 
-@router.callback_query(F.data.startswith("shop_s_"))
-async def shop_service_view(call: CallbackQuery):
-    if await is_banned(call.from_user.id):
-        await call.answer()
-        return
-    sid = int(call.data.split("_")[2])
+async def _shop_service_screen(uid: int, sid: int):
+    """Экран услуги: (текст, клавиатура) или None, если услуга недоступна."""
     sv = await shop_get_service(sid)
     tariffs = await shop_get_tariffs(sid, True) if sv else []
     if not sv or not sv[4] or not tariffs:
-        await call.answer("Эта услуга сейчас недоступна.", show_alert=True)
-        return
+        return None
     lines = [f"💎 <b>{html.escape(sv[1])}</b>"]
     if sv[2]:
         lines.append("\n" + html.escape(sv[2]))
     if sv[3] == "prelinks":
         exp_map = await get_prelink_expiry_map()
-        if call.from_user.id in exp_map:
-            lines.append(f"\n✅ Ваш доступ сейчас: <b>{fmt_prelink_until(exp_map[call.from_user.id])}</b>. Покупка продлит его.")
+        if uid in exp_map:
+            lines.append(f"\n✅ Ваш доступ сейчас: <b>{fmt_prelink_until(exp_map[uid])}</b>. Покупка продлит его.")
     tpct = {}
     codes = {}
     for t in tariffs:
-        pr_t = await _best_promo(call.from_user.id, sid, t[0])
+        pr_t = await _best_promo(uid, sid, t[0])
         tpct[t[0]] = pr_t[2] if pr_t else 0
         if pr_t:
             codes[pr_t[1]] = pr_t[2]
@@ -7382,7 +7395,19 @@ async def shop_service_view(call: CallbackQuery):
     rows.append([IB(text="🎟 Ввести промокод", callback_data="shop_promo")])
     rows.append([IB(text="💳 Другие методы оплаты", url=await shop_channel_url())])
     rows.append([IB(text="🔙 Назад", callback_data="shop_home")])
-    await call.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+@router.callback_query(F.data.startswith("shop_s_"))
+async def shop_service_view(call: CallbackQuery):
+    if await is_banned(call.from_user.id):
+        await call.answer()
+        return
+    sid = int(call.data.split("_")[2])
+    screen = await _shop_service_screen(call.from_user.id, sid)
+    if not screen:
+        await call.answer("Эта услуга сейчас недоступна.", show_alert=True)
+        return
+    await call.message.edit_text(screen[0], reply_markup=screen[1], parse_mode="HTML")
     await call.answer()
 
 async def _user_has_forever_prelinks(uid: int) -> bool:
@@ -11440,6 +11465,79 @@ async def _site_flags() -> dict:
         logging.warning(f"/api/status: не удалось прочитать настройки: {e}")
         return _SITE_FLAGS["data"] or {}
 
+_SITE_SECRETS = {"t": 0.0, "data": None}
+_SITE_SHOP = {"t": 0.0, "data": None}
+
+async def _site_secrets() -> dict:
+    """Лента секреток для сайта: только тип, возраст и статус. Ссылок и серверов тут нет и быть не должно. Кэш 15 с."""
+    now = time.time()
+    if _SITE_SECRETS["data"] is not None and now - _SITE_SECRETS["t"] < 15:
+        return _SITE_SECRETS["data"]
+    data = {"items": [], "farm": None, "saboteur": None}
+    if TEST_MODE_ON:
+        # в тест-режиме посты идут в тестовый канал, сайту их показывать не нужно
+        _SITE_SECRETS.update(t=now, data=data)
+        return data
+    try:
+        rows = await _db_all(
+            "SELECT secret_type, EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - created_at)), is_expired "
+            "FROM secret_posts WHERE message_id > 0 AND created_at > CURRENT_TIMESTAMP - INTERVAL '24 hours' "
+            "ORDER BY created_at DESC LIMIT 8"
+        )
+        for stype, age, expired in rows:
+            age = max(0, int(age or 0))
+            data["items"].append({
+                "type": str(stype or "Секретка")[:40],
+                "age": age,
+                # если пометка «истекла» почему-то не поставилась, через 30 минут пост всё равно считаем закрытым
+                "open": (not expired) and age < 1800,
+            })
+    except Exception as e:
+        logging.warning(f"/api/secrets: не удалось прочитать секретки: {e}")
+        return _SITE_SECRETS["data"] or {"items": [], "farm": None, "saboteur": None, "error": True}
+    for key, sql in (
+        ("farm", "SELECT COUNT(*) FROM farm_servers s JOIN farm_posts p ON p.id = s.post_id WHERE s.is_active = TRUE AND p.is_active = TRUE"),
+        ("saboteur", "SELECT COUNT(*) FROM saboteur_servers s JOIN saboteur_posts p ON p.id = s.post_id WHERE s.is_active = TRUE AND p.is_active = TRUE"),
+    ):
+        try:
+            r = await _db_one(sql)
+            data[key] = int(r[0]) if r else 0
+        except Exception as e:
+            logging.warning(f"/api/secrets: счётчик {key}: {e}")
+    _SITE_SECRETS.update(t=now, data=data)
+    return data
+
+async def _site_shop() -> dict:
+    """Витрина услуг для сайта: то же, что видит человек в боте (активные услуги и тарифы). Кэш 30 с."""
+    now = time.time()
+    if _SITE_SHOP["data"] is not None and now - _SITE_SHOP["t"] < 30:
+        return _SITE_SHOP["data"]
+    try:
+        out = []
+        for sv in await shop_get_services(True):
+            tariffs = await shop_get_tariffs(sv[0], True)
+            if not tariffs:
+                continue
+            out.append({
+                "id": int(sv[0]),
+                "title": str(sv[1] or "")[:80],
+                "description": str(sv[2] or "")[:600],
+                "kind": str(sv[3] or ""),
+                "tariffs": [{"label": str(t[1] or "")[:60], "stars": int(t[2]), "days": (int(t[3]) if t[3] else None)} for t in tariffs],
+            })
+        data = {"services": out, "channel": await shop_channel_url()}
+        _SITE_SHOP.update(t=now, data=data)
+        return data
+    except Exception as e:
+        logging.warning(f"/api/shop: не удалось прочитать услуги: {e}")
+        return _SITE_SHOP["data"] or {"services": [], "channel": SHOP_DEFAULT_CHANNEL, "error": True}
+
+async def handle_api_secrets(request):
+    return web.json_response(await _site_secrets(), headers={"Cache-Control": "no-store"})
+
+async def handle_api_shop(request):
+    return web.json_response(await _site_shop(), headers={"Cache-Control": "no-store"})
+
 async def handle_api_status(request):
     """Публичный статус для сайта. Только безопасные данные, без личной информации."""
     payload = {
@@ -11462,6 +11560,8 @@ async def web_server():
     app.router.add_get("/", handle_ping)
     app.router.add_get("/health", handle_health)
     app.router.add_get("/api/status", handle_api_status)
+    app.router.add_get("/api/secrets", handle_api_secrets)
+    app.router.add_get("/api/shop", handle_api_shop)
     app.router.add_get("/{name}", handle_page)   # ставим последним: /health и /api/status имеют приоритет
     runner = web.AppRunner(app)
     await runner.setup()
