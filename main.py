@@ -5,6 +5,11 @@ import os
 import html
 import re
 import uuid
+import base64
+import hashlib
+import hmac
+import json
+import secrets
 from types import SimpleNamespace
 import time
 from datetime import datetime, timezone, timedelta
@@ -1177,6 +1182,16 @@ def _init_db_sync():
                     score INTEGER,
                     review TEXT
                 );
+                ALTER TABLE ratings ADD COLUMN IF NOT EXISTS review_at TIMESTAMP WITH TIME ZONE;
+                CREATE TABLE IF NOT EXISTS complaint_targets (
+                    id SERIAL PRIMARY KEY,
+                    ticket_id INTEGER,
+                    reporter_id BIGINT,
+                    tkey TEXT,
+                    nick TEXT,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS complaint_targets_tkey_idx ON complaint_targets (tkey);
                 CREATE TABLE IF NOT EXISTS main_admins (
                     admin_id BIGINT PRIMARY KEY
                 );
@@ -1771,6 +1786,93 @@ async def create_ticket(user_id: int, category: str = 'general', card_text: str 
                 )
                 return cur.fetchone()[0]
     return await asyncio.to_thread(_query)
+
+# ---------- повторные жалобы на одного игрока ----------
+def _ru_plural(n: int, forms: tuple) -> str:
+    n = abs(int(n))
+    if 11 <= n % 100 <= 14:
+        return forms[2]
+    if n % 10 == 1:
+        return forms[0]
+    if 2 <= n % 10 <= 4:
+        return forms[1]
+    return forms[2]
+
+def _ago_ru(dt) -> str:
+    try:
+        sec = max(0, int((datetime.now(timezone.utc) - dt).total_seconds()))
+    except Exception:
+        return ""
+    if sec < 3600:
+        return f"{max(1, sec // 60)} мин. назад"
+    if sec < 86400:
+        return f"{sec // 3600} ч. назад"
+    return f"{sec // 86400} дн. назад"
+
+def _complaint_targets(text: str) -> list:
+    """Нарушители из текста жалобы: [(ключ, ник)]. Ключ: id:<Roblox ID> или n:<ник строчными>."""
+    m = re.search(r"Нарушитель\(и\):\s*([^\n]+)", text or "")
+    if not m:
+        return []
+    line = m.group(1)
+    out, seen = [], set()
+    link_re = r"<a href='[^']*'>([^<]+)</a> \(ID: <code>(\d+)</code>\)"
+    for name, rid in re.findall(link_re, line):
+        k = f"id:{rid}"
+        if k not in seen:
+            seen.add(k)
+            out.append((k, html.unescape(name).strip()))
+    rest = re.sub(link_re, "", line)
+    for name in re.findall(r"<code>([^<]+)</code>", rest):
+        name = html.unescape(name).strip()
+        k = "n:" + name.lower()
+        if name and k not in seen:
+            seen.add(k)
+            out.append((k, name))
+    return out[:5]
+
+async def _complaint_history_line(targets: list) -> str:
+    """Строка для карточки: на этого игрока уже жаловались (за последние 180 дней). Пусто, если жалоб не было."""
+    keys = [k for k, _ in targets]
+    if not keys:
+        return ""
+    rows = await _db_all(
+        "SELECT tkey, ticket_id, reporter_id, created_at FROM complaint_targets "
+        "WHERE tkey = ANY(%s) AND created_at > CURRENT_TIMESTAMP - INTERVAL '180 days' ORDER BY created_at DESC",
+        (keys,)
+    )
+    by_key: Dict[str, dict] = {}
+    for tkey, tid, rep_id, created in rows:
+        d = by_key.setdefault(tkey, {"tickets": [], "reporters": set(), "last": created})
+        if tid not in d["tickets"]:
+            d["tickets"].append(tid)
+        d["reporters"].add(rep_id)
+    lines = []
+    link_ids = []
+    for k, _ in targets:
+        if k in by_key:
+            link_ids.extend(by_key[k]["tickets"][:3])
+    links = await get_ticket_links(link_ids) if link_ids else {}
+    for k, nick in targets:
+        d = by_key.get(k)
+        if not d:
+            continue
+        n, m_ = len(d["tickets"]), len(d["reporters"])
+        refs = ", ".join(ticket_num_html(t, links.get(t, "")) for t in d["tickets"][:3])
+        lines.append(
+            f"⚠️ <b>{html.escape(nick)}</b>: уже {n} {_ru_plural(n, ('жалоба', 'жалобы', 'жалоб'))} "
+            f"от {m_} {_ru_plural(m_, ('игрока', 'игроков', 'игроков'))}, последняя {_ago_ru(d['last'])} ({refs})"
+        )
+    if not lines:
+        return ""
+    return "🔁 <b>Повторные жалобы:</b>\n" + "\n".join(lines) + "\n\n"
+
+async def _record_complaint_targets(ticket_id: int, reporter_id: int, targets: list):
+    for k, nick in targets:
+        await _db_exec(
+            "INSERT INTO complaint_targets (ticket_id, reporter_id, tkey, nick) VALUES (%s, %s, %s, %s)",
+            (ticket_id, reporter_id, k, nick[:60])
+        )
 
 async def touch_ticket(ticket_id: int, actor: str = 'user'):
     def _query():
@@ -2629,6 +2731,7 @@ class SecretAdminStates(StatesGroup):
     call_command = State()
     test_channel = State()
     prelink_duration = State()
+    rating_comment = State()
 
 # ----------------------------------------------------------------------
 # КЛАВИАТУРЫ
@@ -2700,8 +2803,11 @@ async def recruit_kb():
 async def system_kb():
     maint_icon, maint_word = ("🔴", "ВКЛЮЧЁН") if MAINTENANCE_ON else ("🟢", "Выкл")
     test_word = "ВКЛЮЧЁН" if TEST_MODE_ON else "Выкл"
+    ds_on = (await get_setting("daily_summary", "true")) == "true"
     return InlineKeyboardMarkup(inline_keyboard=[
         [IB(text=f"{maint_icon} Тех. перерыв: {maint_word}", callback_data="toggle_maintenance")],
+        [IB(text=f"{'🟢' if ds_on else '🔴'} Ежедневная сводка: {'Вкл' if ds_on else 'Выкл'}", callback_data="toggle_daily_summary"),
+         IB(text="📨 Сводка сейчас", callback_data="daily_summary_now")],
         [IB(text=f"🧪 Тест режим: {test_word}", callback_data="toggle_testmode"),
          IB(text="📡 Канал тест-режима", callback_data="set_test_channel")],
         [IB(text="👥 Публикаторы секреток", callback_data="sec_manage_pubs")],
@@ -2799,6 +2905,66 @@ def skip_photo_kb(target: str):
         IB(text="⏩ Пропустить прикрепление фото", callback_data=f"skip_photo_{target}")
     ]])
 
+SITE_URL = (os.getenv("SITE_URL") or "https://towerofsecrets.run.place").rstrip("/")
+
+# Правила по типам серверов (то же, что на странице сайта /rules)
+RULES_BY_TYPE = {
+    "secret": (
+        ["Не ускорять",
+         "Выйти с сервера после получения эффекта",
+         "Не покупать негативные мутаторы",
+         "Не подниматься выше уровня над секреткой и не идти к воротам ускорения"],
+        "Фарм-секретка: не ускорять; выйти с сервера после получения монеток (можно перезайти, но выйти нужно); не покупать негативные мутаторы."
+    ),
+    "saboteur": (
+        ["Снять все эффекты (сияние, нимбы, черепок, призрак, лапки, сердечки; эффекты без следов можно)",
+         "Не стоять в АФК больше 2 раундов",
+         "Не подниматься выше ворот",
+         "Не трогать рычаги, этим занимаются админы",
+         "Вход с карминовым и фиолетовым нимбом запрещён",
+         "Покупать при саботёре щит и прочее (плохие мутаторы нельзя)",
+         "Не играть в мини-игры, пока не прошли башню",
+         "Ускорение башни с саботёром или секреткой запрещено",
+         "Всегда ускорять башню из 4 уровней, не ждать других"],
+        ""
+    ),
+    "farm": (
+        ["Снять все эффекты (сияние, нимбы, черепок, призрак, лапки, сердечки; эффекты без следов можно)",
+         "Не стоять в АФК больше 2 раундов",
+         "Ускорять не раньше чем через 3 минуты от начала раунда",
+         "Не покупать негативные мутаторы",
+         "По возможности покупать положительные мутаторы"],
+        ""
+    ),
+    "researcher": (
+        ["Проходить башню",
+         "Не стоять в АФК",
+         "После получения бейджа сразу выйти",
+         "Не покупать негативные мутаторы"],
+        ""
+    ),
+    "mutator": (
+        ["Не проходить башню",
+         "Не стоять в АФК",
+         "После получения бейджа сразу выйти"],
+        ""
+    ),
+}
+
+def _rules_hint(key: str, kind: str) -> str:
+    """Свёрнутая цитата с правилами выбранного типа сервера (для жалобы или обжалования)."""
+    sec = RULES_BY_TYPE.get(key)
+    if not sec:
+        return ""
+    rules, extra = sec
+    body = "\n".join(f"{i}. {html.escape(r)}" for i, r in enumerate(rules, 1))
+    if extra:
+        body += "\n\n" + html.escape(extra)
+    head = ("Проверьте, что нарушение есть в правилах этого типа:" if kind == "complaint"
+            else "Правила этого типа, по ним обычно выдают бан:")
+    return (f"\n\n📜 <b>{head}</b>\n<blockquote expandable>{body}</blockquote>\n"
+            f'<a href="{SITE_URL}/rules#{key}">Полные правила на сайте</a>')
+
 def complaint_servers_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [IB(text="🌐 Сервер с секреткой", callback_data="cmp_srv_secret")],
@@ -2840,8 +3006,22 @@ async def dispatch_ticket_to_admin(user_id: int, user, category: str, text: str,
         joined = "\n".join(lines)
         notes_header = f"📌 <b>Постоянные заметки:</b>\n{joined}\n━━━━━━━━━━━━━━━━━━━━\n"
 
+    rep_line, targets = "", []
+    if category == "complaint":
+        try:
+            targets = _complaint_targets(text)
+            rep_line = await _complaint_history_line(targets)
+        except Exception as e:
+            logging.warning(f"Не удалось проверить повторные жалобы: {e}")
+            rep_line, targets = "", []
+
     ticket_id = await create_ticket(user_id, category, "")
-    admin_card_text = f"{notes_header}{title} | <b>Заявка №{ticket_id}</b>\n👤 От: {user_mention} | ID: <code>{user_id}</code>\n\n{text}"
+    if targets:
+        try:
+            await _record_complaint_targets(ticket_id, user_id, targets)
+        except Exception as e:
+            logging.warning(f"Тикет #{ticket_id}: не удалось записать нарушителей жалобы: {e}")
+    admin_card_text = f"{notes_header}{title} | <b>Заявка №{ticket_id}</b>\n👤 От: {user_mention} | ID: <code>{user_id}</code>\n\n{rep_line}{text}"
 
     def _save_card_txt():
         with get_db() as conn:
@@ -2859,6 +3039,7 @@ async def dispatch_ticket_to_admin(user_id: int, user, category: str, text: str,
             with get_db() as conn:
                 with conn.cursor() as cur:
                     cur.execute("DELETE FROM tickets WHERE ticket_id = %s", (ticket_id,))
+                    cur.execute("DELETE FROM complaint_targets WHERE ticket_id = %s", (ticket_id,))
         try:
             await asyncio.to_thread(_d)
         except Exception as _e:
@@ -2950,6 +3131,10 @@ async def dispatch_ticket_to_admin(user_id: int, user, category: str, text: str,
 @router.message(CommandStart(), F.chat.type == "private")
 async def start_cmd(message: Message, state: FSMContext, command: CommandObject):
     payload = (command.args or "").strip()
+    # вход на сайт: t.me/бот?start=login_<код>. Не требует подписки, показывает только кнопку подтверждения
+    if payload.lower().startswith("login_"):
+        await _web_login_prompt(message, payload[6:])
+        return
     # реферальная ссылка t.me/бот?start=ref_ID: записываем до проверки подписки
     if payload.lower().startswith("ref_"):
         await _ref_register(message.from_user.id, payload[4:])
@@ -3053,6 +3238,45 @@ async def _go_shop(message: Message, sid: int):
         await message.answer("Эта услуга сейчас недоступна. Вот актуальный список:")
     text, kb = await _shop_home_screen()
     await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+# ---------- вход на сайт через бота (личный кабинет) ----------
+async def _web_login_prompt(message: Message, code: str):
+    ent = _LOGIN.get(code)
+    if not ent or time.time() - ent["t"] > _LOGIN_TTL or ent["uid"] is not None:
+        await message.answer("⌛ Эта ссылка для входа устарела. Вернитесь на сайт и нажмите «Войти» ещё раз.")
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [IB(text="✅ Да, это я, войти", callback_data=f"weblogin_{code}")],
+        [IB(text="❌ Это не я", callback_data="weblogin_no")],
+    ])
+    await message.answer(
+        "🔐 <b>Вход на сайт</b>\n\n"
+        f"Запрос входа в личный кабинет на {html.escape(SITE_URL.replace('https://', ''))}.\n"
+        "Подтверждайте, только если вы сами нажали «Войти» на сайте. Если об этом вас попросил кто-то другой, нажмите «Это не я».",
+        reply_markup=kb, parse_mode="HTML"
+    )
+
+@router.callback_query(F.data.startswith("weblogin_"))
+async def web_login_confirm(call: CallbackQuery):
+    code = call.data[len("weblogin_"):]
+    if code == "no":
+        try:
+            await call.message.edit_text("Вход отменён. Если это были не вы, ничего делать не нужно.")
+        except Exception:
+            pass
+        await call.answer()
+        return
+    ent = _LOGIN.get(code)
+    if not ent or time.time() - ent["t"] > _LOGIN_TTL or ent["uid"] is not None:
+        await call.answer("Ссылка устарела. Нажмите «Войти» на сайте ещё раз.", show_alert=True)
+        return
+    ent["uid"] = call.from_user.id
+    ent["name"] = (call.from_user.full_name or "")[:40]
+    try:
+        await call.message.edit_text("✅ Готово! Вернитесь на сайт, вход выполнится сам.")
+    except Exception:
+        pass
+    await call.answer()
 
 async def _start_welcome(message: Message, state: FSMContext):
     try:
@@ -6653,7 +6877,7 @@ class SubscriptionGateMiddleware(BaseMiddleware):
             if txt.startswith(("/start", "/paysupport", "/refund")):
                 return await handler(event, data)   # /start сам проверяет подписку после записи реферала
         elif isinstance(event, CallbackQuery):
-            if event.data == "subchk" or event.message is None or event.message.chat.type != "private":
+            if event.data == "subchk" or (event.data or "").startswith("weblogin_") or event.message is None or event.message.chat.type != "private":
                 return await handler(event, data)
         else:
             return await handler(event, data)
@@ -9319,10 +9543,10 @@ async def process_c_server_choice(call: CallbackQuery, state: FSMContext):
     await state.update_data(c_place=chosen_server)
     await state.set_state(Form.complaint_time)
     await call.message.edit_text(
-        f"Выбран сервер: <b>{chosen_server}</b>\n\n"
+        f"Выбран сервер: <b>{chosen_server}</b>{_rules_hint(call.data[8:], 'complaint')}\n\n"
         f"{NUM_4} {ICON_TIMER} <b>Укажите время публикации поста:</b>\n"
         "<i>(Укажите примерное или точное время публикации поста по МСК, например: <code>18:45</code> или <code>18:45:20 28.09</code>)</i>",
-        parse_mode="HTML"
+        parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True)
     )
     await call.answer()
 
@@ -9487,10 +9711,10 @@ async def process_a_server_choice(call: CallbackQuery, state: FSMContext):
     await state.update_data(a_place=chosen_server)
     await state.set_state(Form.appeal_time)
     await call.message.edit_text(
-        f"Выбран сервер: <b>{chosen_server}</b>\n\n"
+        f"Выбран сервер: <b>{chosen_server}</b>{_rules_hint(call.data[8:], 'appeal')}\n\n"
         f"{NUM_3} {ICON_TIMER} <b>Укажите время публикации поста:</b>\n"
         "<i>(Укажите примерное или точное время публикации поста по МСК, например: <code>18:45</code> или <code>18:45:20 28.09</code>)</i>",
-        parse_mode="HTML"
+        parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True)
     )
     await call.answer()
 
@@ -10002,9 +10226,84 @@ async def process_rating(call: CallbackQuery):
     else:
         await save_rating_db(ticket_id, user_id, admin_id, score)
         try:
-            await call.message.edit_text(f"{ICON_STAR} Спасибо за оценку ({score}/5)! Ваше мнение учтено.", parse_mode="HTML")
+            await call.message.edit_text(
+                f"{ICON_STAR} Спасибо за оценку ({score}/5)! Ваше мнение учтено.\n"
+                "Если хотите рассказать, что понравилось или что улучшить, нажмите кнопку ниже (это необязательно).",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[IB(text="💬 Написать отзыв", callback_data=f"rfb_{ticket_id}")]]),
+                parse_mode="HTML"
+            )
         except TelegramBadRequest:
             pass
+
+_RFB_CANCEL_KB = InlineKeyboardMarkup(inline_keyboard=[[IB(text="Отмена", callback_data="rfbx")]])
+
+@router.callback_query(F.data.regexp(r"^rfb_\d+$"))
+async def rating_feedback_start(call: CallbackQuery, state: FSMContext):
+    ticket_id = int(call.data.split("_")[1])
+    row = await _db_one("SELECT user_id, review FROM ratings WHERE ticket_id = %s", (ticket_id,))
+    if not row or row[0] != call.from_user.id:
+        await call.answer("Оценка не найдена.", show_alert=True)
+        return
+    if row[1]:
+        await call.answer("Отзыв уже отправлен, спасибо!", show_alert=True)
+        return
+    await state.clear()
+    await state.set_state(Form.rating_comment)
+    await state.update_data(rfb_ticket=ticket_id)
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await call.message.answer(
+        "💬 Напишите одним сообщением, что понравилось или что стоит улучшить (до 500 символов).",
+        reply_markup=_RFB_CANCEL_KB
+    )
+    await call.answer()
+
+@router.callback_query(F.data == "rfbx")
+async def rating_feedback_cancel(call: CallbackQuery, state: FSMContext):
+    if await state.get_state() == Form.rating_comment.state:
+        await state.clear()
+    try:
+        await call.message.edit_text("Хорошо, без отзыва. Спасибо за оценку!")
+    except Exception:
+        pass
+    await call.answer()
+
+@router.message(Form.rating_comment, F.text, F.chat.type == "private")
+async def rating_feedback_save(message: Message, state: FSMContext):
+    data = await state.get_data()
+    ticket_id = data.get("rfb_ticket")
+    await state.clear()
+    txt = (message.text or "").strip()
+    if not ticket_id or not txt or txt.startswith("/"):
+        await message.answer("Хорошо, без отзыва. Спасибо за оценку!")
+        return
+    txt = txt[:500]
+    row = await _db_one(
+        "UPDATE ratings SET review = %s, review_at = CURRENT_TIMESTAMP "
+        "WHERE ticket_id = %s AND user_id = %s AND (review IS NULL OR review = '') RETURNING score, admin_id",
+        (txt, ticket_id, message.from_user.id)
+    )
+    if not row:
+        await message.answer("Не удалось сохранить отзыв: оценка не найдена или отзыв уже отправлен.")
+        return
+    await message.answer("🙏 Спасибо! Ваш отзыв передан команде.")
+    agent = await _db_one("SELECT agent_number FROM admin_agents WHERE admin_id = %s", (row[1],)) if row[1] else None
+    agent_txt = f"Агент #{agent[0]}" if agent and agent[0] else "агент не указан"
+    note = (
+        f"💬 <b>Отзыв по заявке №{ticket_id}</b> · оценка {row[0]}/5 · {agent_txt}\n\n"
+        f"<i>{html.escape(txt)}</i>"
+    )
+    for aid in await get_main_admin_ids():
+        try:
+            await bot.send_message(aid, note, parse_mode="HTML")
+        except Exception as e:
+            logging.warning(f"Не удалось отправить отзыв админу {aid}: {e}")
+
+@router.message(Form.rating_comment, F.chat.type == "private")
+async def rating_feedback_not_text(message: Message):
+    await message.answer("Отправьте отзыв текстом или нажмите «Отмена».", reply_markup=_RFB_CANCEL_KB)
 
 # ----------------------------------------------------------------------
 # ДИАЛОГ В ЛС С ПОЛЬЗОВАТЕЛЕМ (ОТПРАВКА В ТЕМУ ПОДДЕРЖКИ)
@@ -11201,6 +11500,137 @@ async def prelink_renew_reminder_worker():
             logging.error(f"Ошибка в prelink_renew_reminder_worker: {err}", exc_info=True)
         await asyncio.sleep(600)
 
+# ----------------------------------------------------------------------
+# ЕЖЕДНЕВНАЯ СВОДКА ДЛЯ ГЛАВНЫХ АДМИНОВ
+# ----------------------------------------------------------------------
+async def build_daily_summary() -> str:
+    """Короткая сводка за последние 24 часа. Каждая часть считается отдельно: сбой одного запроса не ломает остальные."""
+    async def one(sql, params=()):
+        try:
+            return await _db_one(sql, params)
+        except Exception as e:
+            logging.warning(f"Сводка: запрос не удался: {e}")
+            return None
+
+    async def many(sql, params=()):
+        try:
+            return await _db_all(sql, params) or []
+        except Exception as e:
+            logging.warning(f"Сводка: запрос не удался: {e}")
+            return []
+
+    day = "CURRENT_TIMESTAMP - INTERVAL '24 hours'"
+    now = datetime.now(MSK_TZ)
+    lines = [f"📊 <b>Сводка за сутки</b> · {now.strftime('%d.%m.%Y %H:%M')} МСК", ""]
+
+    cats = dict(await many(f"SELECT category, COUNT(*) FROM tickets WHERE created_at >= {day} GROUP BY category"))
+    total_new = sum(int(v) for v in cats.values())
+    names = (("complaint", "жалоб"), ("appeal", "обжалований"), ("question", "вопросов"), ("friends", "друзей"))
+    parts = [f"{n} {int(cats[k])}" for k, n in names if cats.get(k)]
+    lines.append(f"🎫 Новых обращений: <b>{total_new}</b>" + (f" ({', '.join(parts)})" if parts else ""))
+
+    done = dict(await many(f"SELECT status, COUNT(*) FROM tickets WHERE status IN ('closed', 'rejected') AND updated_at >= {day} GROUP BY status"))
+    lines.append(f"✅ Закрыто: <b>{int(done.get('closed', 0))}</b> · ❌ отклонено: <b>{int(done.get('rejected', 0))}</b>")
+
+    wait = await one("SELECT COUNT(*), COALESCE(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - MIN(created_at))) / 3600, 0) FROM tickets WHERE status = 'pending'")
+    act = await one("SELECT COUNT(*) FROM tickets WHERE status = 'active'")
+    if wait is not None:
+        oldest = f", самое старое ждёт {int(float(wait[1]))} ч." if int(wait[0]) else ""
+        lines.append(f"⏳ Ждут ответа: <b>{int(wait[0])}</b>{oldest} · в работе: <b>{int(act[0]) if act else 0}</b>")
+
+    rt = await one(f"SELECT AVG(r.score), COUNT(*) FROM ratings r JOIN tickets t ON t.ticket_id = r.ticket_id WHERE t.status = 'closed' AND t.updated_at >= {day}")
+    if rt and rt[1]:
+        lines.append(f"⭐ Средняя оценка: <b>{round(float(rt[0]), 2)}</b> (оценок: {int(rt[1])})")
+
+    best = await one(
+        f"SELECT a.agent_number, COUNT(*) AS c FROM tickets t LEFT JOIN admin_agents a ON a.admin_id = t.admin_id "
+        f"WHERE t.status = 'closed' AND t.admin_id IS NOT NULL AND t.updated_at >= {day} GROUP BY a.agent_number, t.admin_id ORDER BY c DESC LIMIT 1"
+    )
+    if best:
+        who = f"Агент #{best[0]}" if best[0] else "агент без номера"
+        lines.append(f"🏆 Больше всех закрыл: <b>{who}</b> ({int(best[1])})")
+
+    fb_total = await one(f"SELECT COUNT(*) FROM ratings WHERE review IS NOT NULL AND review <> '' AND review_at >= {day}")
+    if fb_total and int(fb_total[0]):
+        lines.append("")
+        lines.append(f"💬 <b>Отзывов за сутки: {int(fb_total[0])}</b> (сначала самые низкие оценки)")
+        for tid, score, review in await many(
+            f"SELECT ticket_id, score, review FROM ratings WHERE review IS NOT NULL AND review <> '' AND review_at >= {day} "
+            f"ORDER BY score ASC, review_at DESC LIMIT 3"
+        ):
+            r = (review or "").replace("\n", " ")
+            lines.append(f"• №{tid} ({score}/5): <i>{html.escape(r[:140])}{'…' if len(r) > 140 else ''}</i>")
+
+    lines.append("")
+    pub = []
+    for label, sql in (
+        ("секреток", f"SELECT COUNT(*) FROM secret_posts WHERE created_at >= {day}"),
+        ("серверов саботёра", f"SELECT COUNT(*) FROM saboteur_servers WHERE created_at >= {day}"),
+        ("фарм-серверов", f"SELECT COUNT(*) FROM farm_servers WHERE created_at >= {day}"),
+        ("бейджей мутатор", f"SELECT COUNT(*) FROM mutator_badges WHERE created_at >= {day}"),
+        ("бейджей исследователь", f"SELECT COUNT(*) FROM researcher_badges WHERE created_at >= {day}"),
+    ):
+        r = await one(sql)
+        if r and int(r[0]):
+            pub.append(f"{label} {int(r[0])}")
+    lines.append("🔮 Опубликовано: " + (", ".join(pub) if pub else "ничего"))
+
+    apps = dict(await many("SELECT kind, COUNT(*) FROM applications_pending GROUP BY kind"))
+    lines.append(f"📝 Заявки ждут решения: хелперы <b>{int(apps.get('helper', 0))}</b>, искатели <b>{int(apps.get('secret', 0))}</b>")
+
+    pay = await one(f"SELECT COUNT(*), COALESCE(SUM(stars), 0) FROM shop_payments WHERE status = 'paid' AND created_at >= {day}")
+    if pay and int(pay[0]):
+        lines.append(f"💎 Оплат за сутки: <b>{int(pay[0])}</b> на <b>{int(pay[1])} ⭐</b>")
+
+    h_on = (await get_setting("helper_recruitment", "true")) == "true"
+    s_on = (await get_setting("secret_recruitment", "true")) == "true"
+    lines.append(f"🚪 Наборы: хелперы {'открыт' if h_on else 'закрыт'}, искатели {'открыт' if s_on else 'закрыт'}")
+    return "\n".join(lines)
+
+async def daily_summary_worker():
+    """Раз в сутки (с 09:00 МСК) шлёт сводку главным админам. Выключается в «Система и доступ»."""
+    logging.info("Воркер ежедневной сводки запущен.")
+    while True:
+        try:
+            now = datetime.now(MSK_TZ)
+            if 9 <= now.hour < 12 and (await get_setting("daily_summary", "true")) == "true":
+                today = now.strftime("%Y-%m-%d")
+                if (await get_setting("daily_summary_last", "")) != today:
+                    await set_setting("daily_summary_last", today)     # сперва отмечаем день, чтобы не продублировать при сбое
+                    text = await build_daily_summary()
+                    for aid in await get_main_admin_ids():
+                        try:
+                            await bot.send_message(aid, text, parse_mode="HTML")
+                        except Exception as e:
+                            logging.warning(f"Не удалось отправить сводку админу {aid}: {e}")
+        except Exception as e:
+            logging.error(f"Ошибка в daily_summary_worker: {e}", exc_info=True)
+        await asyncio.sleep(120)
+
+@router.callback_query(F.data == "toggle_daily_summary")
+async def toggle_daily_summary_cb(call: CallbackQuery):
+    if not await is_main_admin(call.from_user.id):
+        await call.answer("❌ Нет доступа", show_alert=True)
+        return
+    new_val = "false" if (await get_setting("daily_summary", "true")) == "true" else "true"
+    await set_setting("daily_summary", new_val)
+    await call.answer("Ежедневная сводка включена." if new_val == "true" else "Ежедневная сводка выключена.", show_alert=True)
+    try:
+        await call.message.edit_reply_markup(reply_markup=await system_kb())
+    except Exception:
+        pass
+
+@router.callback_query(F.data == "daily_summary_now")
+async def daily_summary_now_cb(call: CallbackQuery):
+    if not await is_main_admin(call.from_user.id):
+        await call.answer("❌ Нет доступа", show_alert=True)
+        return
+    await call.answer("Собираю сводку…")
+    try:
+        await bot.send_message(call.from_user.id, await build_daily_summary(), parse_mode="HTML")
+    except Exception as e:
+        logging.warning(f"Не удалось отправить сводку по запросу: {e}")
+
 async def reminder_worker():
     logging.info("Фоновый воркер напоминаний запущен.")
     while True:
@@ -11546,6 +11976,172 @@ async def handle_api_secrets(request):
 async def handle_api_shop(request):
     return web.json_response(await _site_shop(), headers={"Cache-Control": "no-store"})
 
+# ---------- личный кабинет на сайте ----------
+# Вход без паролей: сайт выдаёт одноразовый код, человек подтверждает его в боте, сайт получает подписанную куку.
+_LOGIN: Dict[str, dict] = {}
+_LOGIN_TTL = 600
+_LOGIN_RATE: Dict[str, list] = {}
+_SESS_COOKIE = "tos_sess"
+_SESS_DAYS = 30
+_SESS_KEY = hashlib.sha256(("site-session:" + (os.getenv("SESSION_SECRET") or BOT_TOKEN or "dev")).encode()).digest()
+_CAB_CACHE: Dict[int, tuple] = {}
+
+def _sess_make(uid: int, name: str) -> str:
+    raw = json.dumps({"u": int(uid), "n": (name or "")[:40], "e": int(time.time()) + _SESS_DAYS * 86400}, separators=(",", ":"), ensure_ascii=False)
+    payload = base64.urlsafe_b64encode(raw.encode()).decode().rstrip("=")
+    sig = hmac.new(_SESS_KEY, payload.encode(), hashlib.sha256).hexdigest()[:32]
+    return payload + "." + sig
+
+def _sess_read(value) -> dict:
+    try:
+        payload, sig = str(value).rsplit(".", 1)
+        good = hmac.new(_SESS_KEY, payload.encode(), hashlib.sha256).hexdigest()[:32]
+        if not hmac.compare_digest(sig, good):
+            return None
+        d = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        if int(d.get("e", 0)) < time.time():
+            return None
+        return {"uid": int(d["u"]), "name": str(d.get("n", ""))}
+    except Exception:
+        return None
+
+def _sess_from_request(request):
+    v = request.cookies.get(_SESS_COOKIE)
+    return _sess_read(v) if v else None
+
+def _client_ip(request) -> str:
+    return (request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or request.remote or "?")[:64]
+
+def _login_rate_ok(ip: str) -> bool:
+    now = time.time()
+    lst = [t for t in _LOGIN_RATE.get(ip, []) if now - t < 600]
+    if len(lst) >= 10:
+        _LOGIN_RATE[ip] = lst
+        return False
+    lst.append(now)
+    _LOGIN_RATE[ip] = lst
+    if len(_LOGIN_RATE) > 5000:
+        for k in [k for k, v in _LOGIN_RATE.items() if not v or now - v[-1] > 600]:
+            _LOGIN_RATE.pop(k, None)
+    return True
+
+_NOSTORE = {"Cache-Control": "no-store"}
+
+async def handle_login_start(request):
+    if not _login_rate_ok(_client_ip(request)):
+        return web.json_response({"error": "rate"}, status=429, headers=_NOSTORE)
+    now = time.time()
+    for k in [k for k, v in _LOGIN.items() if now - v["t"] > _LOGIN_TTL]:
+        _LOGIN.pop(k, None)
+    uname = await _bot_username()
+    if not uname or len(_LOGIN) > 3000:
+        return web.json_response({"error": "unavailable"}, status=503, headers=_NOSTORE)
+    code = secrets.token_urlsafe(9)
+    sec = secrets.token_urlsafe(18)
+    _LOGIN[code] = {"secret": sec, "t": now, "uid": None, "name": ""}
+    return web.json_response(
+        {"code": code, "secret": sec, "link": f"https://t.me/{uname}?start=login_{code}", "ttl": _LOGIN_TTL},
+        headers=_NOSTORE
+    )
+
+async def handle_login_check(request):
+    try:
+        body = await request.json()
+        code = str(body.get("code", ""))[:40]
+        sec = str(body.get("secret", ""))[:80]
+    except Exception:
+        return web.json_response({"status": "unknown"}, status=400, headers=_NOSTORE)
+    ent = _LOGIN.get(code)
+    if not ent or not hmac.compare_digest(ent["secret"], sec):
+        return web.json_response({"status": "unknown"}, headers=_NOSTORE)
+    if time.time() - ent["t"] > _LOGIN_TTL:
+        _LOGIN.pop(code, None)
+        return web.json_response({"status": "expired"}, headers=_NOSTORE)
+    if ent["uid"] is None:
+        return web.json_response({"status": "wait"}, headers=_NOSTORE)
+    _LOGIN.pop(code, None)
+    resp = web.json_response({"status": "ok"}, headers=_NOSTORE)
+    secure = request.headers.get("X-Forwarded-Proto", "").lower() == "https" or request.secure
+    resp.set_cookie(_SESS_COOKIE, _sess_make(ent["uid"], ent["name"]), max_age=_SESS_DAYS * 86400,
+                    httponly=True, samesite="Lax", secure=secure, path="/")
+    return resp
+
+async def handle_logout(request):
+    resp = web.json_response({"ok": True}, headers=_NOSTORE)
+    resp.del_cookie(_SESS_COOKIE, path="/")
+    return resp
+
+async def _cabinet_data(uid: int) -> dict:
+    """Только данные самого человека: статусы обращений без текста, заявки, подписка, рефералы, Предссылки, оплаты."""
+    now = time.time()
+    c = _CAB_CACHE.get(uid)
+    if c and now - c[0] < 10:
+        return c[1]
+    data = {}
+    try:
+        rows = await _db_all(
+            "SELECT t.ticket_id, t.category, t.status, t.created_at, r.score FROM tickets t "
+            "LEFT JOIN ratings r ON r.ticket_id = t.ticket_id WHERE t.user_id = %s ORDER BY t.ticket_id DESC LIMIT 15", (uid,)
+        )
+        data["tickets"] = [{"id": r[0], "category": r[1], "status": r[2], "created": int(r[3].timestamp()) if r[3] else 0, "rating": r[4]} for r in rows]
+    except Exception as e:
+        logging.warning(f"/api/me: обращения: {e}")
+        data["tickets"] = []
+    try:
+        data["apps"] = [r[0] for r in await _db_all("SELECT kind FROM applications_pending WHERE user_id = %s", (uid,))]
+    except Exception:
+        data["apps"] = []
+    try:
+        sub = await check_subscription(uid)
+        data["subscribed"] = sub if sub in (True, False) else None
+    except Exception:
+        data["subscribed"] = None
+    try:
+        ban = await is_banned(uid)
+        data["banned"] = bool(ban)
+        data["ban_reason"] = str(ban[0])[:200] if ban else ""
+    except Exception:
+        data["banned"] = False
+        data["ban_reason"] = ""
+    try:
+        if _REF_CFG.get("ref"):
+            cnt = await _ref_counts(uid)
+            uname = await _bot_username()
+            data["ref"] = {
+                "link": f"https://t.me/{uname}?start=ref_{uid}" if uname else "",
+                "confirmed": cnt.get("confirmed", 0), "waiting": cnt.get("waiting", 0),
+                "pending": cnt.get("pending", 0), "rewards": cnt.get("rewards", 0),
+            }
+        else:
+            data["ref"] = None
+    except Exception as e:
+        logging.warning(f"/api/me: рефералка: {e}")
+        data["ref"] = None
+    try:
+        pl = await _db_one("SELECT expires_at FROM prelink_users WHERE user_id = %s AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)", (uid,))
+        data["prelinks"] = {"active": True, "until": fmt_prelink_until(pl[0])} if pl else {"active": False, "until": ""}
+    except Exception:
+        data["prelinks"] = {"active": False, "until": ""}
+    try:
+        pay = await _db_all(
+            "SELECT service_title, tariff_label, stars, created_at FROM shop_payments WHERE user_id = %s AND status = 'paid' ORDER BY id DESC LIMIT 5", (uid,)
+        )
+        data["payments"] = [{"title": str(p[0] or "")[:80], "label": str(p[1] or "")[:60], "stars": int(p[2] or 0), "created": int(p[3].timestamp()) if p[3] else 0} for p in pay]
+    except Exception:
+        data["payments"] = []
+    if len(_CAB_CACHE) > 2000:
+        _CAB_CACHE.clear()
+    _CAB_CACHE[uid] = (now, data)
+    return data
+
+async def handle_api_me(request):
+    sess = _sess_from_request(request)
+    if not sess:
+        return web.json_response({"error": "auth"}, status=401, headers=_NOSTORE)
+    data = dict(await _cabinet_data(sess["uid"]))
+    data["user"] = {"id": sess["uid"], "name": sess["name"]}
+    return web.json_response(data, headers=_NOSTORE)
+
 async def handle_api_status(request):
     """Публичный статус для сайта. Только безопасные данные, без личной информации."""
     payload = {
@@ -11570,6 +12166,10 @@ async def web_server():
     app.router.add_get("/api/status", handle_api_status)
     app.router.add_get("/api/secrets", handle_api_secrets)
     app.router.add_get("/api/shop", handle_api_shop)
+    app.router.add_get("/api/me", handle_api_me)
+    app.router.add_post("/api/login/start", handle_login_start)
+    app.router.add_post("/api/login/check", handle_login_check)
+    app.router.add_post("/api/logout", handle_logout)
     app.router.add_get("/{name}", handle_page)   # ставим последним: /health и /api/status имеют приоритет
     runner = web.AppRunner(app)
     await runner.setup()
@@ -11607,6 +12207,7 @@ async def main():
             logging.error(f"Не удалось запустить юзербота: {e}")
             
     spawn(reminder_worker())
+    spawn(daily_summary_worker())
     spawn(secret_timer_worker())
     spawn(mutator_timer_worker())
     spawn(prelink_expiry_worker())
