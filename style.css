@@ -200,3 +200,10 @@ ol.rlist{margin-inline:auto}
 .tariffs li{display:flex;justify-content:space-between;gap:12px;border-top:1px solid var(--line);padding-top:8px;color:var(--muted)}
 .tariffs b{color:var(--amber);white-space:nowrap}
 .shop-grid .btn{margin-top:auto}
+
+/* типы секреток на странице правил */
+.tabs a{min-height:44px;display:inline-flex;align-items:center}
+.tabs.sub{margin:0 auto 8px;max-width:760px}
+.tabs.sub a{padding:8px 14px;font-size:14px}
+.rtype{max-width:760px;margin:36px auto 14px;font-size:21px;display:flex;align-items:center;gap:10px;text-align:left}
+.rnote{max-width:760px;margin:-6px auto 14px;color:var(--muted)}
