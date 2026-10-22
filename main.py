@@ -2803,14 +2803,18 @@ def complaint_servers_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [IB(text="🌐 Сервер с секреткой", callback_data="cmp_srv_secret")],
         [IB(text="🕵 Поиск саботера", callback_data="cmp_srv_saboteur")],
-        [IB(text="🌾 Фарм сервер", callback_data="cmp_srv_farm")]
+        [IB(text="🌾 Фарм сервер", callback_data="cmp_srv_farm")],
+        [IB(text="🔎 Бейдж исследователь", callback_data="cmp_srv_researcher")],
+        [IB(text="🧬 Бейдж мутатор", callback_data="cmp_srv_mutator")]
     ])
 
 def appeal_servers_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [IB(text="🌐 Сервер с секреткой", callback_data="app_srv_secret")],
         [IB(text="🕵️ Поиск саботера", callback_data="app_srv_saboteur")],
-        [IB(text="🌾 Фарм сервер", callback_data="app_srv_farm")]
+        [IB(text="🌾 Фарм сервер", callback_data="app_srv_farm")],
+        [IB(text="🔎 Бейдж исследователь", callback_data="app_srv_researcher")],
+        [IB(text="🧬 Бейдж мутатор", callback_data="app_srv_mutator")]
     ])
 
 # ----------------------------------------------------------------------
@@ -9307,7 +9311,9 @@ async def process_c_server_choice(call: CallbackQuery, state: FSMContext):
     srv_types = {
         "cmp_srv_secret": "Сервер с секреткой",
         "cmp_srv_saboteur": "Поиск саботера",
-        "cmp_srv_farm": "Фарм сервер"
+        "cmp_srv_farm": "Фарм сервер",
+        "cmp_srv_researcher": "Бейдж исследователь",
+        "cmp_srv_mutator": "Бейдж мутатор"
     }
     chosen_server = srv_types.get(call.data, "Не указан")
     await state.update_data(c_place=chosen_server)
@@ -9473,7 +9479,9 @@ async def process_a_server_choice(call: CallbackQuery, state: FSMContext):
     srv_types = {
         "app_srv_secret": "Сервер с секреткой",
         "app_srv_saboteur": "Поиск саботера",
-        "app_srv_farm": "Фарм сервер"
+        "app_srv_farm": "Фарм сервер",
+        "app_srv_researcher": "Бейдж исследователь",
+        "app_srv_mutator": "Бейдж мутатор"
     }
     chosen_server = srv_types.get(call.data, "Не указан")
     await state.update_data(a_place=chosen_server)
