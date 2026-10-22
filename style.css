@@ -266,3 +266,32 @@ button.btn{border:0;cursor:pointer;font:inherit;font-weight:700}
 button.btn.alt{border:1px solid var(--line2)}
 button.btn:disabled{opacity:.6;cursor:default}
 .cab-grid{margin-bottom:16px}
+
+/* вход: число для сверки */
+.loginnum{font-family:var(--serif);font-size:56px;font-weight:900;line-height:1;letter-spacing:.04em;margin:4px 0 16px;color:var(--accent);text-shadow:0 0 24px rgba(194,17,31,.55)}
+/* блоки для команды */
+.cab-sect{margin:28px 0 12px}
+.cab-sect h2{font-size:21px;text-align:left;margin:0}
+.cab-sect .cab-note{margin:4px 0 0}
+.cab-card.wide{grid-column:1/-1}
+.cab-card.staff{border-color:var(--line2)}
+.cab-sub{font-size:15px;color:var(--muted);margin:18px 0 8px;text-align:left;font-weight:700}
+.cab-card .stats{grid-template-columns:repeat(auto-fit,minmax(130px,1fr))}
+.tlist .rv{flex:1 1 100%;color:var(--text);font-size:14.5px;overflow-wrap:anywhere}
+.trank .medal{min-width:28px;font-size:18px}
+.bars{display:grid;gap:6px}
+.brow{display:grid;grid-template-columns:38px 1fr 36px;align-items:center;gap:10px;font-size:14px;color:var(--muted)}
+.bar{height:10px;border-radius:6px;background:var(--bg2);border:1px solid var(--line);overflow:hidden;display:block}
+.bar i{display:block;height:100%;background:linear-gradient(90deg,var(--g2),var(--accent))}
+.bn{text-align:right}
+.chart{display:flex;align-items:flex-end;gap:4px;height:130px;padding:8px 0 0}
+.ccol{flex:1;min-width:0;display:flex;flex-direction:column;align-items:center;gap:4px;height:100%}
+.cpair{flex:1;width:100%;display:flex;align-items:flex-end;justify-content:center;gap:2px}
+.cpair i{display:block;width:40%;min-height:2px;border-radius:3px 3px 0 0}
+.cnew{background:var(--amber)}
+.cdone{background:var(--ok)}
+.cd{font-size:10px;color:var(--muted)}
+.lg{display:inline-block;padding-left:14px;position:relative;margin-right:8px}
+.lg::before{content:"";position:absolute;left:0;top:.4em;width:9px;height:9px;border-radius:2px}
+.lg-new::before{background:var(--amber)}
+.lg-done::before{background:var(--ok)}

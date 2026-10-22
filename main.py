@@ -3246,21 +3246,43 @@ async def _web_login_prompt(message: Message, code: str):
     if not ent or time.time() - ent["t"] > _LOGIN_TTL or ent["uid"] is not None:
         await message.answer("⌛ Эта ссылка для входа устарела. Вернитесь на сайт и нажмите «Войти» ещё раз.")
         return
+    # сверка числа: на сайте показано одно число, здесь нужно выбрать именно его. Так чужую ссылку для входа
+    # (например, присланную мошенником) подтвердить не получится: человек не видит число с чужой страницы.
+    right = int(ent.get("num") or 0)
+    opts = {right}
+    while len(opts) < 4:
+        opts.add(10 + secrets.randbelow(90))
+    order = list(opts)
+    secrets.SystemRandom().shuffle(order)
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [IB(text="✅ Да, это я, войти", callback_data=f"weblogin_{code}")],
+        [IB(text=str(n), callback_data=f"weblogin_{code}_{n}") for n in order[:2]],
+        [IB(text=str(n), callback_data=f"weblogin_{code}_{n}") for n in order[2:]],
         [IB(text="❌ Это не я", callback_data="weblogin_no")],
     ])
     await message.answer(
         "🔐 <b>Вход на сайт</b>\n\n"
         f"Запрос входа в личный кабинет на {html.escape(SITE_URL.replace('https://', ''))}.\n"
-        "Подтверждайте, только если вы сами нажали «Войти» на сайте. Если об этом вас попросил кто-то другой, нажмите «Это не я».",
+        "<b>Выберите число, которое сейчас показано на странице сайта.</b>\n\n"
+        "Если вы сами не нажимали «Войти на сайте» или не видите там такого числа, нажмите «Это не я». "
+        "Никому не показывайте эту ссылку и не подтверждайте вход по просьбе других людей.",
         reply_markup=kb, parse_mode="HTML"
     )
+    try:
+        if await _login_is_staff(message.from_user.id):
+            await message.answer(
+                "⚠️ <b>У вас есть роль в команде.</b> После входа на сайте откроется ваша рабочая статистика"
+                " (для главных админов ещё и общая по проекту). Подтверждайте вход только со своего устройства. "
+                f"Сессия команды действует {_SESS_DAYS_STAFF} дня.",
+                parse_mode="HTML"
+            )
+    except Exception as e:
+        logging.warning(f"Вход на сайт: не удалось проверить роль {message.from_user.id}: {e}")
 
 @router.callback_query(F.data.startswith("weblogin_"))
 async def web_login_confirm(call: CallbackQuery):
-    code = call.data[len("weblogin_"):]
-    if code == "no":
+    payload = call.data[len("weblogin_"):]
+    code, _, picked = payload.rpartition("_")
+    if payload == "no":
         try:
             await call.message.edit_text("Вход отменён. Если это были не вы, ничего делать не нужно.")
         except Exception:
@@ -3270,6 +3292,15 @@ async def web_login_confirm(call: CallbackQuery):
     ent = _LOGIN.get(code)
     if not ent or time.time() - ent["t"] > _LOGIN_TTL or ent["uid"] is not None:
         await call.answer("Ссылка устарела. Нажмите «Войти» на сайте ещё раз.", show_alert=True)
+        return
+    if picked != str(ent.get("num")):
+        _LOGIN.pop(code, None)      # одна попытка: после ошибки запрос входа аннулируется
+        try:
+            await call.message.edit_text("⛔ Число не совпало, вход отменён. Если это были не вы, ничего делать не нужно. "
+                                         "Чтобы войти, нажмите «Войти» на сайте ещё раз.")
+        except Exception:
+            pass
+        await call.answer()
         return
     ent["uid"] = call.from_user.id
     ent["name"] = (call.from_user.full_name or "")[:40]
@@ -11987,8 +12018,16 @@ _SESS_DAYS = 30
 _SESS_KEY = hashlib.sha256(("site-session:" + (os.getenv("SESSION_SECRET") or BOT_TOKEN or "dev")).encode()).digest()
 _CAB_CACHE: Dict[int, tuple] = {}
 
-def _sess_make(uid: int, name: str) -> str:
-    raw = json.dumps({"u": int(uid), "n": (name or "")[:40], "e": int(time.time()) + _SESS_DAYS * 86400}, separators=(",", ":"), ensure_ascii=False)
+_SESS_DAYS_STAFF = 3     # у команды сессия короче: на сайте открыта статистика и данные других людей
+
+async def _login_is_staff(uid: int) -> bool:
+    try:
+        return bool(await is_main_admin(uid) or await _is_staff_cached(uid) or await is_secret_publisher(uid))
+    except Exception:
+        return True      # при сомнении считаем стаффом: сессия короче, это безопаснее
+
+def _sess_make(uid: int, name: str, days: int = None) -> str:
+    raw = json.dumps({"u": int(uid), "n": (name or "")[:40], "e": int(time.time()) + (days or _SESS_DAYS) * 86400}, separators=(",", ":"), ensure_ascii=False)
     payload = base64.urlsafe_b64encode(raw.encode()).decode().rstrip("=")
     sig = hmac.new(_SESS_KEY, payload.encode(), hashlib.sha256).hexdigest()[:32]
     return payload + "." + sig
@@ -12011,7 +12050,8 @@ def _sess_from_request(request):
     return _sess_read(v) if v else None
 
 def _client_ip(request) -> str:
-    return (request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or request.remote or "?")[:64]
+    # последний адрес в цепочке добавляет наш прокси, первый мог подставить сам клиент
+    return (request.headers.get("X-Forwarded-For", "").split(",")[-1].strip() or request.remote or "?")[:64]
 
 def _login_rate_ok(ip: str) -> bool:
     now = time.time()
@@ -12039,9 +12079,10 @@ async def handle_login_start(request):
         return web.json_response({"error": "unavailable"}, status=503, headers=_NOSTORE)
     code = secrets.token_urlsafe(9)
     sec = secrets.token_urlsafe(18)
-    _LOGIN[code] = {"secret": sec, "t": now, "uid": None, "name": ""}
+    num = 10 + secrets.randbelow(90)      # число для сверки: сайт его показывает, в боте его нужно выбрать среди вариантов
+    _LOGIN[code] = {"secret": sec, "t": now, "uid": None, "name": "", "num": num}
     return web.json_response(
-        {"code": code, "secret": sec, "link": f"https://t.me/{uname}?start=login_{code}", "ttl": _LOGIN_TTL},
+        {"code": code, "secret": sec, "num": num, "link": f"https://t.me/{uname}?start=login_{code}", "ttl": _LOGIN_TTL},
         headers=_NOSTORE
     )
 
@@ -12063,7 +12104,8 @@ async def handle_login_check(request):
     _LOGIN.pop(code, None)
     resp = web.json_response({"status": "ok"}, headers=_NOSTORE)
     secure = request.headers.get("X-Forwarded-Proto", "").lower() == "https" or request.secure
-    resp.set_cookie(_SESS_COOKIE, _sess_make(ent["uid"], ent["name"]), max_age=_SESS_DAYS * 86400,
+    days = _SESS_DAYS_STAFF if await _login_is_staff(ent["uid"]) else _SESS_DAYS
+    resp.set_cookie(_SESS_COOKIE, _sess_make(ent["uid"], ent["name"], days), max_age=days * 86400,
                     httponly=True, samesite="Lax", secure=secure, path="/")
     return resp
 
@@ -12135,12 +12177,227 @@ async def _cabinet_data(uid: int) -> dict:
     _CAB_CACHE[uid] = (now, data)
     return data
 
+# ---------- статистика команды для личного кабинета ----------
+# Роли определяются на сервере по тем же правилам, что и в боте (/mystats, /secstats, /supptop):
+#   хелпер (участник админ-чата) видит свою статистику; публикатор секреток или главный админ видит статистику публикаций;
+#   главный админ видит ещё полную статистику проекта и общий рейтинг команды.
+_NAME_CACHE: Dict[int, tuple] = {}
+_RANK_CACHE = {"t": 0.0, "data": []}
+_ADMIN_STATS_CACHE = {"t": 0.0, "data": None}
+_STAFF_SITE_CACHE: Dict[int, tuple] = {}
+
+def _rater_filter() -> str:
+    """Оценки считаются только от обычных игроков: свои оценки стафф не накручивает (как и в боте)."""
+    owner = int(OWNER_ID or 0)
+    return (f"r.user_id != {owner} AND r.user_id NOT IN (SELECT admin_id FROM main_admins) "
+            "AND r.user_id NOT IN (SELECT admin_id FROM admin_agents)")
+
+async def _plain_name(uid: int) -> str:
+    c = _NAME_CACHE.get(uid)
+    if c and time.time() - c[1] < 3600:
+        return c[0]
+    name = f"ID {uid}"
+    try:
+        ci = await bot.get_chat(uid)
+        if ci.username:
+            name = "@" + ci.username
+        elif ci.full_name:
+            name = ci.full_name
+    except Exception:
+        pass
+    name = name[:40]
+    if len(_NAME_CACHE) > 2000:
+        _NAME_CACHE.clear()
+    _NAME_CACHE[uid] = (name, time.time())
+    return name
+
+async def _support_ranking() -> list:
+    """[(admin_id, закрыто, средняя оценка, номер агента, оценок)] от лучшего к худшему, только те, кто ещё в админ-чате. Кэш 60 с."""
+    now = time.time()
+    if _RANK_CACHE["data"] and now - _RANK_CACHE["t"] < 60:
+        return _RANK_CACHE["data"]
+    ok = _rater_filter()
+    rows = await _db_all(
+        "SELECT t.admin_id, COUNT(t.ticket_id), COALESCE(AVG(CASE WHEN " + ok + " THEN r.score END), 0), a.agent_number, "
+        "COUNT(CASE WHEN " + ok + " THEN r.score END) "
+        "FROM tickets t LEFT JOIN ratings r ON r.ticket_id = t.ticket_id LEFT JOIN admin_agents a ON a.admin_id = t.admin_id "
+        "WHERE t.admin_id IS NOT NULL AND t.status = 'closed' GROUP BY t.admin_id, a.agent_number "
+        "ORDER BY 3 DESC, 2 DESC, t.admin_id"
+    )
+    rows = await filter_in_admin_chat(rows)
+    data = [(int(r[0]), int(r[1]), round(float(r[2]), 2), (int(r[3]) if r[3] else None), int(r[4])) for r in rows]
+    _RANK_CACHE.update(t=now, data=data)
+    return data
+
+async def _site_helper_stats(uid: int) -> dict:
+    ok = _rater_filter()
+    cl = await _db_one(
+        "SELECT COUNT(*), COUNT(*) FILTER (WHERE updated_at >= CURRENT_TIMESTAMP - INTERVAL '7 days'), "
+        "COUNT(*) FILTER (WHERE updated_at >= CURRENT_TIMESTAMP - INTERVAL '30 days') "
+        "FROM tickets WHERE admin_id = %s AND status = 'closed'", (uid,))
+    act = await _db_one("SELECT COUNT(*) FROM tickets WHERE admin_id = %s AND status = 'active'", (uid,))
+    rt = await _db_one("SELECT COALESCE(AVG(r.score), 0), COUNT(*) FROM ratings r WHERE r.admin_id = %s AND " + ok, (uid,))
+    dist = dict(await _db_all("SELECT r.score, COUNT(*) FROM ratings r WHERE r.admin_id = %s AND " + ok + " GROUP BY r.score", (uid,)))
+    revs = await _db_all(
+        "SELECT r.ticket_id, r.score, r.review, COALESCE(EXTRACT(EPOCH FROM r.review_at), 0) FROM ratings r "
+        "WHERE r.admin_id = %s AND r.review IS NOT NULL AND r.review <> '' AND " + ok + " ORDER BY r.review_at DESC NULLS LAST LIMIT 5", (uid,))
+    ag = await _db_one("SELECT agent_number FROM admin_agents WHERE admin_id = %s", (uid,))
+    agent = 1 if (OWNER_ID and uid == OWNER_ID) else (int(ag[0]) if ag and ag[0] else None)
+    ranking = await _support_ranking()
+    rank, of = None, len(ranking)
+    for i, r in enumerate(ranking, 1):
+        if r[0] == uid:
+            rank = i
+            break
+    return {
+        "agent": agent,
+        "closed": int(cl[0]), "closed7": int(cl[1]), "closed30": int(cl[2]),
+        "active": int(act[0]) if act else 0,
+        "avg": round(float(rt[0]), 2), "rated": int(rt[1]),
+        "dist": {str(k): int(dist.get(k, 0)) for k in (5, 4, 3, 2, 1)},
+        "rank": rank, "of": of,
+        "reviews": [{"ticket": int(x[0]), "score": int(x[1]), "text": str(x[2])[:300], "at": int(x[3])} for x in revs],
+    }
+
+_BADGE_TABLES = (("saboteur", "saboteur_servers"), ("farm", "farm_servers"), ("mutator", "mutator_badges"), ("researcher", "researcher_badges"))
+
+async def _site_publisher_stats(uid: int) -> dict:
+    tot = await _db_one(
+        "SELECT COUNT(*), COUNT(*) FILTER (WHERE created_at >= CURRENT_TIMESTAMP - INTERVAL '24 hours') FROM secret_posts WHERE user_id = %s", (uid,))
+    types = await _db_all("SELECT secret_type, COUNT(*) FROM secret_posts WHERE user_id = %s GROUP BY secret_type ORDER BY 2 DESC, 1 LIMIT 5", (uid,))
+    ranks = await _db_all("SELECT user_id, COUNT(*) FROM secret_posts GROUP BY user_id ORDER BY 2 DESC, 1")
+    rank = next((i for i, r in enumerate(ranks, 1) if r[0] == uid), None)
+    other = {}
+    for key, table in _BADGE_TABLES:
+        try:
+            r = await _db_one(
+                f"SELECT COUNT(*), COUNT(*) FILTER (WHERE created_at >= CURRENT_TIMESTAMP - INTERVAL '24 hours') FROM {table} WHERE user_id = %s", (uid,))
+            other[key] = {"total": int(r[0]), "day": int(r[1])}
+        except Exception as e:
+            logging.warning(f"Кабинет: статистика {table}: {e}")
+            other[key] = {"total": 0, "day": 0}
+    recent = await _db_all(
+        "SELECT secret_type, EXTRACT(EPOCH FROM created_at), is_expired FROM secret_posts WHERE user_id = %s AND message_id > 0 "
+        "ORDER BY created_at DESC LIMIT 8", (uid,))
+    return {
+        "total": int(tot[0]), "day": int(tot[1]), "rank": rank, "of": len(ranks),
+        "types": [{"type": str(t[0] or "Секретка")[:40], "count": int(t[1])} for t in types],
+        "other": other,
+        "recent": [{"type": str(x[0] or "Секретка")[:40], "at": int(x[1]), "expired": bool(x[2])} for x in recent],
+    }
+
+async def _site_admin_stats() -> dict:
+    """Полная статистика проекта для главных админов. Кэш 60 с (общий для всех админов)."""
+    now = time.time()
+    if _ADMIN_STATS_CACHE["data"] is not None and now - _ADMIN_STATS_CACHE["t"] < 60:
+        return _ADMIN_STATS_CACHE["data"]
+    ok = _rater_filter()
+    out = {}
+    total, closed, rejected, avg = await get_tickets_stats()
+    out["tickets"] = {"total": int(total), "closed": int(closed), "rejected": int(rejected), "avg": float(avg)}
+    out["users"] = int(await get_all_users_count())
+    st = dict(await _db_all("SELECT status, COUNT(*) FROM tickets GROUP BY status"))
+    out["tickets"]["pending"] = int(st.get("pending", 0))
+    out["tickets"]["active"] = int(st.get("active", 0))
+    old = await _db_one("SELECT COALESCE(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - MIN(created_at))) / 3600, 0) FROM tickets WHERE status = 'pending'")
+    out["tickets"]["oldest_wait_h"] = int(float(old[0])) if old else 0
+    out["categories"] = {str(k): int(v) for k, v in await _db_all("SELECT category, COUNT(*) FROM tickets GROUP BY category")}
+    new_by = dict(await _db_all(
+        "SELECT TO_CHAR((created_at AT TIME ZONE 'Europe/Moscow')::date, 'YYYY-MM-DD'), COUNT(*) FROM tickets "
+        "WHERE created_at >= CURRENT_TIMESTAMP - INTERVAL '16 days' GROUP BY 1"))
+    done_by = dict(await _db_all(
+        "SELECT TO_CHAR((updated_at AT TIME ZONE 'Europe/Moscow')::date, 'YYYY-MM-DD'), COUNT(*) FROM tickets "
+        "WHERE status = 'closed' AND updated_at >= CURRENT_TIMESTAMP - INTERVAL '16 days' GROUP BY 1"))
+    days = []
+    for i in range(13, -1, -1):
+        d = (datetime.now(MSK_TZ) - timedelta(days=i)).strftime("%Y-%m-%d")
+        days.append({"d": d, "new": int(new_by.get(d, 0)), "closed": int(done_by.get(d, 0))})
+    out["days"] = days
+    dist = dict(await _db_all("SELECT r.score, COUNT(*) FROM ratings r WHERE " + ok + " GROUP BY r.score"))
+    out["dist"] = {str(k): int(dist.get(k, 0)) for k in (5, 4, 3, 2, 1)}
+    team = []
+    for aid, cnt, avg_sc, agent, rated in await _support_ranking():
+        team.append({"id": aid, "name": await _plain_name(aid), "agent": agent, "closed": cnt, "avg": avg_sc, "rated": rated})
+    out["team"] = team
+    pubs = []
+    for uid_, cnt, d24 in await _db_all(
+            "SELECT user_id, COUNT(*), COUNT(*) FILTER (WHERE created_at >= CURRENT_TIMESTAMP - INTERVAL '24 hours') "
+            "FROM secret_posts GROUP BY user_id ORDER BY 2 DESC, 1 LIMIT 10"):
+        pubs.append({"id": int(uid_), "name": await _plain_name(int(uid_)), "count": int(cnt), "day": int(d24)})
+    out["publishers"] = pubs
+    sp = await _db_one(
+        "SELECT COUNT(*), COUNT(*) FILTER (WHERE created_at >= CURRENT_TIMESTAMP - INTERVAL '24 hours'), "
+        "COUNT(*) FILTER (WHERE created_at >= CURRENT_TIMESTAMP - INTERVAL '7 days') FROM secret_posts")
+    published = {"secrets": {"total": int(sp[0]), "day": int(sp[1]), "week": int(sp[2])}}
+    for key, table in _BADGE_TABLES:
+        try:
+            r = await _db_one(f"SELECT COUNT(*), COUNT(*) FILTER (WHERE created_at >= CURRENT_TIMESTAMP - INTERVAL '24 hours') FROM {table}")
+            published[key] = {"total": int(r[0]), "day": int(r[1])}
+        except Exception as e:
+            logging.warning(f"Кабинет: статистика {table}: {e}")
+    out["published"] = published
+    pay = {}
+    for key, interval in (("week", "7 days"), ("month", "30 days")):
+        try:
+            r = await _db_one("SELECT COUNT(*), COALESCE(SUM(stars), 0) FROM shop_payments WHERE status = 'paid' "
+                              f"AND created_at >= CURRENT_TIMESTAMP - INTERVAL '{interval}'")
+            pay[key] = {"count": int(r[0]), "stars": int(r[1])}
+        except Exception as e:
+            logging.warning(f"Кабинет: оплаты: {e}")
+            pay[key] = {"count": 0, "stars": 0}
+    out["payments"] = pay
+    try:
+        out["apps"] = {str(k): int(v) for k, v in await _db_all("SELECT kind, COUNT(*) FROM applications_pending GROUP BY kind")}
+    except Exception:
+        out["apps"] = {}
+    _ADMIN_STATS_CACHE.update(t=now, data=out)
+    return out
+
+async def _site_staff(uid: int):
+    """Блок «для команды»: None, если человек не стафф. Каждая часть независима: сбой одной не ломает остальные."""
+    c = _STAFF_SITE_CACHE.get(uid)
+    if c and time.time() - c[0] < 30:
+        return c[1]
+    is_main = await is_main_admin(uid)
+    is_helper = is_main or await _is_staff_cached(uid)
+    is_pub = is_main or await is_secret_publisher(uid)
+    res = None
+    if is_helper or is_pub or is_main:
+        res = {"roles": [], "helper": None, "publisher": None, "admin": None}
+        if is_helper:
+            res["roles"].append("helper")
+            try:
+                res["helper"] = await _site_helper_stats(uid)
+            except Exception as e:
+                logging.warning(f"/api/me: статистика хелпера {uid}: {e}")
+        if is_pub:
+            res["roles"].append("publisher")
+            try:
+                res["publisher"] = await _site_publisher_stats(uid)
+            except Exception as e:
+                logging.warning(f"/api/me: статистика публикатора {uid}: {e}")
+        if is_main:
+            res["roles"].append("admin")
+            try:
+                res["admin"] = await _site_admin_stats()
+            except Exception as e:
+                logging.warning(f"/api/me: статистика админа {uid}: {e}")
+    if len(_STAFF_SITE_CACHE) > 500:
+        _STAFF_SITE_CACHE.clear()
+    _STAFF_SITE_CACHE[uid] = (time.time(), res)
+    return res
+
 async def handle_api_me(request):
     sess = _sess_from_request(request)
     if not sess:
         return web.json_response({"error": "auth"}, status=401, headers=_NOSTORE)
     data = dict(await _cabinet_data(sess["uid"]))
     data["user"] = {"id": sess["uid"], "name": sess["name"]}
+    try:
+        data["staff"] = await _site_staff(sess["uid"])
+    except Exception as e:
+        logging.warning(f"/api/me: блок для команды: {e}")
+        data["staff"] = None
     return web.json_response(data, headers=_NOSTORE)
 
 async def handle_api_status(request):

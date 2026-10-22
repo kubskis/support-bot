@@ -38,7 +38,7 @@
     api('/api/login/start',{method:'POST'}).then(function(r){
       if(r.status===429) throw 'rate'; if(!r.ok) throw 'fail'; return r.json();
     }).then(function(d){
-      var info={code:d.code,secret:d.secret,link:d.link,t:Date.now(),ttl:(d.ttl||600)*1000};
+      var info={code:d.code,secret:d.secret,num:d.num,link:d.link,t:Date.now(),ttl:(d.ttl||600)*1000};
       store(info); viewWait(info);
     }).catch(function(e){
       viewLogin(e==='rate'?'Слишком много попыток. Подождите несколько минут.':'Не удалось начать вход. Попробуйте ещё раз чуть позже.');
@@ -47,9 +47,13 @@
   function viewWait(info){
     clear();
     var c=card('Подтвердите вход в Telegram');
+    if(info.num){
+      c.appendChild(note('Ваше число для сверки (никому его не сообщайте):','cab-note small'));
+      var big=el('div','loginnum',String(info.num)); big.setAttribute('aria-label','Число для сверки '+info.num); c.appendChild(big);
+    }
     var ol=el('ol','cab-steps');
     ol.appendChild(el('li',null,'Нажмите «Открыть Telegram».'));
-    ol.appendChild(el('li',null,'В чате с ботом нажмите «Да, это я, войти».'));
+    ol.appendChild(el('li',null,info.num?'В чате с ботом нажмите кнопку с числом '+info.num+'.':'В чате с ботом подтвердите вход.'));
     ol.appendChild(el('li',null,'Вернитесь на эту страницу: вход выполнится сам.'));
     c.appendChild(ol);
     var row=el('div','btns');
@@ -80,6 +84,123 @@
   var APP={helper:'Заявка в хелперы',secret:'Заявка в искатели секреток'};
 
   function stat(n,label){var s=el('div','stat'); s.appendChild(el('b',null,String(n))); s.appendChild(el('span',null,label)); return s}
+
+
+  // ---------- блоки для команды (приходят только если сервер подтвердил роль) ----------
+  function bars(dist,total,labelFn){
+    var wrap=el('div','bars');
+    ['5','4','3','2','1'].forEach(function(k){
+      var n=dist[k]||0, row=el('div','brow');
+      row.appendChild(el('span','bl',labelFn?labelFn(k):k+' ★'));
+      var b=el('span','bar'); var f=el('i'); f.style.width=(total?Math.round(n*100/total):0)+'%'; b.appendChild(f); row.appendChild(b);
+      row.appendChild(el('span','bn',String(n))); wrap.appendChild(row);
+    });
+    return wrap;
+  }
+  function tiles(list){var g=el('div','stats'); list.forEach(function(x){g.appendChild(stat(x[0],x[1]))}); return g}
+  function rankText(r,of){return r?('#'+r+' из '+of):'—'}
+  function fmtDT(ts){ if(!ts) return ''; try{return new Date(ts*1000).toLocaleString('ru-RU',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit',timeZone:'Europe/Moscow'})}catch(e){return ''} }
+  var MEDAL=['🥇','🥈','🥉'];
+
+  function helperCard(h){
+    var c=card('Моя статистика хелпера'); c.classList.add('staff');
+    c.appendChild(tiles([[h.agent?('#'+h.agent):'—','номер агента'],[rankText(h.rank,h.of),'место в рейтинге'],[h.closed,'закрыто всего'],[h.closed7,'за 7 дней'],[h.closed30,'за 30 дней'],[h.active,'в работе сейчас'],[h.rated?h.avg+' / 5':'—','средняя оценка ('+h.rated+')']]));
+    if(h.rated){c.appendChild(el('h3','cab-sub','Оценки игроков')); c.appendChild(bars(h.dist,h.rated))}
+    if(h.reviews&&h.reviews.length){
+      c.appendChild(el('h3','cab-sub','Последние отзывы'));
+      var ul=el('ul','tlist');
+      h.reviews.forEach(function(r){var li=el('li'); li.appendChild(el('b',null,'№'+r.ticket)); li.appendChild(el('span','pill2 '+(r.score>=4?'st-done':(r.score>=3?'st-wait':'st-no')),r.score+'/5')); li.appendChild(el('span','tm',fmtDT(r.at))); li.appendChild(el('span','rv',r.text)); ul.appendChild(li)});
+      c.appendChild(ul); c.appendChild(note('Отзывы приходят без имён игроков.','cab-note small'));
+    }
+    return c;
+  }
+  var BADGE={saboteur:'Саботёр (серверы)',farm:'Фарм (серверы)',mutator:'Бейдж «Мутатор»',researcher:'Бейдж «Исследователь»'};
+  function publisherCard(p){
+    var c=card('Статистика публикатора'); c.classList.add('staff');
+    c.appendChild(tiles([[p.total,'секреток всего'],[p.day,'за 24 часа'],[rankText(p.rank,p.of),'место в топе']]));
+    var ul=el('ul','tlist');
+    Object.keys(BADGE).forEach(function(k){var o=(p.other||{})[k]||{total:0,day:0}; var li=el('li'); li.appendChild(el('span','tc',BADGE[k])); li.appendChild(el('b',null,String(o.total))); li.appendChild(el('span','tm','за 24 ч: '+o.day)); ul.appendChild(li)});
+    c.appendChild(el('h3','cab-sub','Другие публикации')); c.appendChild(ul);
+    if(p.types&&p.types.length){
+      c.appendChild(el('h3','cab-sub','Любимые типы секреток'));
+      var u2=el('ul','tlist'); p.types.forEach(function(t){var li=el('li'); li.appendChild(el('span','tc',t.type)); li.appendChild(el('b',null,String(t.count))); u2.appendChild(li)}); c.appendChild(u2);
+    }
+    if(p.recent&&p.recent.length){
+      c.appendChild(el('h3','cab-sub','Последние секретки'));
+      var u3=el('ul','tlist'); p.recent.forEach(function(r){var li=el('li'); li.appendChild(el('span','tc',r.type)); li.appendChild(el('span','pill2 '+(r.expired?'st-no':'st-done'),r.expired?'Закрыта':'Идёт')); li.appendChild(el('span','tm',fmtDT(r.at))); u3.appendChild(li)}); c.appendChild(u3);
+    }
+    return c;
+  }
+  var CATN={complaint:'Жалобы',appeal:'Обжалования',question:'Вопросы',friends:'Друзья'};
+  function chart(days){
+    var max=1; days.forEach(function(d){max=Math.max(max,d.new,d.closed)});
+    var wrap=el('div','chart'); wrap.setAttribute('role','img');
+    var tn=0,tc=0; days.forEach(function(d){tn+=d.new; tc+=d.closed});
+    wrap.setAttribute('aria-label','Обращения за 14 дней: новых '+tn+', закрыто '+tc);
+    days.forEach(function(d){
+      var col=el('div','ccol'); col.title=d.d+': новых '+d.new+', закрыто '+d.closed;
+      var pair=el('div','cpair'); var a=el('i','cnew'); a.style.height=Math.round(d.new*100/max)+'%'; var b=el('i','cdone'); b.style.height=Math.round(d.closed*100/max)+'%'; pair.appendChild(a); pair.appendChild(b);
+      col.appendChild(pair); col.appendChild(el('span','cd',d.d.slice(8))); wrap.appendChild(col);
+    });
+    var box=el('div'); box.appendChild(wrap);
+    var lg=el('p','cab-note small'); lg.appendChild(el('span','lg lg-new','новые')); lg.appendChild(document.createTextNode(' ')); lg.appendChild(el('span','lg lg-done','закрытые')); lg.appendChild(document.createTextNode(' · за 14 дней, по Москве')); box.appendChild(lg);
+    return box;
+  }
+  function adminCards(a){
+    var out=[];
+    var team=card('Общий рейтинг команды'); team.classList.add('staff','wide');
+    if(a.team&&a.team.length){
+      var ul=el('ul','tlist trank');
+      a.team.forEach(function(t,i){
+        var li=el('li'); li.appendChild(el('span','medal',MEDAL[i]||String(i+1)+'.'));
+        li.appendChild(el('span','tc',t.name+(t.agent?' · агент #'+t.agent:'')));
+        li.appendChild(el('b',null,t.rated?t.avg+' / 5':'—')); li.appendChild(el('span','tm','закрыто '+t.closed+', оценок '+t.rated)); ul.appendChild(li);
+      });
+      team.appendChild(ul);
+    } else team.appendChild(note('Пока нет закрытых обращений.'));
+    team.appendChild(note('Рейтинг: сначала средняя оценка, затем число закрытых обращений. Оценки от стаффа не учитываются.','cab-note small'));
+    out.push(team);
+
+    var pr=card('Статистика проекта'); pr.classList.add('staff','wide');
+    var t=a.tickets||{};
+    pr.appendChild(tiles([[a.users,'пользователей в боте'],[t.total,'обращений всего'],[t.closed,'закрыто'],[t.rejected,'отклонено'],[t.pending,'ждут ответа'+(t.pending&&t.oldest_wait_h?' (старое '+t.oldest_wait_h+' ч)':'')],[t.active,'в работе'],[t.avg?t.avg+' / 5':'—','общая оценка']]));
+    pr.appendChild(el('h3','cab-sub','Обращения по дням')); pr.appendChild(chart(a.days||[]));
+    var cats=a.categories||{}; var u1=el('ul','tlist');
+    Object.keys(CATN).forEach(function(k){if(cats[k]!==undefined){var li=el('li'); li.appendChild(el('span','tc',CATN[k])); li.appendChild(el('b',null,String(cats[k]))); u1.appendChild(li)}});
+    if(u1.children.length){pr.appendChild(el('h3','cab-sub','По типам обращений')); pr.appendChild(u1)}
+    var totalR=0; ['1','2','3','4','5'].forEach(function(k){totalR+=(a.dist||{})[k]||0});
+    if(totalR){pr.appendChild(el('h3','cab-sub','Оценки игроков (все агенты)')); pr.appendChild(bars(a.dist,totalR))}
+    out.push(pr);
+
+    var pb=card('Публикации и деньги'); pb.classList.add('staff','wide');
+    var pu=a.published||{}; var u2=el('ul','tlist');
+    [['secrets','Секретки'],['saboteur','Серверы саботёра'],['farm','Фарм-серверы'],['mutator','Бейджи «Мутатор»'],['researcher','Бейджи «Исследователь»']].forEach(function(p){
+      var o=pu[p[0]]; if(!o) return; var li=el('li'); li.appendChild(el('span','tc',p[1])); li.appendChild(el('b',null,String(o.total)));
+      li.appendChild(el('span','tm','за 24 ч: '+o.day+(o.week!==undefined?', за 7 дн.: '+o.week:''))); u2.appendChild(li);
+    });
+    pb.appendChild(u2);
+    if(a.publishers&&a.publishers.length){
+      pb.appendChild(el('h3','cab-sub','Топ публикаторов секреток'));
+      var u3=el('ul','tlist trank'); a.publishers.forEach(function(x,i){var li=el('li'); li.appendChild(el('span','medal',MEDAL[i]||String(i+1)+'.')); li.appendChild(el('span','tc',x.name)); li.appendChild(el('b',null,String(x.count))); li.appendChild(el('span','tm','за 24 ч: '+x.day)); u3.appendChild(li)}); pb.appendChild(u3);
+    }
+    var py=a.payments||{};
+    pb.appendChild(el('h3','cab-sub','Оплаты и заявки'));
+    pb.appendChild(tiles([[(py.week||{}).count||0,'оплат за 7 дней'],[((py.week||{}).stars||0)+' ⭐','сумма за 7 дней'],[(py.month||{}).count||0,'оплат за 30 дней'],[((py.month||{}).stars||0)+' ⭐','сумма за 30 дней'],[(a.apps||{}).helper||0,'заявок хелперов'],[(a.apps||{}).secret||0,'заявок искателей']]));
+    out.push(pb);
+    return out;
+  }
+  function renderStaff(sf){
+    if(!sf||!sf.roles||!sf.roles.length) return;
+    var h=el('div','cab-sect'); h.appendChild(el('h2',null,'Для команды'));
+    var roles={helper:'хелпер',publisher:'публикатор секреток',admin:'главный админ'};
+    h.appendChild(note('Ваши роли: '+sf.roles.map(function(r){return roles[r]||r}).join(', ')+'. Этот раздел видите только вы.','cab-note small'));
+    root.appendChild(h);
+    var grid=el('div','cab-grid');
+    if(sf.helper) grid.appendChild(helperCard(sf.helper));
+    if(sf.publisher) grid.appendChild(publisherCard(sf.publisher));
+    root.appendChild(grid);
+    if(sf.admin) adminCards(sf.admin).forEach(function(c){root.appendChild(c)});
+  }
 
   function viewCabinet(d){
     clear();
@@ -155,6 +276,8 @@
       py.appendChild(ul3); grid.appendChild(py);
     }
     root.appendChild(grid);
+
+    renderStaff(d.staff);
 
     var act=card('Быстрые действия'); var row2=el('div','btns');
     row2.appendChild(link('btn','Подать жалобу',BOT+'?start=go_complaint'));
