@@ -109,6 +109,36 @@ def spawn(coro):
     task.add_done_callback(_done)
     return task
 
+_WORKER_ALERT: Dict[str, float] = {}
+
+async def _supervised(fn):
+    """Фоновый воркер, который сам перезапускается после падения. О падении сообщаем главным админам (раз в час на воркер)."""
+    name = getattr(fn, "__name__", "worker")
+    delay = 5
+    while True:
+        t0 = time.time()
+        try:
+            await fn()
+            logging.warning(f"Воркер {name} завершился сам.")
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logging.error(f"Воркер {name} упал: {e!r}", exc_info=True)
+            now = time.time()
+            if now - _WORKER_ALERT.get(name, 0) > 3600:
+                _WORKER_ALERT[name] = now
+                try:
+                    await _notify_ops(
+                        f"⚠️ <b>Фоновая задача «{html.escape(name)}» упала</b> и перезапускается.\n"
+                        f"<code>{html.escape(repr(e)[:300])}</code>"
+                    )
+                    await alog(None, "incident", "", f"упал воркер {name}")
+                except Exception:
+                    pass
+        delay = 5 if time.time() - t0 > 300 else min(delay * 2, 300)
+        await asyncio.sleep(delay)
+
 creation_lock = asyncio.Lock()
 publish_lock = asyncio.Lock()
 saboteur_lock = asyncio.Lock()
@@ -1192,6 +1222,28 @@ def _init_db_sync():
                     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
                 );
                 CREATE INDEX IF NOT EXISTS complaint_targets_tkey_idx ON complaint_targets (tkey);
+                CREATE TABLE IF NOT EXISTS recruit_subs (
+                    user_id BIGINT NOT NULL,
+                    kind TEXT NOT NULL,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (user_id, kind)
+                );
+                CREATE TABLE IF NOT EXISTS faq_votes (
+                    voter TEXT NOT NULL,
+                    q TEXT NOT NULL,
+                    v SMALLINT NOT NULL,
+                    ts TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (voter, q)
+                );
+                CREATE TABLE IF NOT EXISTS admin_log (
+                    id BIGSERIAL PRIMARY KEY,
+                    ts TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                    actor_id BIGINT,
+                    action TEXT NOT NULL,
+                    target TEXT DEFAULT '',
+                    details TEXT DEFAULT ''
+                );
+                CREATE INDEX IF NOT EXISTS admin_log_ts_idx ON admin_log (ts DESC);
                 CREATE TABLE IF NOT EXISTS main_admins (
                     admin_id BIGINT PRIMARY KEY
                 );
@@ -1703,6 +1755,89 @@ async def set_setting(key: str, value: str):
                     (key, value)
                 )
     await asyncio.to_thread(_query)
+
+# ----------------------------------------------------------------------
+# ЖУРНАЛ ДЕЙСТВИЙ КОМАНДЫ (виден главным админам в личном кабинете на сайте)
+# ----------------------------------------------------------------------
+# действие -> (подпись, группа для фильтра на сайте)
+ALOG_INFO = {
+    "ticket_take": ("Взял обращение в работу", "tickets"),
+    "ticket_close": ("Закрыл обращение", "tickets"),
+    "ticket_reject": ("Отклонил обращение", "tickets"),
+    "ban": ("Заблокировал игрока", "people"),
+    "unban": ("Разблокировал игрока", "people"),
+    "helper_accept": ("Принял заявку в хелперы", "people"),
+    "helper_reject": ("Отклонил заявку в хелперы", "people"),
+    "secret_accept": ("Принял заявку в искатели", "people"),
+    "secret_reject": ("Отклонил заявку в искатели", "people"),
+    "pub_add": ("Выдал доступ публикатора", "people"),
+    "pub_del": ("Забрал доступ публикатора", "people"),
+    "admin_add": ("Назначил главного админа", "people"),
+    "admin_del": ("Снял главного админа", "people"),
+    "recruit_helper": ("Набор в хелперы", "settings"),
+    "recruit_secret": ("Набор в искатели секреток", "settings"),
+    "friend_toggle": ("Добавление в друзья", "settings"),
+    "maintenance": ("Технический перерыв", "settings"),
+    "testmode": ("Тест-режим", "settings"),
+    "incident": ("Сбой бота", "system"),
+    "restart": ("Запуск бота", "system"),
+}
+ALOG_KEEP_DAYS = 180
+
+async def alog(actor_id, action: str, target="", details=""):
+    """Записывает действие в журнал. Никогда не бросает исключений: сбой журнала не должен ломать само действие."""
+    try:
+        await _db_exec(
+            "INSERT INTO admin_log (actor_id, action, target, details) VALUES (%s, %s, %s, %s)",
+            (int(actor_id) if actor_id else None, str(action)[:40], str(target)[:60], str(details)[:300])
+        )
+    except Exception as e:
+        logging.warning(f"Журнал действий: не удалось записать {action}: {e}")
+
+# ----------------------------------------------------------------------
+# УВЕДОМЛЕНИЕ ОБ ОТКРЫТИИ НАБОРА (подписка с сайта или из бота)
+# ----------------------------------------------------------------------
+# вид набора -> (ключ настройки, название, ссылка на анкету)
+RECRUIT_KINDS = {
+    "helper": ("helper_recruitment", "Набор в команду поддержки (хелперы)", "go_helper"),
+    "secret": ("secret_recruitment", "Набор в искатели секреток", "go_seeker"),
+}
+RECRUIT_NOTIFY_KEYS = {"notify_helpers": "helper", "notify_seekers": "secret"}
+
+async def recruit_sub_has(uid: int, kind: str) -> bool:
+    try:
+        return bool(await _db_one("SELECT 1 FROM recruit_subs WHERE user_id = %s AND kind = %s", (uid, kind)))
+    except Exception as e:
+        logging.warning(f"Подписка на набор: не удалось прочитать {uid}: {e}")
+        return False
+
+async def recruit_sub_set(uid: int, kind: str, on: bool):
+    if kind not in RECRUIT_KINDS:
+        return
+    if on:
+        await _db_exec("INSERT INTO recruit_subs (user_id, kind) VALUES (%s, %s) ON CONFLICT (user_id, kind) DO NOTHING", (uid, kind))
+    else:
+        await _db_exec("DELETE FROM recruit_subs WHERE user_id = %s AND kind = %s", (uid, kind))
+
+async def recruit_sub_count(kind: str) -> int:
+    try:
+        r = await _db_one("SELECT COUNT(*) FROM recruit_subs WHERE kind = %s", (kind,))
+        return int(r[0]) if r else 0
+    except Exception:
+        return 0
+
+def _recruit_closed_text(kind: str, subscribed: bool) -> str:
+    base = f"{ICON_WARN} {RECRUIT_KINDS[kind][1]} в данный момент закрыт."
+    if subscribed:
+        base += "\n\n🔔 Я напишу вам, как только набор откроется (один раз)."
+    return base
+
+async def _recruit_closed_kb(uid: int, kind: str):
+    has = await recruit_sub_has(uid, kind)
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        IB(text="🔕 Не уведомлять" if has else "🔔 Сообщить, когда откроется",
+           callback_data=f"rsub_{'off' if has else 'on'}_{kind}")
+    ]])
 
 async def register_user(user_id: int):
     def _query():
@@ -3169,6 +3304,8 @@ _GO_TITLES = {
     "complaint": "Жалоба на игрока",
     "appeal": "Обжалование бана",
     "question": "Вопрос поддержке",
+    "notify_helpers": "Уведомление о наборе в хелперы",
+    "notify_seekers": "Уведомление о наборе в искатели секреток",
 }
 _GO_PENDING: Dict[int, tuple] = {}
 _GO_TTL = 3600
@@ -3219,13 +3356,25 @@ async def _go_run(message: Message, state: FSMContext, key: str):
     try:
         # короткое сообщение заодно ставит главное меню (клавиатуру), чтобы оно не пропало
         await message.answer(
-            f"🌐 Переход с сайта: <b>{_GO_TITLES[key.split('_')[0]]}</b>",
+            f"🌐 Переход с сайта: <b>{_GO_TITLES.get(key) or _GO_TITLES[key.split('_')[0]]}</b>",
             reply_markup=await main_keyboard(uid), parse_mode="HTML"
         )
     except Exception as e:
         logging.warning(f"Переход с сайта: не удалось отправить меню {uid}: {e}")
     if key.startswith("shop"):
         await _go_shop(message, int(key[5:]) if key.startswith("shop_") else 0)
+        return
+    if key in RECRUIT_NOTIFY_KEYS:
+        kind = RECRUIT_NOTIFY_KEYS[key]
+        if await get_setting(RECRUIT_KINDS[kind][0], "true") == "true":
+            # набор уже открыт: подписка не нужна, сразу ведём в анкету
+            await message.answer("🟢 Набор уже открыт, вот анкета.")
+            await (start_helper_apply if kind == "helper" else start_secret_apply)(message, state)
+            return
+        await recruit_sub_set(uid, kind, True)
+        await message.answer(
+            _recruit_closed_text(kind, True), reply_markup=await _recruit_closed_kb(uid, kind), parse_mode="HTML"
+        )
         return
     await starter(message, state)
 
@@ -3427,7 +3576,9 @@ async def back_to_admin_panel(call: CallbackQuery):
 async def adm_recruit_screen(call: CallbackQuery):
     if not await is_main_admin(call.from_user.id): return
     await call.message.edit_text(
-        "📝 <b>Наборы и друзья</b>\n\nВключайте и выключайте приём заявок. 🟢 открыт, 🔴 закрыт.",
+        "📝 <b>Наборы и друзья</b>\n\nВключайте и выключайте приём заявок. 🟢 открыт, 🔴 закрыт.\n"
+        f"🔔 Ждут открытия: хелперы {await recruit_sub_count('helper')}, искатели {await recruit_sub_count('secret')}. "
+        "Когда включите набор, им уйдёт разовое уведомление.",
         reply_markup=await recruit_kb(), parse_mode="HTML"
     )
     await call.answer()
@@ -3489,6 +3640,7 @@ async def process_add_main_admin(message: Message, state: FSMContext):
                 with conn.cursor() as cur:
                     cur.execute("INSERT INTO main_admins (admin_id) VALUES (%s) ON CONFLICT (admin_id) DO NOTHING", (new_id,))
         await asyncio.to_thread(_query)
+        await alog(message.from_user.id, "admin_add", f"ID {new_id}")
         await state.clear()
         kb = await main_keyboard(message.from_user.id)
         await message.answer(f"{ICON_CHECK} Пользователь <code>{new_id}</code> успешно назначен главным администратором!", reply_markup=kb, parse_mode="HTML")
@@ -3518,6 +3670,7 @@ async def process_del_main_admin(message: Message, state: FSMContext):
                 with conn.cursor() as cur:
                     cur.execute("DELETE FROM main_admins WHERE admin_id = %s", (del_id,))
         await asyncio.to_thread(_query)
+        await alog(message.from_user.id, "admin_del", f"ID {del_id}")
         await state.clear()
         kb = await main_keyboard(message.from_user.id)
         await message.answer(f"{ICON_CHECK} Пользователь <code>{del_id}</code> снят с поста главного администратора.", reply_markup=kb, parse_mode="HTML")
@@ -3847,6 +4000,7 @@ async def toggle_testmode_callback(call: CallbackQuery):
         msg = "🟢 Тест режим выключен. Тех. перерыв снят, бот снова работает для всех. Сводка отправлена вам в личные сообщения."
     await set_setting("test_mode", "true" if TEST_MODE_ON else "false")
     await set_setting("maintenance_mode", "true" if MAINTENANCE_ON else "false")
+    await alog(call.from_user.id, "testmode", "", "включён" if TEST_MODE_ON else "выключен")
     logging.warning(f"Тест режим {'ВКЛЮЧЁН' if TEST_MODE_ON else 'выключен'} пользователем {call.from_user.id}")
     await call.answer(msg[:200], show_alert=True)
     try:
@@ -3881,6 +4035,7 @@ async def toggle_maintenance_callback(call: CallbackQuery):
         return
     MAINTENANCE_ON = not MAINTENANCE_ON
     await set_setting("maintenance_mode", "true" if MAINTENANCE_ON else "false")
+    await alog(call.from_user.id, "maintenance", "", "включён" if MAINTENANCE_ON else "выключен")
     logging.warning(f"Технический перерыв {'ВКЛЮЧЁН' if MAINTENANCE_ON else 'выключен'} пользователем {call.from_user.id}")
     await call.answer(
         "🛠 Перерыв ВКЛЮЧЁН: бот закрыт для всех, кроме вас." if MAINTENANCE_ON else "🟢 Перерыв выключен, бот работает для всех.",
@@ -3898,6 +4053,7 @@ async def toggle_friend_callback(call: CallbackQuery):
     current = await get_setting("friend_active", "false")
     new_val = "false" if current == "true" else "true"
     await set_setting("friend_active", new_val)
+    await alog(call.from_user.id, "friend_toggle", "", "включено" if new_val == "true" else "выключено")
     await call.answer("Статус изменен")
     kb = await recruit_kb()
     await call.message.edit_reply_markup(reply_markup=kb)
@@ -3908,6 +4064,9 @@ async def toggle_helper_callback(call: CallbackQuery):
     current = await get_setting("helper_recruitment", "true")
     new_val = "false" if current == "true" else "true"
     await set_setting("helper_recruitment", new_val)
+    await alog(call.from_user.id, "recruit_helper", "", "открыт" if new_val == "true" else "закрыт")
+    if new_val == "true":
+        spawn(notify_recruit_open("helper", call.from_user.id))
     await call.answer("Статус набора хелперов изменен")
     kb = await recruit_kb()
     await call.message.edit_reply_markup(reply_markup=kb)
@@ -3925,6 +4084,8 @@ async def toggle_secret_callback(call: CallbackQuery):
         except ValueError:
             ep = 0
         await set_setting("secret_recruit_epoch", str(ep + 1))
+        spawn(notify_recruit_open("secret", call.from_user.id))
+    await alog(call.from_user.id, "recruit_secret", "", "открыт" if new_val == "true" else "закрыт")
     await call.answer("Статус набора в искатели изменен")
     kb = await recruit_kb()
     await call.message.edit_reply_markup(reply_markup=kb)
@@ -4030,6 +4191,7 @@ async def sec_add_pub_proc(message: Message, state: FSMContext):
                 with conn.cursor() as cur:
                     cur.execute("INSERT INTO secret_publishers (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING", (t_id,))
         await asyncio.to_thread(_q)
+        await alog(message.from_user.id, "pub_add", f"ID {t_id}")
         await state.clear()
         kb = await main_keyboard(message.from_user.id)
         await message.answer(f"{ICON_CHECK} Пользователь <code>{t_id}</code> добавлен в публикаторы! У него появится кнопка '🔮 Секретки'.", reply_markup=kb, parse_mode="HTML")
@@ -4053,6 +4215,7 @@ async def sec_del_pub_proc(message: Message, state: FSMContext):
                 with conn.cursor() as cur:
                     cur.execute("DELETE FROM secret_publishers WHERE user_id = %s", (t_id,))
         await asyncio.to_thread(_q)
+        await alog(message.from_user.id, "pub_del", f"ID {t_id}")
         await state.clear()
         kb = await main_keyboard(message.from_user.id)
         await message.answer(f"{ICON_CHECK} Пользователь <code>{t_id}</code> удален из публикаторов.", reply_markup=kb, parse_mode="HTML")
@@ -9092,13 +9255,85 @@ async def shopa_history(call: CallbackQuery):
 # СИСТЕМА НАБОРА В ХЕЛПЕРЫ И ИСКАТЕЛИ СЕКРЕТОВ
 # ----------------------------------------------------------------------
 
+@router.callback_query(F.data.regexp(r"^rsub_(on|off)_(helper|secret)$"))
+async def recruit_sub_callback(call: CallbackQuery):
+    _, act, kind = call.data.split("_")
+    uid = call.from_user.id
+    if await is_banned(uid):
+        await call.answer("Недоступно.", show_alert=True)
+        return
+    if act == "on":
+        if await get_setting(RECRUIT_KINDS[kind][0], "true") == "true":
+            await call.answer("Набор уже открыт! Нажмите кнопку подачи заявки в меню.", show_alert=True)
+            return
+        await recruit_sub_set(uid, kind, True)
+        await call.answer("Готово, напишу, когда откроется.")
+    else:
+        await recruit_sub_set(uid, kind, False)
+        await call.answer("Уведомление отменено.")
+    try:
+        await call.message.edit_text(
+            _recruit_closed_text(kind, act == "on"), reply_markup=await _recruit_closed_kb(uid, kind), parse_mode="HTML"
+        )
+    except Exception:
+        pass
+
+async def notify_recruit_open(kind: str, admin_id: int = 0):
+    """Набор открыли: один раз пишем подписчикам. Если набор успели снова закрыть, остальные подписки остаются до следующего раза."""
+    if kind not in RECRUIT_KINDS:
+        return
+    setting, title, go = RECRUIT_KINDS[kind]
+    try:
+        rows = await _db_all("SELECT user_id FROM recruit_subs WHERE kind = %s ORDER BY created_at", (kind,))
+    except Exception as e:
+        logging.error(f"Подписки на набор: не удалось прочитать список ({kind}): {e}")
+        return
+    if not rows:
+        return
+    uname = await _bot_username()
+    kb = None
+    if uname:
+        kb = InlineKeyboardMarkup(inline_keyboard=[[IB(text="📝 Подать заявку", url=f"https://t.me/{uname}?start={go}")]])
+    text = (f"🟢 <b>{html.escape(title)} открыт!</b>\n\nМожно подавать заявку, нажмите кнопку ниже.\n"
+            "<i>Это разовое уведомление. Чтобы получить следующее, подпишитесь снова на сайте или в боте.</i>")
+    sent = failed = 0
+    for i, (uid,) in enumerate(rows):
+        if i % 20 == 0 and await get_setting(setting, "true") != "true":
+            break                      # набор закрыли обратно: оставшихся не трогаем
+        try:
+            if await is_banned(uid):
+                pass
+            else:
+                try:
+                    await bot.send_message(uid, text, reply_markup=kb, parse_mode="HTML")
+                except TelegramRetryAfter as e:
+                    await asyncio.sleep(min(int(getattr(e, "retry_after", 3)) + 1, 30))
+                    await bot.send_message(uid, text, reply_markup=kb, parse_mode="HTML")
+                sent += 1
+        except Exception:
+            failed += 1                # заблокировал бота и т. п.
+        try:
+            await recruit_sub_set(uid, kind, False)
+        except Exception:
+            pass
+        await asyncio.sleep(0.06)
+    logging.info(f"Набор открыт ({kind}): уведомлено {sent}, не доставлено {failed}")
+    if admin_id and (sent or failed):
+        try:
+            await bot.send_message(admin_id, f"🔔 Подписчикам набора разослано: {sent}" + (f" (не доставлено: {failed})" if failed else ""))
+        except Exception:
+            pass
+
 # --- НАБОР В ХЕЛПЕРЫ (В ТЕМУ ПОДДЕРЖКИ) ---
 @router.message(F.text.in_(btn_texts(BTN_HELPER_APPLY)), F.chat.type == "private")
 async def start_helper_apply(message: Message, state: FSMContext):
     await register_user(message.from_user.id)
     if await is_banned(message.from_user.id): return
     if await get_setting("helper_recruitment", "true") != "true":
-        await message.answer(f"{ICON_WARN} Набор в команду поддержки в данный момент закрыт.", parse_mode="HTML")
+        has = await recruit_sub_has(message.from_user.id, "helper")
+        await message.answer(
+            _recruit_closed_text("helper", has), reply_markup=await _recruit_closed_kb(message.from_user.id, "helper"), parse_mode="HTML"
+        )
         return
     if await app_pending_exists(message.from_user.id, "helper"):
         await message.answer(_APP_PENDING_TEXT, parse_mode="HTML")
@@ -9239,6 +9474,7 @@ async def helper_accept_callback(call: CallbackQuery):
         return
     user_id = int(call.data.split("_")[2])
     if not await _mark_application_decision(call, True, "helper", user_id): return
+    await alog(call.from_user.id, "helper_accept", f"ID {user_id}")
     try:
         await bot.send_message(user_id, "<tg-emoji emoji-id='5994502837327892086'>🎉</tg-emoji> <b>Поздравляем! Ваша заявка на хелпера принята!</b> Администрация свяжется с вами в ближайшее время.", parse_mode="HTML")
     except Exception:
@@ -9251,6 +9487,7 @@ async def helper_reject_callback(call: CallbackQuery):
         return
     user_id = int(call.data.split("_")[2])
     if not await _mark_application_decision(call, False, "helper", user_id): return
+    await alog(call.from_user.id, "helper_reject", f"ID {user_id}")
     try:
         await bot.send_message(user_id, f"{ICON_CROSS} К сожалению, ваша заявка на хелпера была отклонена.", parse_mode="HTML")
     except Exception:
@@ -9299,7 +9536,10 @@ async def start_secret_apply(message: Message, state: FSMContext):
     await register_user(message.from_user.id)
     if await is_banned(message.from_user.id): return
     if await get_setting("secret_recruitment", "true") != "true":
-        await message.answer(f"{ICON_WARN} Набор в искатели секреток в данный момент закрыт.", parse_mode="HTML")
+        has = await recruit_sub_has(message.from_user.id, "secret")
+        await message.answer(
+            _recruit_closed_text("secret", has), reply_markup=await _recruit_closed_kb(message.from_user.id, "secret"), parse_mode="HTML"
+        )
         return
     if not message.from_user.username:
         await message.answer(
@@ -9444,6 +9684,7 @@ async def secret_accept_callback(call: CallbackQuery):
         return
     user_id = int(call.data.split("_")[2])
     if not await _mark_application_decision(call, True, "secret", user_id): return
+    await alog(call.from_user.id, "secret_accept", f"ID {user_id}")
     try:
         await bot.send_message(user_id, "<tg-emoji emoji-id='5994502837327892086'>🎉</tg-emoji> <b>Поздравляем! Ваша заявка в искатели секреток принята!</b> Администрация свяжется с вами в ближайшее время.", parse_mode="HTML")
     except Exception:
@@ -9456,6 +9697,7 @@ async def secret_reject_callback(call: CallbackQuery):
         return
     user_id = int(call.data.split("_")[2])
     if not await _mark_application_decision(call, False, "secret", user_id): return
+    await alog(call.from_user.id, "secret_reject", f"ID {user_id}")
     try:
         await bot.send_message(user_id, f"{ICON_CROSS} К сожалению, ваша заявка в искатели секреток была отклонена.", parse_mode="HTML")
     except Exception:
@@ -10043,6 +10285,7 @@ async def take_ticket_handler(call: CallbackQuery):
 
     agent_number = await get_or_create_agent_number(call.from_user.id)
     await activate_ticket(ticket_id, call.from_user.id)
+    await alog(call.from_user.id, "ticket_take", f"№{ticket_id}")
     await call.answer("✅ Заявка взята в работу!")
 
     try:
@@ -10121,6 +10364,8 @@ async def close_ticket_handler(call: CallbackQuery):
     agent_no = await get_or_create_agent_number(call.from_user.id)
 
     await close_ticket_db(ticket_id, status='closed', admin_id=call.from_user.id)
+    await alog(call.from_user.id, "ticket_close", f"№{ticket_id}",
+               "" if call.from_user.id == assigned_admin_id else "закрыл чужое обращение")
 
     try:
         await bot.send_message(
@@ -11103,6 +11348,7 @@ async def cmd_ban_reply(message: Message):
             ticket_id = active[0]
 
     await ban_user_db(user_id, reason)
+    await alog(message.from_user.id, "ban", f"ID {user_id}", reason)
 
     if ticket_id:
         await close_ticket_db(ticket_id, 'rejected')
@@ -11167,6 +11413,7 @@ async def cmd_unban(message: Message):
         return
 
     await unban_user_db(user_id)
+    await alog(message.from_user.id, "unban", f"ID {user_id}")
     await message.answer(f"✅ Пользователь с ID <code>{user_id}</code> успешно разблокирован.", parse_mode="HTML")
 
 # ----------------------------------------------------------------------
@@ -11227,6 +11474,7 @@ async def handle_admin_group_messages(message: Message):
                 reason = html.escape(text or "Без причины")
                 agent_no = await get_or_create_agent_number(message.from_user.id)
                 await close_ticket_db(pending_ticket_id, 'rejected', admin_id=message.from_user.id)
+                await alog(message.from_user.id, "ticket_reject", f"№{pending_ticket_id}", text or "Без причины")
 
                 try:
                     user_kb = await main_keyboard(ticket_info[0])
@@ -11359,19 +11607,18 @@ async def userbot_watchdog_worker():
                     if OWNER_ID and (not _userbot_alert["bad"] or now - _userbot_alert["last"] > 6 * 3600):
                         _userbot_alert["bad"], _userbot_alert["last"] = True, now
                         try:
-                            await bot.send_message(
-                                OWNER_ID,
+                            await _notify_ops(
                                 f"⚠️ <b>Юзербот не работает.</b>\n<code>{html.escape(err[:300])}</code>\n"
-                                "Посты уйдут запасным путём (ботом) без премиум-эмодзи. Проверьте сессию и переменные окружения.",
-                                parse_mode="HTML"
+                                "Посты уйдут запасным путём (ботом) без премиум-эмодзи. Проверьте сессию и переменные окружения."
                             )
+                            await alog(None, "incident", "", f"юзербот: {err[:150]}")
                         except Exception:
                             pass
                 elif _userbot_alert["bad"]:
                     _userbot_alert["bad"] = False
                     if OWNER_ID:
                         try:
-                            await bot.send_message(OWNER_ID, "✅ Юзербот снова работает.", parse_mode="HTML")
+                            await _notify_ops("✅ Юзербот снова работает.")
                         except Exception:
                             pass
         except Exception as err2:
@@ -11383,6 +11630,35 @@ async def userbot_watchdog_worker():
 # ----------------------------------------------------------------------
 HEALTH_ALERT_AFTER = 300      # сек: о проблеме сообщаем, если она тянется дольше 5 минут
 _health = {"bad_since": None, "reason": "", "alerted": False, "last_ok": None}
+_STARTED_AT = time.time()
+_LOG_PRUNE = {"t": 0.0}
+_ERR_TIMES: list = []          # моменты необработанных ошибок в обработчиках (для всплесков)
+_ERR_SPIKE = {"last": 0.0}
+
+async def _notify_ops(text: str) -> bool:
+    """Служебное сообщение о сбое: владельцу и всем главным админам. True, если дошло хотя бы до одного."""
+    ok = False
+    for aid in await get_main_admin_ids():
+        try:
+            await bot.send_message(aid, text, parse_mode="HTML")
+            ok = True
+        except Exception as e:
+            logging.warning(f"Не удалось написать {aid}: {e}")
+    return ok
+
+def _err_register(exc):
+    """Считает ошибки обработчиков. Много ошибок подряд (например, после неудачного обновления) = сообщение главным админам."""
+    now = time.time()
+    _ERR_TIMES.append(now)
+    del _ERR_TIMES[:-300]
+    recent = [t for t in _ERR_TIMES if now - t < 300]
+    if len(recent) >= 10 and now - _ERR_SPIKE["last"] > 1800:
+        _ERR_SPIKE["last"] = now
+        spawn(_notify_ops(
+            f"🔥 <b>Всплеск ошибок:</b> {len(recent)} за 5 минут.\nПоследняя: <code>{html.escape(repr(exc)[:300])}</code>\n"
+            "Если это началось после обновления, возможно, стоит откатить его."
+        ))
+        spawn(alog(None, "incident", "", f"всплеск ошибок: {len(recent)} за 5 мин"))
 
 async def _health_check_once() -> str | None:
     try:
@@ -11418,9 +11694,10 @@ async def health_watchdog_worker():
         last = await get_setting("last_heartbeat", "")
         if last:
             gap = time.time() - float(last)
+            await alog(None, "restart", "", f"не работал ≈ {_fmt_minutes(gap)}" if gap > HEALTH_ALERT_AFTER else "перезапуск")
             if gap > HEALTH_ALERT_AFTER:
                 started = datetime.fromtimestamp(float(last), MSK_TZ).strftime("%d.%m %H:%M")
-                await _notify_owner(
+                await _notify_ops(
                     f"ℹ️ <b>Бот снова запущен.</b>\nОн не работал примерно <b>{_fmt_minutes(gap)}</b> (с {started} по МСК). "
                     "Это перезапуск или сбой: отложенные публикации, которые не успели выйти, восстановлены."
                 )
@@ -11436,19 +11713,66 @@ async def health_watchdog_worker():
                 _health["reason"] = reason
                 logging.warning(f"Сторож здоровья: {reason}")
                 if not _health["alerted"] and now - _health["bad_since"] >= HEALTH_ALERT_AFTER:
-                    if await _notify_owner(f"⚠️ <b>Проблема с ботом уже {_fmt_minutes(now - _health['bad_since'])}:</b> {html.escape(reason)}."):
+                    if await _notify_ops(f"⚠️ <b>Проблема с ботом уже {_fmt_minutes(now - _health['bad_since'])}:</b> {html.escape(reason)}."):
                         _health["alerted"] = True
+                        await alog(None, "incident", "", reason)
             else:
                 _health["last_ok"] = now
                 if _health["bad_since"] is not None:
                     dur = now - _health["bad_since"]
                     if _health["alerted"] or dur >= HEALTH_ALERT_AFTER:
-                        await _notify_owner(f"✅ <b>Бот снова в порядке.</b> Сбой длился {_fmt_minutes(dur)} ({html.escape(_health['reason'])}).")
+                        await _notify_ops(f"✅ <b>Бот снова в порядке.</b> Сбой длился {_fmt_minutes(dur)} ({html.escape(_health['reason'])}).")
+                        await alog(None, "incident", "", f"восстановлено, сбой длился {_fmt_minutes(dur)}")
                     _health.update(bad_since=None, reason="", alerted=False)
                 await set_setting("last_heartbeat", str(int(now)))
+                if now - _LOG_PRUNE["t"] > 3600:
+                    _LOG_PRUNE["t"] = now
+                    await _db_exec(f"DELETE FROM admin_log WHERE ts < CURRENT_TIMESTAMP - INTERVAL '{int(ALOG_KEEP_DAYS)} days'")
         except Exception as e:
             logging.error(f"Ошибка в health_watchdog_worker: {e}", exc_info=True)
         await asyncio.sleep(60)
+
+@router.message(Command("monitor"), F.chat.type == "private")
+async def cmd_monitor(message: Message):
+    """Сводка состояния бота для главных админов."""
+    if not await is_main_admin(message.from_user.id):
+        return
+    async def probe(coro, timeout=15):
+        t0 = time.time()
+        try:
+            await asyncio.wait_for(coro, timeout=timeout)
+            return f"ок, {int((time.time() - t0) * 1000)} мс"
+        except Exception as e:
+            return f"❌ {type(e).__name__}"
+    now = time.time()
+    lines = ["🩺 <b>Состояние бота</b>", ""]
+    lines.append(f"• Telegram Bot API: {await probe(bot.get_me())}")
+    lines.append(f"• База данных: {await probe(_db_one('SELECT 1'))}")
+    if userbot:
+        lines.append("• Юзербот: " + ("подключён" if userbot.is_connected() else "❌ не подключён"))
+    else:
+        lines.append("• Юзербот: не настроен")
+    lines.append(f"• Работает без перезапуска: {_fmt_minutes(now - _STARTED_AT)}")
+    if _health["bad_since"] is not None:
+        lines.append(f"• ⚠️ Сейчас сбой уже {_fmt_minutes(now - _health['bad_since'])}: {html.escape(_health['reason'])}")
+    else:
+        lines.append("• Сторож здоровья: всё хорошо")
+    lines.append(f"• Ошибок в обработчиках за час: {len([t for t in _ERR_TIMES if now - t < 3600])}")
+    lines.append(f"• Фоновых задач работает: {len(_BG_TASKS)}")
+    try:
+        rows = await _db_all(
+            "SELECT EXTRACT(EPOCH FROM ts), action, details FROM admin_log WHERE action IN ('incident', 'restart') "
+            "AND ts > CURRENT_TIMESTAMP - INTERVAL '24 hours' ORDER BY id DESC LIMIT 5")
+    except Exception:
+        rows = []
+    if rows:
+        lines += ["", "<b>Происшествия за сутки:</b>"]
+        for ts, act, det in rows:
+            when = datetime.fromtimestamp(float(ts), MSK_TZ).strftime("%d.%m %H:%M")
+            lines.append(f"• {when} {'запуск' if act == 'restart' else 'сбой'}: {html.escape(str(det or ''))[:120]}")
+    lines += ["", "<i>Если бот выключится совсем, он не сможет написать сам. Для мгновенного сообщения подключите внешний монитор "
+                  "(например UptimeRobot) на адрес /health сайта: он ответит ошибкой при сбое.</i>"]
+    await message.answer("\n".join(lines), parse_mode="HTML")
 
 async def prelink_expiry_worker():
     logging.info("Фоновый воркер срока предссылок запущен.")
@@ -11863,6 +12187,7 @@ async def global_error_handler(event):
     logging.error(f"Необработанная ошибка: {exc!r}", exc_info=exc)
     if isinstance(exc, TelegramBadRequest) and ("not modified" in text or "query is too old" in text or "query id is invalid" in text):
         return True
+    _err_register(exc)
     try:
         if upd.message and upd.message.chat.type == "private":
             await upd.message.answer("⚠️ Что-то пошло не так. Попробуйте ещё раз или нажмите «Перезагрузить меню».")
@@ -12350,6 +12675,17 @@ async def _site_admin_stats() -> dict:
         out["apps"] = {str(k): int(v) for k, v in await _db_all("SELECT kind, COUNT(*) FROM applications_pending GROUP BY kind")}
     except Exception:
         out["apps"] = {}
+    try:
+        titles = _faq_items()
+        rows = await _db_all(
+            "SELECT q, COUNT(*) FILTER (WHERE v = 1), COUNT(*) FILTER (WHERE v = -1) FROM faq_votes GROUP BY q")
+        faq = [{"q": q, "title": titles.get(q, q), "yes": int(y), "no": int(n)} for q, y, n in rows if q in titles]
+        faq.sort(key=lambda x: (-x["no"], x["yes"], x["q"]))
+        out["faq"] = faq[:12]
+    except Exception as e:
+        logging.warning(f"Кабинет: статистика FAQ: {e}")
+        out["faq"] = []
+    out["recruit_subs"] = {"helper": await recruit_sub_count("helper"), "secret": await recruit_sub_count("secret")}
     _ADMIN_STATS_CACHE.update(t=now, data=out)
     return out
 
@@ -12400,6 +12736,141 @@ async def handle_api_me(request):
         data["staff"] = None
     return web.json_response(data, headers=_NOSTORE)
 
+# ---------- голосование «ответ помог?» на странице /faq ----------
+_FAQ_RATE: Dict[str, list] = {}
+_ADMLOG_RATE: Dict[str, list] = {}
+_FAQ_CACHE = {"mt": 0.0, "items": {}}
+_VOTER_COOKIE = "tos_v"
+
+def _hit(bucket: dict, key: str, limit: int, window: int) -> bool:
+    """Простой лимитер: не больше limit обращений за window секунд на ключ."""
+    now = time.time()
+    lst = [t for t in bucket.get(key, []) if now - t < window]
+    if len(lst) >= limit:
+        bucket[key] = lst
+        return False
+    lst.append(now)
+    bucket[key] = lst
+    if len(bucket) > 5000:
+        for k in [k for k, v in bucket.items() if not v or now - v[-1] > window]:
+            bucket.pop(k, None)
+    return True
+
+def _faq_items() -> dict:
+    """{id вопроса: заголовок}: берём из faq.html, поэтому голосовать можно только за существующие вопросы."""
+    path = os.path.join(SITE_DIR, "faq.html")
+    try:
+        mt = os.path.getmtime(path)
+    except OSError:
+        return {}
+    if _FAQ_CACHE["items"] and _FAQ_CACHE["mt"] == mt:
+        return _FAQ_CACHE["items"]
+    try:
+        with open(path, encoding="utf-8") as f:
+            txt = f.read()
+    except Exception:
+        return _FAQ_CACHE["items"]
+    items = {}
+    for m in re.finditer(r'<details[^>]*\bdata-q="([a-z0-9-]{1,40})"[^>]*>\s*<summary>(.*?)</summary>', txt, re.S):
+        items[m.group(1)] = re.sub(r"<[^>]+>", "", html.unescape(m.group(2))).strip()[:120]
+    _FAQ_CACHE.update(mt=mt, items=items)
+    return items
+
+def _voter_token(request) -> str:
+    v = request.cookies.get(_VOTER_COOKIE, "")
+    return v if re.fullmatch(r"[0-9a-f]{32}", v or "") else ""
+
+def _voter_key(tok: str) -> str:
+    return hashlib.sha256((tok + "|faq").encode()).hexdigest()[:32]
+
+async def handle_faq_vote(request):
+    if not _hit(_FAQ_RATE, "ip:" + _client_ip(request), 120, 600):
+        return web.json_response({"error": "rate"}, status=429, headers=_NOSTORE)
+    try:
+        body = await request.json()
+        q = str(body.get("q", ""))[:40]
+        v = int(body.get("v"))
+    except Exception:
+        return web.json_response({"error": "bad"}, status=400, headers=_NOSTORE)
+    if q not in _faq_items() or v not in (-1, 0, 1):
+        return web.json_response({"error": "bad"}, status=400, headers=_NOSTORE)
+    tok = _voter_token(request)
+    fresh = not tok
+    if fresh:
+        tok = secrets.token_hex(16)
+    key = _voter_key(tok)
+    if not _hit(_FAQ_RATE, "v:" + key, 40, 600):
+        return web.json_response({"error": "rate"}, status=429, headers=_NOSTORE)
+    try:
+        if v == 0:
+            await _db_exec("DELETE FROM faq_votes WHERE voter = %s AND q = %s", (key, q))
+        else:
+            await _db_exec(
+                "INSERT INTO faq_votes (voter, q, v) VALUES (%s, %s, %s) "
+                "ON CONFLICT (voter, q) DO UPDATE SET v = EXCLUDED.v, ts = CURRENT_TIMESTAMP", (key, q, v))
+    except Exception as e:
+        logging.warning(f"/api/faq/vote: {e}")
+        return web.json_response({"error": "db"}, status=503, headers=_NOSTORE)
+    resp = web.json_response({"ok": True, "v": v}, headers=_NOSTORE)
+    if fresh:
+        secure = request.headers.get("X-Forwarded-Proto", "").lower() == "https" or request.secure
+        resp.set_cookie(_VOTER_COOKIE, tok, max_age=365 * 86400, httponly=True, samesite="Lax", secure=secure, path="/")
+    return resp
+
+async def handle_faq_votes(request):
+    """Только свои голоса этого браузера. Чужие и общие счётчики публично не отдаются."""
+    tok = _voter_token(request)
+    mine = {}
+    if tok:
+        try:
+            rows = await _db_all("SELECT q, v FROM faq_votes WHERE voter = %s", (_voter_key(tok),))
+            known = _faq_items()
+            mine = {str(q): int(v) for q, v in rows if q in known}
+        except Exception as e:
+            logging.warning(f"/api/faq/votes: {e}")
+    return web.json_response({"mine": mine}, headers=_NOSTORE)
+
+# ---------- журнал действий команды: только для главных админов ----------
+async def handle_admin_log(request):
+    sess = _sess_from_request(request)
+    if not sess:
+        return web.json_response({"error": "auth"}, status=401, headers=_NOSTORE)
+    if not await is_main_admin(sess["uid"]):          # права проверяем при каждом запросе, не по кэшу
+        return web.json_response({"error": "forbidden"}, status=403, headers=_NOSTORE)
+    if not _hit(_ADMLOG_RATE, str(sess["uid"]), 60, 60):
+        return web.json_response({"error": "rate"}, status=429, headers=_NOSTORE)
+    group = request.query.get("g", "")
+    try:
+        before = max(0, int(request.query.get("before", "0") or 0))
+    except ValueError:
+        before = 0
+    where, params = [], []
+    if group in ("tickets", "people", "settings", "system"):
+        acts = [a for a, (_, g) in ALOG_INFO.items() if g == group]
+        where.append("action IN (" + ",".join(["%s"] * len(acts)) + ")")
+        params += acts
+    if before:
+        where.append("id < %s")
+        params.append(before)
+    sql = ("SELECT id, EXTRACT(EPOCH FROM ts), actor_id, action, target, details FROM admin_log"
+           + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY id DESC LIMIT 41")
+    try:
+        rows = await _db_all(sql, tuple(params))
+    except Exception as e:
+        logging.warning(f"/api/admin/log: {e}")
+        return web.json_response({"error": "db"}, status=503, headers=_NOSTORE)
+    more = len(rows) > 40
+    items = []
+    for rid, ts, actor, action, target, details in rows[:40]:
+        label, grp = ALOG_INFO.get(action, (action, "other"))
+        items.append({
+            "id": int(rid), "at": int(ts),
+            "who": (await _plain_name(int(actor))) if actor else "Система",
+            "action": label, "group": grp,
+            "target": str(target or "")[:60], "details": str(details or "")[:300],
+        })
+    return web.json_response({"items": items, "more": more}, headers=_NOSTORE)
+
 async def handle_api_status(request):
     """Публичный статус для сайта. Только безопасные данные, без личной информации."""
     payload = {
@@ -12425,6 +12896,9 @@ async def web_server():
     app.router.add_get("/api/secrets", handle_api_secrets)
     app.router.add_get("/api/shop", handle_api_shop)
     app.router.add_get("/api/me", handle_api_me)
+    app.router.add_post("/api/faq/vote", handle_faq_vote)
+    app.router.add_get("/api/faq/votes", handle_faq_votes)
+    app.router.add_get("/api/admin/log", handle_admin_log)
     app.router.add_post("/api/login/start", handle_login_start)
     app.router.add_post("/api/login/check", handle_login_check)
     app.router.add_post("/api/logout", handle_logout)
@@ -12464,17 +12938,17 @@ async def main():
         except Exception as e:
             logging.error(f"Не удалось запустить юзербота: {e}")
             
-    spawn(reminder_worker())
-    spawn(daily_summary_worker())
-    spawn(secret_timer_worker())
-    spawn(mutator_timer_worker())
-    spawn(prelink_expiry_worker())
-    spawn(userbot_watchdog_worker())
-    spawn(promo_hold_worker())
-    spawn(health_watchdog_worker())
-    spawn(prelink_renew_reminder_worker())
-    spawn(referral_worker())
-    spawn(userbot_keepalive_worker())
+    spawn(_supervised(reminder_worker))
+    spawn(_supervised(daily_summary_worker))
+    spawn(_supervised(secret_timer_worker))
+    spawn(_supervised(mutator_timer_worker))
+    spawn(_supervised(prelink_expiry_worker))
+    spawn(_supervised(userbot_watchdog_worker))
+    spawn(_supervised(promo_hold_worker))
+    spawn(_supervised(health_watchdog_worker))
+    spawn(_supervised(prelink_renew_reminder_worker))
+    spawn(_supervised(referral_worker))
+    spawn(_supervised(userbot_keepalive_worker))
     try:
         me_bot = await bot.get_me()
         await bot.delete_webhook(drop_pending_updates=False)   # вебхук мешал бы polling

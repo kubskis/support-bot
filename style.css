@@ -295,3 +295,24 @@ button.btn:disabled{opacity:.6;cursor:default}
 .lg::before{content:"";position:absolute;left:0;top:.4em;width:9px;height:9px;border-radius:2px}
 .lg-new::before{background:var(--amber)}
 .lg-done::before{background:var(--ok)}
+
+/* FAQ: голосование, ссылка «все вопросы» */
+.faq-more{text-align:center;color:var(--muted);margin-top:20px}
+.faq-more a{color:var(--accent)}
+.faq-full details{border-bottom:1px solid var(--line)}
+.vote{display:flex;flex-wrap:wrap;align-items:center;gap:8px 10px;margin:-4px 0 16px;color:var(--muted);font-size:14px}
+.vbtn{background:transparent;border:1px solid var(--line2);color:var(--text);border-radius:10px;padding:8px 14px;min-height:40px;font:inherit;font-size:14px;cursor:pointer}
+.vbtn:hover{border-color:var(--accent)}
+.vbtn.on{background:rgba(194,17,31,.22);border-color:var(--accent)}
+.vbtn:disabled{opacity:.6;cursor:wait}
+.vmsg{color:var(--muted)}
+.vmore{color:var(--accent)}
+.btn.notify{margin-top:10px}
+.cab-card .logt{font-size:13px}
+.chips button[aria-pressed="true"]{background:rgba(194,17,31,.22);border-color:var(--accent);color:var(--text)}
+.alog li.sys .tc{color:var(--amber)}
+.alog li{gap:2px 10px}
+.alog li .tm{flex:1 1 100%;font-size:12.5px}
+.alog li .tc{flex:1 1 100%}
+.alog li .tc b{color:var(--text)}
+.logmore{margin-top:14px}

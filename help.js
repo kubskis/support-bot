@@ -53,7 +53,7 @@
   function parseFaq(doc){
     doc.querySelectorAll('#faq details').forEach(function(d){
       var s=d.querySelector('summary'), p=d.querySelector('p');
-      if(s) add('Частые вопросы', s.textContent, p?p.textContent:'', '/#faq');
+      if(s) add('Частые вопросы', s.textContent, p?p.textContent:'', '/faq#'+(d.id||''));
     });
   }
   function parseProse(doc,cat,url){
@@ -69,10 +69,11 @@
   function doc(html){return html?new DOMParser().parseFromString(html,'text/html'):null}
 
   // база поиска строится из самих страниц сайта: изменили правила — поиск обновился сам
-  Promise.all([get('/rules'),get('/'),get('/services'),get('/privacy')]).then(function(r){
+  Promise.all([get('/rules'),get('/'),get('/services'),get('/privacy'),get('/faq')]).then(function(r){
     var d;
     if((d=doc(r[0]))) {parseRules(d); parseWarn(d);}
-    if((d=doc(r[1]))) {parseFaq(d); parseHome(d);}
+    if((d=doc(r[1]))) parseHome(d);
+    if((d=doc(r[4]))) parseFaq(d);
     if((d=doc(r[2]))) parseProse(d,'Платные услуги','/services');
     if((d=doc(r[3]))) parseProse(d,'Конфиденциальность','/privacy');
     loaded=true; failed=items.length===0; render();

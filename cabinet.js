@@ -185,9 +185,67 @@
     }
     var py=a.payments||{};
     pb.appendChild(el('h3','cab-sub','Оплаты и заявки'));
-    pb.appendChild(tiles([[(py.week||{}).count||0,'оплат за 7 дней'],[((py.week||{}).stars||0)+' ⭐','сумма за 7 дней'],[(py.month||{}).count||0,'оплат за 30 дней'],[((py.month||{}).stars||0)+' ⭐','сумма за 30 дней'],[(a.apps||{}).helper||0,'заявок хелперов'],[(a.apps||{}).secret||0,'заявок искателей']]));
+    pb.appendChild(tiles([[(py.week||{}).count||0,'оплат за 7 дней'],[((py.week||{}).stars||0)+' ⭐','сумма за 7 дней'],[(py.month||{}).count||0,'оплат за 30 дней'],[((py.month||{}).stars||0)+' ⭐','сумма за 30 дней'],[(a.apps||{}).helper||0,'заявок хелперов'],[(a.apps||{}).secret||0,'заявок искателей'],[(a.recruit_subs||{}).helper||0,'ждут набора хелперов'],[(a.recruit_subs||{}).secret||0,'ждут набора искателей']]));
     out.push(pb);
+    out.push(faqCard(a.faq));
+    out.push(logCard());
     return out;
+  }
+  function faqCard(list){
+    var c=card('Полезность ответов на сайте'); c.classList.add('staff','wide');
+    if(!list||!list.length){c.appendChild(note('Голосов пока нет. Посетители отмечают на странице «Вопросы», помог ли им ответ.')); return c}
+    var ul=el('ul','tlist');
+    list.forEach(function(x){
+      var li=el('li'), tot=(x.yes||0)+(x.no||0);
+      li.appendChild(el('span','tc',x.title));
+      li.appendChild(el('b',null,'👍 '+x.yes+'  👎 '+x.no));
+      li.appendChild(el('span','tm',tot?Math.round(x.no*100/tot)+'% не помогло':''));
+      ul.appendChild(li);
+    });
+    c.appendChild(ul);
+    c.appendChild(note('Сверху вопросы, на которых чаще нажимают «Нет»: их ответы стоит переписать. Голоса анонимны.','cab-note small'));
+    return c;
+  }
+  function logCard(){
+    var c=card('Журнал действий'); c.classList.add('staff','wide');
+    c.appendChild(note('Кто и что делал в боте: обращения, блокировки, заявки, доступы, переключатели, а также сбои и перезапуски. Видят только главные админы. Записи хранятся 180 дней.','cab-note small'));
+    var F=[['','Все'],['tickets','Обращения'],['people','Люди'],['settings','Настройки'],['system','Сбои и запуски']];
+    var chips=el('div','chips'), list=el('ul','tlist alog'), msg=note('Загружаю…'), more=el('button','btn alt logmore','Показать ещё');
+    more.type='button'; more.hidden=true;
+    var group='', last=0, token=0, busy=false, btns=[];
+    function load(reset){
+      if(reset){token++; busy=false; list.textContent=''; last=0; more.hidden=true}
+      if(busy) return; busy=true;
+      var my=token; msg.hidden=false; msg.textContent='Загружаю…';
+      api('/api/admin/log?g='+encodeURIComponent(group)+(last?'&before='+last:'')).then(function(r){
+        if(!r.ok) throw r.status; return r.json();
+      }).then(function(d){
+        if(my!==token) return;
+        (d.items||[]).forEach(function(it){
+          var li=el('li',it.group==='system'?'sys':'');
+          li.appendChild(el('span','tm',fmtDT(it.at)));
+          var tc=el('span','tc'); tc.appendChild(el('b',null,it.who)); tc.appendChild(document.createTextNode(' · '+it.action+(it.target?' · '+it.target:''))); li.appendChild(tc);
+          if(it.details) li.appendChild(el('span','rv',it.details));
+          list.appendChild(li); last=it.id;
+        });
+        msg.hidden=list.children.length>0; if(!list.children.length) msg.textContent='Записей пока нет.';
+        more.hidden=!d.more;
+      }).catch(function(e){
+        if(my!==token) return;
+        msg.hidden=false; msg.textContent=(e===429)?'Слишком часто. Подождите минуту.':(e===403?'Нет доступа.':'Не удалось загрузить журнал.');
+      }).then(function(){ if(my===token) busy=false });
+    }
+    F.forEach(function(f){
+      var b=el('button',null,f[1]); b.type='button'; b.setAttribute('aria-pressed',f[0]===''?'true':'false');
+      b.addEventListener('click',function(){
+        group=f[0]; btns.forEach(function(x){x.setAttribute('aria-pressed',x===b?'true':'false')}); load(true);
+      });
+      btns.push(b); chips.appendChild(b);
+    });
+    more.addEventListener('click',function(){load(false)});
+    c.appendChild(chips); c.appendChild(list); c.appendChild(msg); c.appendChild(more);
+    load(true);
+    return c;
   }
   function renderStaff(sf){
     if(!sf||!sf.roles||!sf.roles.length) return;

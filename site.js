@@ -10,7 +10,8 @@
       if(open!==true && open!==false) return;          // статус неизвестен: оставляем как есть
       show(card.querySelector('.pill.ok'), open);
       show(card.querySelector('.pill.off'), !open);
-      show(card.querySelector('.btn'), open);
+      show(card.querySelector('.btn:not(.notify)'), open);
+      show(card.querySelector('.notify'), !open);
       show(card.querySelector('.closed-note'), !open);
     });
   }
