@@ -1779,6 +1779,7 @@ ALOG_INFO = {
     "friend_toggle": ("Добавление в друзья", "settings"),
     "maintenance": ("Технический перерыв", "settings"),
     "testmode": ("Тест-режим", "settings"),
+    "publish_pause": ("Публикации в канал", "settings"),
     "incident": ("Сбой бота", "system"),
     "restart": ("Запуск бота", "system"),
 }
@@ -1838,6 +1839,80 @@ async def _recruit_closed_kb(uid: int, kind: str):
         IB(text="🔕 Не уведомлять" if has else "🔔 Сообщить, когда откроется",
            callback_data=f"rsub_{'off' if has else 'on'}_{kind}")
     ]])
+
+# ----------------------------------------------------------------------
+# ОБЩАЯ ОСТАНОВКА ПУБЛИКАЦИЙ В КАНАЛ (кнопка в панели секреток)
+# Действует на всё, что бот и юзербот отправляют в канал новыми сообщениями:
+# секретки, саботёр, фарм, мутатор, исследователь. Поддержка и сам бот работают как обычно.
+# Уже опубликованные посты можно закрывать и редактировать (это правки, они канал не «поднимают»).
+# ----------------------------------------------------------------------
+PUBLISH_PAUSED = False            # загружается из БД при старте
+PUBLISH_PAUSED_SINCE = 0.0
+_PAUSE_REMIND = {"t": 0.0}
+PAUSED_ALERT = "⏸ Публикации в канал сейчас приостановлены администрацией. Попробуйте позже."
+PAUSED_HTML = ("⏸ <b>Публикации в канал сейчас приостановлены администрацией.</b>\n"
+               "Пост не вышел. Попробуйте отправить его позже, когда публикации возобновят.")
+
+def _pub_paused() -> bool:
+    # в тест-режиме посты идут в тест-канал, и пауза не должна мешать проверке
+    return bool(PUBLISH_PAUSED) and not TEST_MODE_ON
+
+async def _pub_paused_alert(call) -> bool:
+    """True, если публикации остановлены (и человеку показано окно). Черновик при этом не сбрасывается."""
+    if not _pub_paused():
+        return False
+    try:
+        await call.answer(PAUSED_ALERT, show_alert=True)
+    except Exception:
+        pass
+    return True
+
+async def _pause_notify_publisher(uid, what: str):
+    if not uid:
+        return
+    try:
+        await bot.send_message(
+            uid,
+            f"⏸ Публикации в канал были остановлены администрацией, поэтому {what} не вышел в канал. "
+            "Ссылку уже могли получить стафф и предссылки. Отправьте пост заново, когда публикации возобновят.",
+        )
+    except Exception:
+        pass
+
+async def _pause_skip_secret(post_id: int):
+    logging.warning(f"[Секретка #{post_id}] публикации остановлены админом: пост в канал не отправлен.")
+    try:
+        r = await _db_one("SELECT user_id FROM secret_posts WHERE id = %s", (post_id,))
+    except Exception:
+        r = None
+    await _pause_notify_publisher(r[0] if r else 0, "ваш пост")
+
+async def _pause_skip_new_post(kind: str, post_id: int, deactivate: bool):
+    """Саботёр или фарм: нового сообщения в канале не будет. Сервера без поста в канале снимаем, чтобы они не висели
+    «активными» и не мешали отправить новый после возобновления."""
+    table = "saboteur_servers" if kind == "sab" else "farm_servers"
+    logging.warning(f"[{'Саботёр' if kind == 'sab' else 'Фарм'} #{post_id}] публикации остановлены админом: новый пост не отправлен.")
+    try:
+        users = [r[0] for r in await _db_all(f"SELECT DISTINCT user_id FROM {table} WHERE post_id = %s AND is_active = TRUE", (post_id,))]
+        if deactivate:
+            await _db_exec(f"UPDATE {table} SET is_active = FALSE WHERE post_id = %s AND is_active = TRUE", (post_id,))
+    except Exception as e:
+        logging.error(f"Остановка публикаций: не удалось обработать {table} #{post_id}: {e}")
+        users = []
+    for u in users:
+        await _pause_notify_publisher(u, "ваш сервер")
+
+async def _notify_pause_change(user, paused: bool):
+    """Остальным главным админам: кто и что переключил (чтобы пауза не осталась незамеченной)."""
+    name = html.escape(getattr(user, "full_name", "") or str(user.id))
+    text = f"{'⏸' if paused else '▶️'} {name} {'остановил' if paused else 'возобновил'} публикации в канал."
+    for aid in await get_main_admin_ids():
+        if aid == user.id:
+            continue
+        try:
+            await bot.send_message(aid, text, parse_mode="HTML")
+        except Exception:
+            pass
 
 async def register_user(user_id: int):
     def _query():
@@ -2398,6 +2473,9 @@ async def publish_to_channel_delayed(channel_id: str, photo_id: str, caption: st
 async def _publish_to_channel_delayed_inner(channel_id: str, photo_id: str, caption: str, post_id: int, delay: int = CHANNEL_DELAY_SECONDS):
     logging.info(f"[Секретка #{post_id}] Ожидание форы {delay} сек перед отправкой в {channel_id}...")
     await asyncio.sleep(delay)
+    if _pub_paused():
+        await _pause_skip_secret(post_id)
+        return
     channel_msg_id = 0
     try:
         if userbot:
@@ -2664,6 +2742,9 @@ async def publish_or_update_saboteur_channel(channel_id: str, post_id: int):
         parsed_text, entities = await parse_telethon_custom_emojis(userbot, final_text)
 
         async def _send_new():
+            if _pub_paused():
+                await _pause_skip_new_post("sab", post_id, deactivate=not (current_post and current_post["message_id"]))
+                return
             try:
                 sent_msg = await _ub_send_text(f"[Саботёр #{post_id}]", target_peer, parsed_text, entities)
             except Exception as e:
@@ -2706,6 +2787,9 @@ async def publish_or_update_saboteur_channel(channel_id: str, post_id: int):
                 link_preview_options=LinkPreviewOptions(is_disabled=True)
             )
         else:
+            if _pub_paused():
+                await _pause_skip_new_post("sab", post_id, deactivate=True)
+                return
             sent_b = await bot.send_message(
                 chat_id=channel_id,
                 text=final_text,
@@ -2953,6 +3037,7 @@ async def system_kb():
 
 def secret_admin_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
+        [IB(text="▶️ Возобновить публикацию" if PUBLISH_PAUSED else "⏸ Остановить публикацию", callback_data="toggle_publish_pause")],
         [IB(text="🔔 Предссылки и уведомления", callback_data="adm_sec_people")],
         [IB(text="📝 Шаблоны постов", callback_data="sec_templates")],
         [IB(text="🧩 Типы секреток", callback_data="adm_sec_types")],
@@ -4109,19 +4194,52 @@ async def save_friend_nick(message: Message, state: FSMContext):
 # ----------------------------------------------------------------------
 # АДМИН-ПАНЕЛЬ: УПРАВЛЕНИЕ СЕКРЕТКАМИ
 # ----------------------------------------------------------------------
-@router.callback_query(F.data == "adm_secret_panel")
-async def adm_secret_panel(call: CallbackQuery):
-    if not await is_main_admin(call.from_user.id): return
+async def _secret_panel_text() -> str:
     dur = await get_setting("timer_seconds", "510")
     dur_int = int(dur) if dur.isdigit() else 510
     m, s = dur_int // 60, dur_int % 60
-    text = (
+    if PUBLISH_PAUSED:
+        since = datetime.fromtimestamp(PUBLISH_PAUSED_SINCE, MSK_TZ).strftime("%d.%m %H:%M") if PUBLISH_PAUSED_SINCE else "?"
+        state = (f"🔴 <b>Публикации в канал ОСТАНОВЛЕНЫ</b> (с {since} МСК). Новые секретки, саботёр, фарм и бейджи не выходят, "
+                 "поддержка работает. Посты, которые уже в канале, можно закрывать.")
+    else:
+        state = "🟢 Публикации в канал идут. Кнопка «Остановить публикацию» блокирует любые новые сообщения бота в канале, например на время рекламы."
+    return (
         f"{ICON_BALL} <b>Панель управления секретками</b>\n\n"
+        f"{state}\n\n"
         f"{ICON_TIMER} Таймер удаления ссылки: <b>{m} мин. {s} сек.</b> (<code>{dur_int}</code> сек.)\n"
         f"Настройте нужные параметры ниже:"
     )
-    await call.message.edit_text(text, reply_markup=secret_admin_kb(), parse_mode="HTML")
+
+@router.callback_query(F.data == "adm_secret_panel")
+async def adm_secret_panel(call: CallbackQuery):
+    if not await is_main_admin(call.from_user.id): return
+    await call.message.edit_text(await _secret_panel_text(), reply_markup=secret_admin_kb(), parse_mode="HTML")
     await call.answer()
+
+@router.callback_query(F.data == "toggle_publish_pause")
+async def toggle_publish_pause(call: CallbackQuery):
+    global PUBLISH_PAUSED, PUBLISH_PAUSED_SINCE
+    if not await is_main_admin(call.from_user.id): return
+    new_state = not PUBLISH_PAUSED
+    since = time.time() if new_state else 0.0
+    try:
+        await set_setting("publish_paused", "true" if new_state else "false")
+        await set_setting("publish_paused_since", str(int(since)))
+    except Exception as e:
+        logging.error(f"Не удалось сохранить остановку публикаций: {e}")
+        await call.answer("❌ Не удалось сохранить настройку (база не отвечает). Попробуйте ещё раз.", show_alert=True)
+        return
+    PUBLISH_PAUSED, PUBLISH_PAUSED_SINCE = new_state, since
+    _PAUSE_REMIND["t"] = 0.0
+    await alog(call.from_user.id, "publish_pause", "", "остановлены" if new_state else "возобновлены")
+    logging.warning(f"Публикации в канал {'ОСТАНОВЛЕНЫ' if new_state else 'возобновлены'} пользователем {call.from_user.id}")
+    spawn(_notify_pause_change(call.from_user, new_state))
+    try:
+        await call.message.edit_text(await _secret_panel_text(), reply_markup=secret_admin_kb(), parse_mode="HTML")
+    except Exception:
+        pass
+    await call.answer("⏸ Публикации остановлены. Новые посты в канал не выйдут." if new_state else "▶️ Публикации возобновлены.", show_alert=True)
 
 @router.callback_query(F.data == "adm_sec_people")
 async def adm_sec_people(call: CallbackQuery):
@@ -5000,7 +5118,9 @@ async def open_secrets_menu(message: Message, state: FSMContext):
         return
     await state.clear()
     await message.answer(
-        f"{ICON_BALL} <b>Панель публикации секреток</b>\n\nВыберите нужное действие:",
+        f"{ICON_BALL} <b>Панель публикации секреток</b>\n\n"
+        + ("⏸ <b>Публикации в канал сейчас приостановлены администрацией.</b> Отправить новый пост пока нельзя.\n\n" if _pub_paused() else "")
+        + "Выберите нужное действие:",
         reply_markup=publisher_menu_kb(),
         parse_mode="HTML"
     )
@@ -5104,6 +5224,7 @@ async def pub_close_post(call: CallbackQuery):
 @router.callback_query(F.data == "pub_send_secret")
 async def pub_send_secret(call: CallbackQuery, state: FSMContext):
     if not await is_secret_publisher(call.from_user.id): return
+    if await _pub_paused_alert(call): return
     ch_id = await check_channel_rights(bot, call.from_user.id)
     if not ch_id:
         await call.message.answer(f"{ICON_CROSS} Сначала привяжите канал через меню секреток!", reply_markup=publisher_menu_kb(), parse_mode="HTML")
@@ -5223,6 +5344,7 @@ async def pub_link(message: Message, state: FSMContext):
 @router.callback_query(SecretPublisherStates.waiting_for_confirm, F.data.startswith("pub_conf_"))
 async def pub_confirm(call: CallbackQuery, state: FSMContext):
     action = call.data.split("_")[2]
+    if action == "yes" and await _pub_paused_alert(call): return
     
     if action == "yes":
         try:
@@ -5371,6 +5493,7 @@ async def pub_confirm(call: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "pub_send_saboteur")
 async def pub_send_saboteur(call: CallbackQuery, state: FSMContext):
     if not await is_secret_publisher(call.from_user.id): return
+    if await _pub_paused_alert(call): return
     ch_id = await check_channel_rights(bot, call.from_user.id)
     if not ch_id:
         await call.message.answer(f"{ICON_CROSS} Сначала привяжите канал через меню секреток!", reply_markup=publisher_menu_kb(), parse_mode="HTML")
@@ -5655,6 +5778,8 @@ async def _res_core(user, data, ch_id) -> tuple:
         return False, f"{ICON_CROSS} Ошибка публикации в канал: {html.escape(str(e))}"
 
 async def _publish_core(kind: str, user, data: dict, ch_id) -> tuple:
+    if _pub_paused():
+        return False, PAUSED_HTML      # в т. ч. для отложенных постов, которые «созрели» уже во время паузы
     if kind == "sab":
         return await _sab_core(user, data, ch_id)
     if kind == "farm":
@@ -5808,6 +5933,7 @@ async def _restore_delayed_publishes():
             logging.info(f"Восстановлена публикация {table} #{post_id}, выйдет через {delay} сек.")
 
 async def _ask_delay(call: CallbackQuery, state: FSMContext, kind: str, need_key: str):
+    if await _pub_paused_alert(call): return
     data = await state.get_data()
     if not data or need_key not in data:
         await call.answer()
@@ -5836,6 +5962,7 @@ async def delay_choice_proc(call: CallbackQuery, state: FSMContext):
         await call.message.edit_text(f"{ICON_CROSS} Публикация отменена.", parse_mode="HTML")
         await call.answer()
         return
+    if await _pub_paused_alert(call): return
     try:
         minutes = int(val)
     except ValueError:
@@ -6095,6 +6222,9 @@ async def publish_or_update_farm_channel(channel_id: str, post_id: int):
         target_peer = int(target_peer)
 
     async def _send_new():
+        if _pub_paused():
+            await _pause_skip_new_post("farm", post_id, deactivate=not post["message_id"])
+            return
         sent_msg = await _ub_send_text(f"[Фарм #{post_id}]", target_peer, parsed_text, entities)
         def _upd_mid():
             with get_db() as conn:
@@ -6231,6 +6361,7 @@ async def mutator_timer_worker():
 @router.callback_query(F.data == "pub_send_mutator")
 async def pub_send_mutator(call: CallbackQuery, state: FSMContext):
     if not await is_secret_publisher(call.from_user.id): return
+    if await _pub_paused_alert(call): return
     ch_id = await check_channel_rights(bot, call.from_user.id)
     if not ch_id:
         await call.message.answer(f"{ICON_CROSS} Сначала привяжите канал через меню секреток!", reply_markup=publisher_menu_kb(), parse_mode="HTML")
@@ -6269,6 +6400,7 @@ async def mutator_confirm_proc(call: CallbackQuery, state: FSMContext):
         await state.clear()
         await call.answer()
         return
+    if await _pub_paused_alert(call): return
 
     try:
         await call.message.edit_reply_markup(reply_markup=None)
@@ -6525,6 +6657,7 @@ async def close_researcher_post(badge_id: int, channel_id: str, message_id: int)
 @router.callback_query(F.data == "pub_send_researcher")
 async def pub_send_researcher(call: CallbackQuery, state: FSMContext):
     if not await is_secret_publisher(call.from_user.id): return
+    if await _pub_paused_alert(call): return
     ch_id = await check_channel_rights(bot, call.from_user.id)
     if not ch_id:
         await call.message.answer(f"{ICON_CROSS} Сначала привяжите канал через меню секреток!", reply_markup=publisher_menu_kb(), parse_mode="HTML")
@@ -6642,6 +6775,7 @@ async def res_close_proc(call: CallbackQuery):
 @router.callback_query(F.data == "pub_send_farm")
 async def pub_send_farm(call: CallbackQuery, state: FSMContext):
     if not await is_secret_publisher(call.from_user.id): return
+    if await _pub_paused_alert(call): return
     ch_id = await check_channel_rights(bot, call.from_user.id)
     if not ch_id:
         await call.message.answer(f"{ICON_CROSS} Сначала привяжите канал через меню секреток!", reply_markup=publisher_menu_kb(), parse_mode="HTML")
@@ -11725,6 +11859,12 @@ async def health_watchdog_worker():
                         await alog(None, "incident", "", f"восстановлено, сбой длился {_fmt_minutes(dur)}")
                     _health.update(bad_since=None, reason="", alerted=False)
                 await set_setting("last_heartbeat", str(int(now)))
+                if PUBLISH_PAUSED and now - max(_PAUSE_REMIND["t"], PUBLISH_PAUSED_SINCE) > 6 * 3600:
+                    _PAUSE_REMIND["t"] = now
+                    await _notify_ops(
+                        f"⏸ <b>Публикации в канал остановлены уже {_fmt_minutes(now - PUBLISH_PAUSED_SINCE) if PUBLISH_PAUSED_SINCE else 'давно'}.</b>\n"
+                        "Не забыли возобновить? Админ-панель ➔ Секретки ➔ «Возобновить публикацию»."
+                    )
                 if now - _LOG_PRUNE["t"] > 3600:
                     _LOG_PRUNE["t"] = now
                     await _db_exec(f"DELETE FROM admin_log WHERE ts < CURRENT_TIMESTAMP - INTERVAL '{int(ALOG_KEEP_DAYS)} days'")
@@ -12911,8 +13051,15 @@ async def web_server():
     logging.info(f"Health-check сервер запущен на порту {port}")
 
 async def main():
-    global MAINTENANCE_ON, TEST_MODE_ON, TEST_CHANNEL_ID, TEST_STARTED_AT
+    global MAINTENANCE_ON, TEST_MODE_ON, TEST_CHANNEL_ID, TEST_STARTED_AT, PUBLISH_PAUSED, PUBLISH_PAUSED_SINCE
     MAINTENANCE_ON = (await get_setting("maintenance_mode", "false")) == "true"
+    PUBLISH_PAUSED = (await get_setting("publish_paused", "false")) == "true"
+    try:
+        PUBLISH_PAUSED_SINCE = float(await get_setting("publish_paused_since", "0") or 0) if PUBLISH_PAUSED else 0.0
+    except ValueError:
+        PUBLISH_PAUSED_SINCE = 0.0
+    if PUBLISH_PAUSED:
+        logging.warning("Публикации в канал ОСТАНОВЛЕНЫ (включено ранее админом). Возобновить: админ-панель, Секретки.")
     TEST_CHANNEL_ID = (await get_setting("test_channel_id", "")) or ""
     TEST_MODE_ON = (await get_setting("test_mode", "false")) == "true" and bool(TEST_CHANNEL_ID)
     if TEST_MODE_ON:
