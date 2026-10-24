@@ -1,6 +1,26 @@
 (function(){
+  // тема: светлая или тёмная. Выбор запоминается; пока выбора нет, берётся системная настройка
+  var root=document.documentElement, tbtn=document.getElementById('theme');
+  function curTheme(){return root.getAttribute('data-theme')==='light'?'light':'dark'}
+  function paintTheme(){
+    var t=curTheme(), m=document.querySelector('meta[name="theme-color"]');
+    if(m) m.setAttribute('content',t==='light'?'#faf3f0':'#0a0507');
+    if(tbtn){var l=t==='light'?'Включить тёмную тему':'Включить светлую тему'; tbtn.textContent=t==='light'?'🌙':'☀️'; tbtn.setAttribute('aria-label',l); tbtn.title=l}
+  }
+  if(tbtn) tbtn.addEventListener('click',function(){
+    var n=curTheme()==='light'?'dark':'light'; root.setAttribute('data-theme',n);
+    try{localStorage.setItem('tos_theme',n)}catch(e){}
+    paintTheme();
+  });
+  try{
+    var mq=window.matchMedia('(prefers-color-scheme: light)');
+    var onq=function(){var s=null; try{s=localStorage.getItem('tos_theme')}catch(e){} if(s!=='light'&&s!=='dark'){root.setAttribute('data-theme',mq.matches?'light':'dark'); paintTheme()}};
+    if(mq.addEventListener) mq.addEventListener('change',onq);
+  }catch(e){}
+  paintTheme();
   var dot=document.getElementById('dot'), st=document.getElementById('st');
-  function set(c,t){if(dot){dot.className='dot '+c;st.textContent=t}}
+  var dot2=document.getElementById('dot2'), st2=document.getElementById('st2');
+  function set(c,t){if(dot){dot.className='dot '+c;st.textContent=t} if(dot2){dot2.className='dot '+c;st2.textContent=t}}
   function show(el,on){if(el){if(on){el.removeAttribute('hidden')}else{el.setAttribute('hidden','')}}}
 
   // карточки набора: статус берётся из настроек бота
