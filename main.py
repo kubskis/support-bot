@@ -38,6 +38,7 @@ from aiogram.types import (
 from telethon import TelegramClient as UserClient
 from telethon.sessions import StringSession
 from telethon.tl.types import MessageEntityCustomEmoji, User as TlUser
+from telethon.tl.functions.channels import GetFullChannelRequest
 from telethon.errors import FloodWaitError, MessageNotModifiedError, MessageIdInvalidError, MessageAuthorRequiredError
 
 # ----------------------------------------------------------------------
@@ -1235,6 +1236,30 @@ def _init_db_sync():
                     ts TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (voter, q)
                 );
+                CREATE TABLE IF NOT EXISTS publisher_nicks (
+                    id BIGSERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    nick TEXT NOT NULL,
+                    nick_lower TEXT NOT NULL,
+                    rbx_id BIGINT,
+                    last_used TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE (user_id, nick_lower)
+                );
+                CREATE TABLE IF NOT EXISTS channel_stats (
+                    day DATE PRIMARY KEY,
+                    subs INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS ticket_messages (
+                    id BIGSERIAL PRIMARY KEY,
+                    ticket_id INTEGER NOT NULL,
+                    sender TEXT NOT NULL,
+                    sender_id BIGINT,
+                    text TEXT DEFAULT '',
+                    media TEXT DEFAULT '',
+                    via TEXT DEFAULT 'bot',
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS ticket_messages_tid_idx ON ticket_messages (ticket_id, id);
                 CREATE TABLE IF NOT EXISTS admin_log (
                     id BIGSERIAL PRIMARY KEY,
                     ts TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
@@ -1780,6 +1805,10 @@ ALOG_INFO = {
     "maintenance": ("Технический перерыв", "settings"),
     "testmode": ("Тест-режим", "settings"),
     "publish_pause": ("Публикации в канал", "settings"),
+    "ticket_reply_web": ("Ответил игроку с сайта", "tickets"),
+    "toh_update": ("Tower of Hell обновился", "system"),
+    "toh_watch": ("Слежение за обновлением игры", "settings"),
+    "event": ("Праздничный режим", "settings"),
     "incident": ("Сбой бота", "system"),
     "restart": ("Запуск бота", "system"),
 }
@@ -2157,6 +2186,15 @@ async def activate_ticket(ticket_id: int, admin_id: int):
                 )
     await asyncio.to_thread(_query)
 
+async def tlog(ticket_id: int, sender: str, sender_id, text: str = "", media: str = "", via: str = "bot"):
+    """Пишет сообщение обращения в базу (для архива на сайте). Никогда не бросает исключений."""
+    try:
+        await _db_exec(
+            "INSERT INTO ticket_messages (ticket_id, sender, sender_id, text, media, via) VALUES (%s,%s,%s,%s,%s,%s)",
+            (int(ticket_id), sender, int(sender_id) if sender_id else None, (text or "")[:4000], media[:20], via[:10]))
+    except Exception as e:
+        logging.warning(f"Архив обращений: не удалось записать сообщение по №{ticket_id}: {e}")
+
 async def close_ticket_db(ticket_id: int, status: str = 'closed', admin_id: int = None):
     def _query():
         with get_db() as conn:
@@ -2172,6 +2210,7 @@ async def close_ticket_db(ticket_id: int, status: str = 'closed', admin_id: int 
                         (status, ticket_id)
                     )
     await asyncio.to_thread(_query)
+    await tlog(ticket_id, "system", admin_id, "closed" if status == "closed" else status)
 
 def _ticket_url(msg_id) -> str:
     """Ссылка на сообщение в теме поддержки админ-чата."""
@@ -2926,6 +2965,7 @@ class ShopAdminStates(StatesGroup):
 
 class ShopUserStates(StatesGroup):
     waiting_promo = State()
+    waiting_donate = State()
 
 class SecretAdminStates(StatesGroup):
     add_publisher_id = State()
@@ -2999,6 +3039,7 @@ async def admin_panel_kb():
          IB(text="👥 Статистика хелперов", callback_data="adm_list_stats")],
         [IB(text="📝 Наборы и друзья", callback_data="adm_recruit")],
         [IB(text="🔮 Секретки", callback_data="adm_secret_panel")],
+        [IB(text="📈 Аналитика канала", callback_data="adm_chan_stats")],
         [IB(text="💎 Платные услуги (Stars)", callback_data="shopa_menu")],
         [IB(text="👥 Рефералка", callback_data="refa_menu")],
         [IB(text="⚙️ Система и доступ", callback_data="adm_system")],
@@ -3568,6 +3609,7 @@ async def _start_welcome(message: Message, state: FSMContext):
         '<tg-emoji emoji-id="5208629654449064934">🔥</tg-emoji>'
         '<i>Выберите нужный раздел на клавиатуре ниже</i>'
     )
+    welcome_caption += await _event_line()
 
     if os.path.exists(PHOTO_FILENAME):
         try:
@@ -5488,6 +5530,152 @@ async def pub_confirm(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 # ----------------------------------------------------------------------
+# СОХРАНЁННЫЕ НИКИ ПУБЛИКАТОРОВ (до 5 штук на человека)
+# ----------------------------------------------------------------------
+PN_LIMIT = 5
+PN_PENDING: dict = {}   # token -> (uid, nick, rbx_id, ts)
+
+def _pn_profile(nick: str, rbx_id) -> str:
+    if rbx_id:
+        return f"<a href='https://www.roblox.com/users/{rbx_id}/profile'>{html.escape(nick)}</a>"
+    return f"<code>{html.escape(nick)}</code>"
+
+async def _pn_list(uid: int) -> list:
+    try:
+        return await _db_all("SELECT id, nick, rbx_id FROM publisher_nicks WHERE user_id = %s ORDER BY last_used DESC", (uid,))
+    except Exception as e:
+        logging.warning(f"Не удалось получить сохранённые ники: {e}")
+        return []
+
+def _pn_kb(rows: list, kind: str):
+    if not rows:
+        return None
+    kb = [[IB(text=f"👤 {r[1]}", callback_data=f"pn_use:{kind}:{r[0]}"),
+           IB(text="🗑", callback_data=f"pn_del:{kind}:{r[0]}")] for r in rows]
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+async def _pn_prompt(target: Message, uid: int, kind: str, title: str):
+    rows = await _pn_list(uid)
+    if rows:
+        text = (f"{title}\n\n1. Введите ваш <b>ник в Roblox</b> или выберите сохранённый ниже "
+                "(🗑 удаляет ник из списка):")
+    else:
+        text = f"{title}\n\n1. Введите ваш <b>ник в Roblox</b>:"
+    await target.answer(text, reply_markup=_pn_kb(rows, kind), parse_mode="HTML")
+
+async def _pn_offer_save(target: Message, uid: int, nick: str, rbx_id):
+    """После нового проверенного ника спрашивает, сохранить ли его на будущее."""
+    if not rbx_id:
+        return
+    try:
+        if await _db_one("SELECT 1 FROM publisher_nicks WHERE user_id = %s AND nick_lower = %s", (uid, nick.lower())):
+            await _db_exec("UPDATE publisher_nicks SET last_used = CURRENT_TIMESTAMP WHERE user_id = %s AND nick_lower = %s", (uid, nick.lower()))
+            return
+    except Exception as e:
+        logging.warning(f"Сохранённые ники: {e}")
+        return
+    now = time.time()
+    for k in [k for k, v in PN_PENDING.items() if now - v[3] > 3600]:
+        PN_PENDING.pop(k, None)
+    token = uuid.uuid4().hex[:8]
+    PN_PENDING[token] = (uid, nick, rbx_id, now)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        IB(text="💾 Сохранить", callback_data=f"pn_save:{token}"),
+        IB(text="Не сохранять", callback_data=f"pn_no:{token}"),
+    ]])
+    await target.answer(f"💾 Сохранить ник <b>{html.escape(nick)}</b> на будущее? В следующий раз его можно будет выбрать одной кнопкой.",
+                        reply_markup=kb, parse_mode="HTML")
+
+@router.callback_query(F.data.startswith("pn_save:"))
+async def pn_save_cb(call: CallbackQuery):
+    token = call.data.split(":", 1)[1]
+    item = PN_PENDING.get(token)
+    if not item or item[0] != call.from_user.id:
+        await call.answer("Предложение устарело.", show_alert=True)
+        try: await call.message.delete()
+        except Exception: pass
+        return
+    uid, nick, rbx_id, _ = item
+    rows = await _pn_list(uid)
+    if len(rows) >= PN_LIMIT:
+        oldest = rows[-1]
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            IB(text=f"Заменить «{oldest[1]}»", callback_data=f"pn_rep:{token}"),
+            IB(text="Не сохранять", callback_data=f"pn_no:{token}"),
+        ]])
+        await call.message.edit_text(
+            f"У вас уже {PN_LIMIT} сохранённых ников (максимум). Заменить самый давний — <b>{html.escape(oldest[1])}</b> — на <b>{html.escape(nick)}</b>?",
+            reply_markup=kb, parse_mode="HTML")
+        await call.answer()
+        return
+    await _db_exec("INSERT INTO publisher_nicks (user_id, nick, nick_lower, rbx_id) VALUES (%s,%s,%s,%s) "
+                   "ON CONFLICT (user_id, nick_lower) DO UPDATE SET last_used = CURRENT_TIMESTAMP", (uid, nick, nick.lower(), rbx_id))
+    PN_PENDING.pop(token, None)
+    await call.message.edit_text(f"{ICON_CHECK} Ник <b>{html.escape(nick)}</b> сохранён.", parse_mode="HTML")
+    await call.answer()
+
+@router.callback_query(F.data.startswith("pn_rep:"))
+async def pn_replace_cb(call: CallbackQuery):
+    token = call.data.split(":", 1)[1]
+    item = PN_PENDING.get(token)
+    if not item or item[0] != call.from_user.id:
+        await call.answer("Предложение устарело.", show_alert=True)
+        return
+    uid, nick, rbx_id, _ = item
+    rows = await _pn_list(uid)
+    if len(rows) >= PN_LIMIT:
+        await _db_exec("DELETE FROM publisher_nicks WHERE id = %s AND user_id = %s", (rows[-1][0], uid))
+    await _db_exec("INSERT INTO publisher_nicks (user_id, nick, nick_lower, rbx_id) VALUES (%s,%s,%s,%s) "
+                   "ON CONFLICT (user_id, nick_lower) DO UPDATE SET last_used = CURRENT_TIMESTAMP", (uid, nick, nick.lower(), rbx_id))
+    PN_PENDING.pop(token, None)
+    await call.message.edit_text(f"{ICON_CHECK} Ник <b>{html.escape(nick)}</b> сохранён, самый давний удалён.", parse_mode="HTML")
+    await call.answer()
+
+@router.callback_query(F.data.startswith("pn_no:"))
+async def pn_no_cb(call: CallbackQuery):
+    PN_PENDING.pop(call.data.split(":", 1)[1], None)
+    try: await call.message.delete()
+    except Exception: pass
+    await call.answer("Не сохраняю.")
+
+@router.callback_query(F.data.startswith("pn_del:"))
+async def pn_del_cb(call: CallbackQuery):
+    try:
+        _, kind, rid = call.data.split(":")
+        rid = int(rid)
+    except ValueError:
+        await call.answer(); return
+    await _db_exec("DELETE FROM publisher_nicks WHERE id = %s AND user_id = %s", (rid, call.from_user.id))
+    rows = await _pn_list(call.from_user.id)
+    try:
+        await call.message.edit_reply_markup(reply_markup=_pn_kb(rows, kind))
+    except Exception:
+        pass
+    await call.answer("Ник удалён из списка.")
+
+@router.callback_query(F.data.startswith("pn_use:"))
+async def pn_use_cb(call: CallbackQuery, state: FSMContext):
+    try:
+        _, kind, rid = call.data.split(":")
+        rid = int(rid)
+    except ValueError:
+        await call.answer(); return
+    cur = await state.get_state()
+    want = {"sab": SaboteurPublisherStates.waiting_for_nick.state, "farm": FarmPublisherStates.waiting_for_nick.state}.get(kind)
+    if cur != want:
+        await call.answer("Эта кнопка уже неактуальна. Начните публикацию заново.", show_alert=True)
+        return
+    row = await _db_one("SELECT nick, rbx_id FROM publisher_nicks WHERE id = %s AND user_id = %s", (rid, call.from_user.id))
+    if not row:
+        await call.answer("Ник уже удалён.", show_alert=True); return
+    await _db_exec("UPDATE publisher_nicks SET last_used = CURRENT_TIMESTAMP WHERE id = %s", (rid,))
+    await call.answer()
+    if kind == "sab":
+        await _sab_nick_accept(call.message, state, row[0], row[1])
+    else:
+        await _farm_nick_accept(call.message, state, row[0], row[1])
+
+# ----------------------------------------------------------------------
 # СИСТЕМА ПУБЛИКАЦИИ САБОТЕРА (ЖИВОЙ ПОСТ + ДИНАМИЧЕСКАЯ СКЛЕЙКА)
 # ----------------------------------------------------------------------
 @router.callback_query(F.data == "pub_send_saboteur")
@@ -5509,29 +5697,28 @@ async def pub_send_saboteur(call: CallbackQuery, state: FSMContext):
 
     await state.clear()
     await state.set_state(SaboteurPublisherStates.waiting_for_nick)
-    await call.message.answer("🕵️ <b>Поиск саботера</b>\n\n1. Введите ваш <b>ник в Roblox</b>:", parse_mode="HTML")
+    await _pn_prompt(call.message, call.from_user.id, "sab", "🕵️ <b>Поиск саботера</b>")
     await call.answer()
 
-@router.message(SaboteurPublisherStates.waiting_for_nick, F.text)
-async def saboteur_nick_proc(message: Message, state: FSMContext):
-    nick_input = message.text.strip()
-    rbx_info = await check_roblox_username(nick_input)
-    if rbx_info:
-        official_name = rbx_info["name"]
-        rbx_id = rbx_info["id"]
-        profile_str = f"<a href='https://www.roblox.com/users/{rbx_id}/profile'>{official_name}</a>"
-    else:
-        official_name = nick_input
-        profile_str = f"<code>{html.escape(nick_input)}</code>"
-
+async def _sab_nick_accept(msg: Message, state: FSMContext, official_name: str, rbx_id):
+    profile_str = _pn_profile(official_name, rbx_id)
     await state.update_data(sab_nick=profile_str, sab_raw_nick=official_name)
     await state.set_state(SaboteurPublisherStates.waiting_for_method)
-    await message.answer(
+    await msg.answer(
         f"{ICON_CHECK} Ник зафиксирован: {profile_str}\n\n"
         "2. Введите <b>метод поиска</b> (разрешены только цифры и символы <code>/ \\ | -</code>, например: <code>4/20</code> или <code>4/40</code>):",
         parse_mode="HTML",
         link_preview_options=LinkPreviewOptions(is_disabled=True)
     )
+
+@router.message(SaboteurPublisherStates.waiting_for_nick, F.text)
+async def saboteur_nick_proc(message: Message, state: FSMContext):
+    nick_input = message.text.strip()
+    rbx_info = await check_roblox_username(nick_input)
+    name = rbx_info["name"] if rbx_info else nick_input
+    rid = rbx_info["id"] if rbx_info else None
+    await _sab_nick_accept(message, state, name, rid)
+    await _pn_offer_save(message, message.from_user.id, name, rid)
 
 @router.message(SaboteurPublisherStates.waiting_for_method, F.text)
 async def saboteur_method_proc(message: Message, state: FSMContext):
@@ -6790,29 +6977,28 @@ async def pub_send_farm(call: CallbackQuery, state: FSMContext):
 
     await state.clear()
     await state.set_state(FarmPublisherStates.waiting_for_nick)
-    await call.message.answer("🌾 <b>Фарм сервер</b>\n\n1. Введите ваш <b>ник в Roblox</b>:", parse_mode="HTML")
+    await _pn_prompt(call.message, call.from_user.id, "farm", "🌾 <b>Фарм сервер</b>")
     await call.answer()
 
-@router.message(FarmPublisherStates.waiting_for_nick, F.text)
-async def farm_nick_proc(message: Message, state: FSMContext):
-    nick_input = message.text.strip()
-    rbx_info = await check_roblox_username(nick_input)
-    if rbx_info:
-        official_name = rbx_info["name"]
-        rbx_id = rbx_info["id"]
-        profile_str = f"<a href='https://www.roblox.com/users/{rbx_id}/profile'>{html.escape(official_name)}</a>"
-    else:
-        official_name = nick_input
-        profile_str = f"<code>{html.escape(nick_input)}</code>"
-
+async def _farm_nick_accept(msg: Message, state: FSMContext, official_name: str, rbx_id):
+    profile_str = _pn_profile(official_name, rbx_id)
     await state.update_data(farm_nick=profile_str, farm_raw_nick=official_name)
     await state.set_state(FarmPublisherStates.waiting_for_sections)
-    await message.answer(
+    await msg.answer(
         f"{ICON_CHECK} Ник зафиксирован: {profile_str}\n\n"
         "2. Введите <b>количество секций</b> (целое число, например: <code>25</code>):",
         parse_mode="HTML",
         link_preview_options=LinkPreviewOptions(is_disabled=True)
     )
+
+@router.message(FarmPublisherStates.waiting_for_nick, F.text)
+async def farm_nick_proc(message: Message, state: FSMContext):
+    nick_input = message.text.strip()
+    rbx_info = await check_roblox_username(nick_input)
+    name = rbx_info["name"] if rbx_info else nick_input
+    rid = rbx_info["id"] if rbx_info else None
+    await _farm_nick_accept(message, state, name, rid)
+    await _pn_offer_save(message, message.from_user.id, name, rid)
 
 @router.message(FarmPublisherStates.waiting_for_sections, F.text)
 async def farm_sections_proc(message: Message, state: FSMContext):
@@ -7903,6 +8089,7 @@ async def _shop_home_screen():
     else:
         text = "💎 <b>Платные услуги</b>\n\nВыберите услугу. Оплата в боте проходит через Telegram Stars ⭐."
         rows.append([IB(text="🎟 Ввести промокод", callback_data="shop_promo")])
+    rows.append([IB(text="💖 Поддержать проект", callback_data="donate_menu")])
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 @router.message(F.text.in_(btn_texts(BTN_SHOP)), F.chat.type == "private")
@@ -8073,6 +8260,16 @@ async def shop_addon_choice(call: CallbackQuery):
 @router.pre_checkout_query()
 async def shop_pre_checkout(q: PreCheckoutQuery):
     try:
+        if (q.invoice_payload or "").startswith("donate:") and q.currency == "XTR":
+            try:
+                want = int(q.invoice_payload.split(":")[1])
+            except (IndexError, ValueError):
+                want = -1
+            if want == int(q.total_amount) and DONATE_MIN <= want <= DONATE_MAX:
+                await q.answer(ok=True)
+            else:
+                await q.answer(ok=False, error_message="Сумма доната не совпадает. Откройте меню заново.")
+            return
         if not (q.invoice_payload or "").startswith("shop:") or q.currency != "XTR":
             await q.answer(ok=False, error_message="Неизвестный счёт.")
             return
@@ -8149,6 +8346,87 @@ async def grant_prelinks_days(uid: int, days) -> object:
     )
     return new_exp
 
+# ---------- «Спасибо проекту»: добровольные донаты Stars ----------
+DONATE_MIN, DONATE_MAX = 1, 10000
+DONATE_PRESETS = (5, 10, 15)
+
+def _donate_kb():
+    row = [IB(text=f"{n} ⭐", callback_data=f"don_{n}") for n in DONATE_PRESETS]
+    return InlineKeyboardMarkup(inline_keyboard=[row, [IB(text="✏️ Своя сумма", callback_data="donate_custom")],
+                                                 [IB(text="🔙 Назад", callback_data="shop_home")]])
+
+_DONATE_TEXT = ("💖 <b>Поддержать проект</b>\n\n"
+                "Это добровольный донат Telegram Stars: он ничего не покупает и не даёт доступа, это просто «спасибо» команде. "
+                "Выберите сумму или введите свою.")
+
+@router.callback_query(F.data == "donate_menu")
+async def donate_menu(call: CallbackQuery, state: FSMContext):
+    if await is_banned(call.from_user.id):
+        await call.answer(); return
+    await state.clear()
+    await call.message.edit_text(_DONATE_TEXT, reply_markup=_donate_kb(), parse_mode="HTML")
+    await call.answer()
+
+@router.message(Command("donate"), F.chat.type == "private")
+async def cmd_donate(message: Message, state: FSMContext):
+    if await is_banned(message.from_user.id): return
+    await state.clear()
+    await message.answer(_DONATE_TEXT, reply_markup=_donate_kb(), parse_mode="HTML")
+
+async def _send_donate_invoice(chat_id: int, amount: int):
+    await bot.send_invoice(
+        chat_id=chat_id, title="Поддержка проекта", description="Добровольный донат команде. Спасибо! 💖",
+        payload=f"donate:{amount}", currency="XTR", prices=[LabeledPrice(label="Донат", amount=amount)], provider_token="",
+    )
+
+@router.callback_query(F.data.regexp(r"^don_\d+$"))
+async def donate_preset(call: CallbackQuery):
+    if await is_banned(call.from_user.id):
+        await call.answer(); return
+    n = int(call.data.split("_")[1])
+    if n not in DONATE_PRESETS:
+        await call.answer(); return
+    await call.answer()
+    await _send_donate_invoice(call.message.chat.id, n)
+
+@router.callback_query(F.data == "donate_custom")
+async def donate_custom(call: CallbackQuery, state: FSMContext):
+    if await is_banned(call.from_user.id):
+        await call.answer(); return
+    await state.set_state(ShopUserStates.waiting_donate)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[IB(text="🔙 Отмена", callback_data="donate_menu")]])
+    await call.message.edit_text(f"✏️ Введите сумму в звёздах целым числом (от {DONATE_MIN} до {DONATE_MAX}).", reply_markup=kb, parse_mode="HTML")
+    await call.answer()
+
+@router.message(ShopUserStates.waiting_donate, F.text, F.chat.type == "private")
+async def donate_custom_amount(message: Message, state: FSMContext):
+    t = (message.text or "").strip().replace(" ", "")
+    if not re.fullmatch(r"\d{1,5}", t) or not (DONATE_MIN <= int(t) <= DONATE_MAX):
+        await message.answer(f"{ICON_CROSS} Нужно целое число от {DONATE_MIN} до {DONATE_MAX}. Попробуйте ещё раз:", parse_mode="HTML")
+        return
+    await state.clear()
+    await _send_donate_invoice(message.chat.id, int(t))
+
+async def _process_donation(message: Message, sp, is_test: bool):
+    user = message.from_user
+    charge_id = sp.telegram_payment_charge_id
+    try:
+        row = await _db_exec(
+            "INSERT INTO shop_payments (user_id, service_id, tariff_id, service_title, tariff_label, stars, charge_id, status, kind) "
+            "VALUES (%s, NULL, NULL, %s, %s, %s, %s, %s, 'donation') ON CONFLICT (charge_id) DO NOTHING RETURNING id",
+            (user.id, "Поддержка проекта", "Донат", sp.total_amount, charge_id, "test" if is_test else "paid"))
+    except Exception as e:
+        logging.error(f"Не удалось записать донат {charge_id}: {e}")
+        await notify_admins_payment(f"🚨 <b>Донат не записался в базу!</b>\n{get_user_mention(user)} (<code>{user.id}</code>), {sp.total_amount} ⭐\n"
+                                    f"Платёж: <code>{html.escape(charge_id)}</code>")
+        await message.answer("💖 Спасибо за поддержку!", parse_mode="HTML")
+        return
+    if not row:
+        return
+    await message.answer(f"💖 <b>Спасибо за поддержку!</b>\nВаш донат: <b>{sp.total_amount} ⭐</b>. Нам очень приятно.", parse_mode="HTML")
+    who = f"{get_user_mention(user)}" + (f" (@{user.username})" if user.username else "") + f", ID <code>{user.id}</code>"
+    await notify_admins_payment(f"💖 <b>{'🧪 ТЕСТ. ' if is_test else ''}Донат</b>\n{who}\nСумма: <b>{sp.total_amount} ⭐</b>\nПлатёж: <code>{html.escape(charge_id)}</code>")
+
 @router.message(F.successful_payment)
 async def shop_successful_payment(message: Message):
     await _process_shop_payment(message, message.successful_payment, False)
@@ -8157,6 +8435,9 @@ async def _process_shop_payment(message: Message, sp, is_test: bool):
     tag = "🧪 ТЕСТ. " if is_test else ""
     user = message.from_user
     payload = sp.invoice_payload or ""
+    if payload.startswith("donate:"):
+        await _process_donation(message, sp, is_test)
+        return
     charge_id = sp.telegram_payment_charge_id
     addon_flag = False
     promo_id = 0
@@ -10731,6 +11012,8 @@ async def user_private_message(message: Message, state: FSMContext):
     active_ticket = await get_active_ticket(message.from_user.id)
     if active_ticket and active_ticket[2] == 'active':
         await touch_ticket(active_ticket[0], actor='user')
+        await tlog(active_ticket[0], "user", message.from_user.id, message.text or message.caption or "",
+                   media=("photo" if message.photo else ("media" if not message.text else "")))
         user_mention = get_user_mention(message.from_user)
         text_to_group = f"📩 <b>Сообщение по заявке №{active_ticket[0]} от {user_mention} | ID: <code>{message.from_user.id}</code>:</b>\n\n{html.escape(message.text or message.caption or '')}"
         
@@ -11609,6 +11892,7 @@ async def handle_admin_group_messages(message: Message):
                 agent_no = await get_or_create_agent_number(message.from_user.id)
                 await close_ticket_db(pending_ticket_id, 'rejected', admin_id=message.from_user.id)
                 await alog(message.from_user.id, "ticket_reject", f"№{pending_ticket_id}", text or "Без причины")
+                await tlog(pending_ticket_id, "admin", message.from_user.id, f"Причина отказа: {text or 'Без причины'}")
 
                 try:
                     user_kb = await main_keyboard(ticket_info[0])
@@ -11682,6 +11966,7 @@ async def handle_admin_group_messages(message: Message):
                         await bot.send_message(user_id, client_text, parse_mode="HTML", reply_markup=solved_kb(ticket_id))
                     await message.react([{"type": "emoji", "emoji": "👍"}])
                     await map_message(message.message_id, user_id, ticket_id)
+                    await tlog(ticket_id, "admin", message.from_user.id, text or "", media=("photo" if message.photo else ""))
                 except Exception as e:
                     await message.answer(f"❌ Ошибка отправки: {e}")
 
@@ -11871,6 +12156,296 @@ async def health_watchdog_worker():
         except Exception as e:
             logging.error(f"Ошибка в health_watchdog_worker: {e}", exc_info=True)
         await asyncio.sleep(60)
+
+# ----------------------------------------------------------------------
+# СЛЕЖЕНИЕ ЗА ОБНОВЛЕНИЯМИ TOWER OF HELL (оповещение стаффа в теме «Секретки», в канал не пишет)
+# ----------------------------------------------------------------------
+TOH_PLACE_ID = 1962086868
+_TOH_UNIVERSE = {"id": None}
+TOH_LIVE = {"playing": None, "visits": None, "updated": "", "checked": 0.0}
+
+async def toh_fetch_info() -> dict | None:
+    """Публичный API Roblox: дата обновления игры, онлайн, посещения."""
+    try:
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            if not _TOH_UNIVERSE["id"]:
+                async with session.get(f"https://apis.roblox.com/universes/v1/places/{TOH_PLACE_ID}/universe") as r:
+                    if r.status != 200:
+                        return None
+                    _TOH_UNIVERSE["id"] = (await r.json()).get("universeId")
+            async with session.get("https://games.roblox.com/v1/games", params={"universeIds": _TOH_UNIVERSE["id"]}) as r:
+                if r.status != 200:
+                    return None
+                data = (await r.json()).get("data") or []
+                if not data:
+                    return None
+                g = data[0]
+                return {"updated": g.get("updated") or "", "playing": g.get("playing"), "visits": g.get("visits")}
+    except Exception as e:
+        logging.info(f"Roblox API (Tower of Hell) недоступен: {e}")
+        return None
+
+def _toh_fmt_date(iso: str) -> str:
+    try:
+        d = datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(MSK_TZ)
+        return d.strftime("%d.%m.%Y %H:%M МСК")
+    except Exception:
+        return iso
+
+async def toh_check_once() -> str:
+    """Один проход. Возвращает 'first' / 'same' / 'changed' / 'error'."""
+    info = await toh_fetch_info()
+    if not info or not info["updated"]:
+        return "error"
+    TOH_LIVE.update(playing=info["playing"], visits=info["visits"], updated=info["updated"], checked=time.time())
+    last = (await get_setting("toh_last_updated", "")) or ""
+    if not last:
+        await set_setting("toh_last_updated", info["updated"])
+        return "first"       # первое значение запоминаем, оповещения нет
+    if last == info["updated"]:
+        return "same"
+    await set_setting("toh_last_updated", info["updated"])
+    await call_staff(
+        "🛠 <b>Tower of Hell обновился!</b>\n"
+        f"Дата обновления в Roblox: <b>{_toh_fmt_date(info['updated'])}</b>.\n"
+        "Секретки могут вести себя иначе, проверьте перед публикацией."
+    )
+    await alog(None, "toh_update", "tower_of_hell", info["updated"])
+    return "changed"
+
+async def toh_watch_worker():
+    logging.info("Воркер слежения за обновлением Tower of Hell запущен.")
+    await asyncio.sleep(75)
+    while True:
+        try:
+            if (await get_setting("toh_watch", "true")) == "true":
+                await toh_check_once()
+        except Exception as err:
+            logging.error(f"Ошибка в toh_watch_worker: {err}", exc_info=True)
+        await asyncio.sleep(300)
+
+@router.message(Command("tohwatch"), F.chat.type == "private")
+async def cmd_tohwatch(message: Message):
+    """/tohwatch — статус; /tohwatch on|off — включить или выключить оповещения об обновлении игры."""
+    if not await is_main_admin(message.from_user.id):
+        return
+    parts = (message.text or "").split()
+    if len(parts) > 1 and parts[1].lower() in ("on", "off"):
+        await set_setting("toh_watch", "true" if parts[1].lower() == "on" else "false")
+        await alog(message.from_user.id, "toh_watch", "", parts[1].lower())
+    on = (await get_setting("toh_watch", "true")) == "true"
+    last = (await get_setting("toh_last_updated", "")) or ""
+    await message.answer(
+        "🛠 <b>Слежение за обновлением Tower of Hell</b>\n"
+        f"Состояние: <b>{'включено' if on else 'выключено'}</b>\n"
+        f"Последнее известное обновление игры: <b>{_toh_fmt_date(last) if last else 'ещё не определено'}</b>\n\n"
+        "Выключить/включить: <code>/tohwatch off</code> / <code>/tohwatch on</code>",
+        parse_mode="HTML")
+
+# ----------------------------------------------------------------------
+# АНАЛИТИКА КАНАЛА (через юзербота): подписчики, просмотры, лучшие часы
+# ----------------------------------------------------------------------
+_CHAN_CACHE = {"ts": 0.0, "data": None}
+_DOW = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
+
+async def _chan_subs_now() -> int | None:
+    full = await _ub_request("channel_stats subs", lambda: userbot(GetFullChannelRequest(SUB_CHANNEL)))
+    return getattr(full.full_chat, "participants_count", None)
+
+async def _chan_snapshot():
+    """Раз в сутки (по МСК) записывает число подписчиков для графика роста."""
+    if not userbot:
+        return
+    today = datetime.now(MSK_TZ).date()
+    if await _db_one("SELECT 1 FROM channel_stats WHERE day = %s", (today,)):
+        return
+    n = await _chan_subs_now()
+    if n:
+        await _db_exec("INSERT INTO channel_stats (day, subs) VALUES (%s,%s) ON CONFLICT (day) DO UPDATE SET subs = EXCLUDED.subs", (today, int(n)))
+
+async def channel_stats_worker():
+    logging.info("Воркер аналитики канала запущен.")
+    await asyncio.sleep(120)
+    while True:
+        try:
+            await _chan_snapshot()
+        except Exception as err:
+            logging.warning(f"Аналитика канала: снимок не записан: {err}")
+        await asyncio.sleep(3600)
+
+async def channel_analytics(force: bool = False) -> dict:
+    """Собирает сводку по каналу. Кэш 10 минут. Всегда возвращает словарь; при сбое там ключ 'error'."""
+    now = time.time()
+    if not force and _CHAN_CACHE["data"] and now - _CHAN_CACHE["ts"] < 600:
+        return _CHAN_CACHE["data"]
+    if not userbot:
+        return {"error": "Юзербот не настроен: аналитика недоступна."}
+    try:
+        msgs = await _ub_request("channel_stats posts", lambda: userbot.get_messages(SUB_CHANNEL, limit=200))
+        subs = await _chan_subs_now()
+        if subs:
+            await _db_exec("INSERT INTO channel_stats (day, subs) VALUES (%s,%s) ON CONFLICT (day) DO UPDATE SET subs = EXCLUDED.subs",
+                           (datetime.now(MSK_TZ).date(), int(subs)))
+    except Exception as e:
+        return {"error": f"Не удалось получить данные канала: {type(e).__name__}: {e}"}
+    posts = [m for m in msgs if getattr(m, "views", None) is not None and m.date]
+    now_dt = datetime.now(timezone.utc)
+    d30 = [m for m in posts if (now_dt - m.date).days < 30]
+    d7 = [m for m in posts if (now_dt - m.date).days < 7]
+    def avg(lst, attr):
+        vals = [getattr(m, attr) or 0 for m in lst]
+        return round(sum(vals) / len(vals)) if vals else 0
+    # лучшие часы/дни: берём посты старше суток, чтобы свежие с малыми просмотрами не занижали средние
+    mature = [m for m in posts if (now_dt - m.date).total_seconds() > 86400 and (now_dt - m.date).days < 90]
+    by_h, by_d = {}, {}
+    for m in mature:
+        loc = m.date.astimezone(MSK_TZ)
+        by_h.setdefault(loc.hour, []).append(m.views or 0)
+        by_d.setdefault(loc.weekday(), []).append(m.views or 0)
+    best_hours = sorted(((h, round(sum(v) / len(v)), len(v)) for h, v in by_h.items() if len(v) >= 2), key=lambda x: -x[1])[:3]
+    best_days = sorted(((_DOW[d], round(sum(v) / len(v)), len(v)) for d, v in by_d.items() if len(v) >= 2), key=lambda x: -x[1])[:3]
+    top = sorted(d30, key=lambda m: -(m.views or 0))[:3]
+    uname = SUB_CHANNEL.lstrip("@")
+    top_posts = [{"id": m.id, "views": m.views or 0, "forwards": m.forwards or 0,
+                  "date": m.date.astimezone(MSK_TZ).strftime("%d.%m %H:%M"), "url": f"https://t.me/{uname}/{m.id}"} for m in top]
+    # рост по снимкам
+    growth = {}
+    rows = await _db_all("SELECT day, subs FROM channel_stats ORDER BY day DESC LIMIT 40")
+    if subs and rows:
+        today = datetime.now(MSK_TZ).date()
+        for days in (1, 7, 30):
+            target = today - timedelta(days=days)
+            older = [r for r in rows if r[0] <= target]
+            if older:
+                growth[days] = int(subs) - int(older[0][1])
+    data = {"subs": subs, "growth": growth, "posts_30": len(d30), "posts_7": len(d7),
+            "avg_views_30": avg(d30, "views"), "avg_fwd_30": avg(d30, "forwards"),
+            "best_hours": best_hours, "best_days": best_days, "top": top_posts,
+            "snap_days": len(rows), "updated": datetime.now(MSK_TZ).strftime("%d.%m %H:%M МСК")}
+    _CHAN_CACHE.update(ts=now, data=data)
+    return data
+
+def _chan_text(d: dict) -> str:
+    if d.get("error"):
+        return f"📈 <b>Аналитика канала</b>\n\n{ICON_CROSS} {html.escape(d['error'])}"
+    def sg(n): return f"{n:+d}"
+    L = [f"📈 <b>Аналитика канала {html.escape(SUB_CHANNEL)}</b>", ""]
+    L.append(f"👥 Подписчиков: <b>{d['subs'] if d['subs'] is not None else '—'}</b>")
+    if d["growth"]:
+        L.append("Рост: " + ", ".join(f"за {k} дн. <b>{sg(v)}</b>" for k, v in sorted(d["growth"].items())))
+    else:
+        L.append("Рост: данных пока мало, снимок делается раз в сутки.")
+    L.append("")
+    L.append(f"📝 Постов за 7 дней: <b>{d['posts_7']}</b>, за 30 дней: <b>{d['posts_30']}</b>")
+    L.append(f"👁 Средние просмотры (30 дн.): <b>{d['avg_views_30']}</b>, пересылки: <b>{d['avg_fwd_30']}</b>")
+    if d["best_hours"]:
+        L.append("")
+        L.append("🕒 <b>Лучшие часы публикации (МСК):</b>")
+        for h, v, n in d["best_hours"]:
+            L.append(f"• {h:02d}:00 — в среднем {v} просмотров ({n} постов)")
+    if d["best_days"]:
+        L.append("📅 Лучшие дни: " + ", ".join(f"{n} ({v})" for n, v, _ in d["best_days"]))
+    if d["top"]:
+        L.append("")
+        L.append("🏆 <b>Лучшие посты за 30 дней:</b>")
+        for t in d["top"]:
+            L.append(f'• <a href="{t["url"]}">{t["date"]}</a>: {t["views"]} просмотров, {t["forwards"]} пересылок')
+    L.append("")
+    L.append(f"<i>Обновлено: {d['updated']}</i>")
+    return "\n".join(L)
+
+@router.callback_query(F.data.in_({"adm_chan_stats", "adm_chan_stats_refresh"}))
+async def adm_chan_stats(call: CallbackQuery):
+    if not await is_main_admin(call.from_user.id):
+        await call.answer("❌ Нет доступа", show_alert=True)
+        return
+    await call.answer("Собираю данные…")
+    d = await channel_analytics(force=(call.data == "adm_chan_stats_refresh"))
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [IB(text="🔄 Обновить", callback_data="adm_chan_stats_refresh")],
+        [IB(text="🔙 Назад", callback_data="back_to_adm")]])
+    try:
+        await call.message.edit_text(_chan_text(d), reply_markup=kb, parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
+    except Exception as e:
+        logging.info(f"Аналитика канала: сообщение не обновлено ({e})")
+
+# ----------------------------------------------------------------------
+# ПРАЗДНИЧНЫЙ РЕЖИМ (Хэллоуин и другие даты): оформление сайта и строка в приветствии бота
+# ----------------------------------------------------------------------
+EVENTS = {
+    "halloween": {"title": "Хэллоуин", "icon": "🎃",
+                  "line": "🎃 <b>Хэллоуин в Tower of Secrets!</b> Ищите праздничные акции в «Платных услугах»."},
+    "newyear": {"title": "Новый год", "icon": "🎄",
+                "line": "🎄 <b>С наступающим Новым годом!</b> Ищите праздничные акции в «Платных услугах»."},
+}
+_EVENT_CACHE = {"t": 0.0, "name": ""}
+
+async def current_event() -> str:
+    """Имя активного праздничного режима или ''. Сам выключается по истечении срока. Кэш 20 с."""
+    now = time.time()
+    if now - _EVENT_CACHE["t"] < 20:
+        return _EVENT_CACHE["name"]
+    name = ""
+    try:
+        mode = (await get_setting("event_mode", "")) or ""
+        if mode in EVENTS:
+            until = float((await get_setting("event_until", "0")) or 0)
+            if until and now > until:
+                await set_setting("event_mode", "")
+                logging.info(f"Праздничный режим «{mode}» закончился по сроку и выключен.")
+            else:
+                name = mode
+    except Exception as e:
+        logging.warning(f"Праздничный режим: не удалось прочитать настройки: {e}")
+        name = _EVENT_CACHE["name"]
+    _EVENT_CACHE.update(t=now, name=name)
+    return name
+
+async def _event_line() -> str:
+    ev = await current_event()
+    return ("\n\n" + EVENTS[ev]["line"]) if ev else ""
+
+@router.message(Command("event"), F.chat.type == "private")
+async def cmd_event(message: Message):
+    """/event — статус; /event halloween [дней] | newyear [дней] — включить (по умолчанию на 7 дней); /event off — выключить."""
+    if not await is_main_admin(message.from_user.id):
+        return
+    parts = (message.text or "").split()[1:]
+    note = ""
+    if parts:
+        arg = parts[0].lower()
+        if arg in ("off", "stop"):
+            await set_setting("event_mode", "")
+            await alog(message.from_user.id, "event", "", "off")
+            note = "Праздничный режим выключен.\n\n"
+        elif arg in EVENTS:
+            days = 7
+            if len(parts) > 1 and parts[1].isdigit() and 1 <= int(parts[1]) <= 60:
+                days = int(parts[1])
+            await set_setting("event_mode", arg)
+            await set_setting("event_until", str(time.time() + days * 86400))
+            await alog(message.from_user.id, "event", arg, f"{days} дн.")
+            note = f"Включено: {EVENTS[arg]['icon']} {EVENTS[arg]['title']} на {days} дн.\n\n"
+        else:
+            note = f"{ICON_CROSS} Неизвестный режим.\n\n"
+        _EVENT_CACHE["t"] = 0.0
+        _SITE_FLAGS["t"] = 0.0
+    ev = await current_event()
+    status = f"{EVENTS[ev]['icon']} включён: <b>{EVENTS[ev]['title']}</b>" if ev else "выключен"
+    until = ""
+    if ev:
+        try:
+            until = ", до " + datetime.fromtimestamp(float(await get_setting("event_until", "0")), MSK_TZ).strftime("%d.%m.%Y %H:%M МСК")
+        except Exception:
+            pass
+    await message.answer(
+        f"{note}🎭 <b>Праздничный режим:</b> {status}{until}\n\n"
+        "Меняет оформление сайта (цвета, баннер, значок) и добавляет строку в приветствие бота. Выключается сам по сроку.\n"
+        "<code>/event halloween</code> — на 7 дней, <code>/event halloween 3</code> — на 3 дня\n"
+        "<code>/event newyear</code>, <code>/event off</code>\n\n"
+        "Праздничный промокод создаётся как обычно: «Платные услуги → Промокоды».",
+        parse_mode="HTML")
 
 @router.message(Command("monitor"), F.chat.type == "private")
 async def cmd_monitor(message: Message):
@@ -12393,7 +12968,8 @@ async def _site_flags() -> dict:
     try:
         helpers = (await get_setting("helper_recruitment", "true")) == "true"
         seekers = (await get_setting("secret_recruitment", "true")) == "true"
-        data = {"recruit": {"helpers": helpers, "seekers": seekers}, "ref": bool(_REF_CFG.get("ref"))}
+        data = {"recruit": {"helpers": helpers, "seekers": seekers}, "ref": bool(_REF_CFG.get("ref")),
+                "event": await current_event()}
         _SITE_FLAGS.update(t=now, data=data)
         return data
     except Exception as e:
@@ -12971,6 +13547,291 @@ async def handle_faq_votes(request):
     return web.json_response({"mine": mine}, headers=_NOSTORE)
 
 # ---------- журнал действий команды: только для главных админов ----------
+# ----------------------------------------------------------------------
+# АДМИНКА НА САЙТЕ (/admin): только главные админы. Права проверяются при КАЖДОМ запросе.
+# ----------------------------------------------------------------------
+_ADM_RATE: Dict[str, list] = {}
+_ADM_WRITE_RATE: Dict[str, list] = {}
+
+def _jerr(code: int, err: str, **extra):
+    return web.json_response({"error": err, **extra}, status=code, headers=_NOSTORE)
+
+async def _adm_auth(request, write: bool = False):
+    """Возвращает (uid, None) или (None, готовый ответ с ошибкой)."""
+    sess = _sess_from_request(request)
+    if not sess:
+        return None, _jerr(401, "auth")
+    if not await is_main_admin(sess["uid"]):
+        return None, _jerr(403, "forbidden")
+    if not _hit(_ADM_RATE, str(sess["uid"]), 240, 60):
+        return None, _jerr(429, "rate")
+    if write:
+        # защита от чужих сайтов: такой заголовок браузер не отправит на чужой домен без нашего разрешения
+        if request.headers.get("X-Requested-With") != "tos":
+            return None, _jerr(403, "csrf")
+        if not _hit(_ADM_WRITE_RATE, str(sess["uid"]), 30, 60):
+            return None, _jerr(429, "rate")
+    return sess["uid"], None
+
+def _plain_card(t) -> str:
+    return html.unescape(re.sub(r"<[^>]+>", "", t or "")).strip()
+
+_CAT_NAMES = {"complaint": "Жалоба", "appeal": "Обжалование", "question": "Вопрос", "friends": "Друзья", "general": "Заявка"}
+
+async def handle_adm_overview(request):
+    uid, err = await _adm_auth(request)
+    if err: return err
+    out = dict(await _site_admin_stats())
+    out["flags"] = {
+        "paused": bool(PUBLISH_PAUSED), "paused_since": int(PUBLISH_PAUSED_SINCE or 0),
+        "maintenance": bool(MAINTENANCE_ON), "test_mode": bool(TEST_MODE_ON),
+        "helpers_open": (await get_setting("helper_recruitment", "true")) == "true",
+        "seekers_open": (await get_setting("secret_recruitment", "true")) == "true",
+        "event": await current_event(),
+        "toh": {"updated": (await get_setting("toh_last_updated", "")) or "", "playing": TOH_LIVE.get("playing")},
+    }
+    out["me"] = {"id": uid, "owner": bool(OWNER_ID and uid == OWNER_ID)}
+    return web.json_response(out, headers=_NOSTORE)
+
+async def handle_adm_tickets(request):
+    uid, err = await _adm_auth(request)
+    if err: return err
+    q = request.query
+    where, params = [], []
+    st = q.get("status", "")
+    if st in ("pending", "active", "closed", "rejected"):
+        where.append("t.status = %s"); params.append(st)
+    elif st == "open":
+        where.append("t.status IN ('pending','active')")
+    cat = q.get("cat", "")
+    if cat in _CAT_NAMES:
+        where.append("t.category = %s"); params.append(cat)
+    adm = q.get("admin", "")
+    if adm.isdigit():
+        where.append("t.admin_id = %s"); params.append(int(adm))
+    before = q.get("before", "")
+    if before.isdigit():
+        where.append("t.ticket_id < %s"); params.append(int(before))
+    term = (q.get("q", "") or "").strip()[:80]
+    if term:
+        if term.lstrip("№#").isdigit():
+            n = int(term.lstrip("№#"))
+            where.append("(t.ticket_id = %s OR t.user_id = %s)"); params += [n, n]
+        else:
+            like = "%" + term.lstrip("@").replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+            where.append("(u.username ILIKE %s OR t.card_text ILIKE %s OR EXISTS (SELECT 1 FROM ticket_messages m WHERE m.ticket_id = t.ticket_id AND m.text ILIKE %s))")
+            params += [like, like, like]
+    try:
+        rows = await _db_all(
+            "SELECT t.ticket_id, t.user_id, u.username, t.status, t.category, t.admin_id, a.agent_number, "
+            "EXTRACT(EPOCH FROM t.created_at), EXTRACT(EPOCH FROM t.updated_at), r.score, "
+            "(SELECT COUNT(*) FROM ticket_messages m WHERE m.ticket_id = t.ticket_id AND m.sender <> 'system') "
+            "FROM tickets t LEFT JOIN users u ON u.user_id = t.user_id LEFT JOIN admin_agents a ON a.admin_id = t.admin_id "
+            "LEFT JOIN ratings r ON r.ticket_id = t.ticket_id"
+            + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY t.ticket_id DESC LIMIT 31", tuple(params))
+    except Exception as e:
+        logging.warning(f"/api/admin/tickets: {e}")
+        return _jerr(503, "db")
+    items = [{"id": int(r[0]), "user": int(r[1]) if r[1] else None, "uname": r[2] or "", "status": r[3], "cat": _CAT_NAMES.get(r[4], str(r[4] or "")),
+              "admin": int(r[5]) if r[5] else None, "agent": r[6], "created": int(r[7] or 0), "updated": int(r[8] or 0),
+              "score": r[9], "msgs": int(r[10] or 0)} for r in rows[:30]]
+    return web.json_response({"items": items, "more": len(rows) > 30}, headers=_NOSTORE)
+
+async def handle_adm_ticket(request):
+    uid, err = await _adm_auth(request)
+    if err: return err
+    tid = request.match_info.get("id", "")
+    if not tid.isdigit():
+        return _jerr(404, "not_found")
+    tid = int(tid)
+    t = await _db_one(
+        "SELECT t.ticket_id, t.user_id, u.username, t.status, t.category, t.admin_id, a.agent_number, "
+        "EXTRACT(EPOCH FROM t.created_at), EXTRACT(EPOCH FROM t.updated_at), t.card_text, t.link_msg_id, t.card_msg_id "
+        "FROM tickets t LEFT JOIN users u ON u.user_id = t.user_id LEFT JOIN admin_agents a ON a.admin_id = t.admin_id WHERE t.ticket_id = %s", (tid,))
+    if not t:
+        return _jerr(404, "not_found")
+    rt = await _db_one("SELECT score, review FROM ratings WHERE ticket_id = %s", (tid,))
+    msgs = await _db_all(
+        "SELECT sender, sender_id, text, media, via, EXTRACT(EPOCH FROM created_at) FROM ticket_messages WHERE ticket_id = %s ORDER BY id LIMIT 500", (tid,))
+    targets = await _db_all("SELECT nick FROM complaint_targets WHERE ticket_id = %s ORDER BY id", (tid,))
+    names = {}
+    for sid in {m[1] for m in msgs if m[0] == "admin" and m[1]} | ({t[5]} if t[5] else set()):
+        names[int(sid)] = await _plain_name(int(sid))
+    timeline = []
+    for sender, sid, text, media, via, ts in msgs:
+        if sender == "system":
+            label = {"closed": "Обращение закрыто", "rejected": "Обращение отклонено"}.get(text, text)
+            timeline.append({"kind": "system", "text": label, "at": int(ts), "who": names.get(int(sid), "") if sid else ""})
+        else:
+            timeline.append({"kind": sender, "text": text or "", "media": media or "", "via": via, "at": int(ts),
+                             "who": names.get(int(sid), "") if (sender == "admin" and sid) else ""})
+    link = _ticket_url(t[10] or t[11])
+    out = {
+        "id": int(t[0]), "user": int(t[1]) if t[1] else None, "uname": t[2] or "", "status": t[3], "cat": _CAT_NAMES.get(t[4], str(t[4] or "")),
+        "admin": int(t[5]) if t[5] else None, "admin_name": names.get(int(t[5]), "") if t[5] else "", "agent": t[6],
+        "created": int(t[7] or 0), "updated": int(t[8] or 0), "card": _plain_card(t[9])[:3500], "link": link,
+        "score": rt[0] if rt else None, "review": (rt[1] or "") if rt else "",
+        "targets": [r[0] for r in targets][:10], "messages": timeline,
+        "logged": bool(msgs),
+    }
+    return web.json_response(out, headers=_NOSTORE)
+
+async def handle_adm_helpers(request):
+    uid, err = await _adm_auth(request)
+    if err: return err
+    days = request.query.get("days", "30")
+    cond = ""
+    if days.isdigit() and 0 < int(days) <= 365:
+        cond = f" AND t.updated_at >= CURRENT_TIMESTAMP - INTERVAL '{int(days)} days'"
+    try:
+        rows = await _db_all(
+            "SELECT t.admin_id, a.agent_number, COUNT(*) FILTER (WHERE t.status = 'closed'), COUNT(*) FILTER (WHERE t.status = 'rejected'), "
+            "COUNT(*) FILTER (WHERE t.status = 'active'), AVG(r.score), COUNT(r.score) "
+            "FROM tickets t LEFT JOIN admin_agents a ON a.admin_id = t.admin_id LEFT JOIN ratings r ON r.ticket_id = t.ticket_id "
+            "WHERE t.admin_id IS NOT NULL" + cond + " GROUP BY t.admin_id, a.agent_number ORDER BY 3 DESC, 1 LIMIT 100")
+        fr = dict(await _db_all(
+            "SELECT t.admin_id, AVG(EXTRACT(EPOCH FROM (m.ts - t.created_at))) FROM tickets t "
+            "JOIN (SELECT ticket_id, MIN(created_at) ts FROM ticket_messages WHERE sender = 'admin' GROUP BY ticket_id) m ON m.ticket_id = t.ticket_id "
+            "WHERE t.admin_id IS NOT NULL" + cond + " GROUP BY t.admin_id"))
+    except Exception as e:
+        logging.warning(f"/api/admin/helpers: {e}")
+        return _jerr(503, "db")
+    items = []
+    for aid, agent, closed, rej, act, avg_sc, rated in rows:
+        items.append({"id": int(aid), "name": await _plain_name(int(aid)), "agent": agent, "closed": int(closed), "rejected": int(rej),
+                      "active": int(act), "avg": round(float(avg_sc), 2) if avg_sc is not None else None, "rated": int(rated),
+                      "first_reply_min": round(float(fr[aid]) / 60, 1) if fr.get(aid) is not None else None})
+    return web.json_response({"items": items}, headers=_NOSTORE)
+
+async def _read_json(request) -> dict:
+    try:
+        d = await request.json()
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+async def handle_adm_reply(request):
+    uid, err = await _adm_auth(request, write=True)
+    if err: return err
+    tid = request.match_info.get("id", "")
+    body = await _read_json(request)
+    text = str(body.get("text", "")).strip()
+    if not tid.isdigit() or not (1 <= len(text) <= 3500):
+        return _jerr(400, "bad_request")
+    tid = int(tid)
+    info = await get_ticket_info(tid)
+    if not info:
+        return _jerr(404, "not_found")
+    if info[2] != "active":
+        return _jerr(409, "not_active")
+    agent_no = await get_or_create_agent_number(uid)
+    try:
+        await bot.send_message(info[0], f"👨‍💻 <b>Ответ поддержки (Агент #{agent_no}):</b>\n\n{html.escape(text)}",
+                               parse_mode="HTML", reply_markup=solved_kb(tid))
+    except Exception as e:
+        logging.warning(f"Админка: не удалось отправить ответ по №{tid}: {e}")
+        return _jerr(502, "send_failed", detail=type(e).__name__)
+    await touch_ticket(tid, actor="admin")
+    await tlog(tid, "admin", uid, text, via="site")
+    await alog(uid, "ticket_reply_web", f"№{tid}", text[:200])
+    try:   # копия в тему поддержки, чтобы хелперы в группе видели ответ; на неё можно отвечать как на обычное сообщение
+        sent = await bot.send_message(ADMIN_CHAT_ID, f"🌐 <b>Ответ с сайта по заявке №{tid}</b> (Агент #{agent_no}):\n\n{html.escape(text)}",
+                                      message_thread_id=TOPIC_SUPPORT_ID, parse_mode="HTML")
+        await map_message(sent.message_id, info[0], tid)
+    except Exception as e:
+        logging.info(f"Админка: копия ответа в группу не отправлена: {e}")
+    return web.json_response({"ok": True}, headers=_NOSTORE)
+
+async def handle_adm_close(request):
+    uid, err = await _adm_auth(request, write=True)
+    if err: return err
+    tid = request.match_info.get("id", "")
+    if not tid.isdigit():
+        return _jerr(404, "not_found")
+    tid = int(tid)
+    info = await get_ticket_info(tid)
+    if not info:
+        return _jerr(404, "not_found")
+    if info[2] != "active":
+        return _jerr(409, "not_active")
+    agent_no = await get_or_create_agent_number(uid)
+    await close_ticket_db(tid, status="closed", admin_id=info[1] or uid)   # заслуга остаётся у хелпера, который вёл обращение
+    await alog(uid, "ticket_close", f"№{tid}", "с сайта")
+    try:
+        await bot.send_message(info[0], f"{ICON_LOCK} Ваша заявка <b>№{tid}</b> закрыта поддержкой.\nОцените качество обслуживания:",
+                               parse_mode="HTML", reply_markup=rating_kb(tid))
+    except Exception:
+        pass
+    await mark_ticket_card_closed(tid, f"🔒 <b>Заявка №{tid} закрыта</b> главным админом через сайт (Агент #{agent_no}).")
+    return web.json_response({"ok": True}, headers=_NOSTORE)
+
+async def handle_adm_pause(request):
+    global PUBLISH_PAUSED, PUBLISH_PAUSED_SINCE
+    uid, err = await _adm_auth(request, write=True)
+    if err: return err
+    body = await _read_json(request)
+    if not isinstance(body.get("on"), bool):
+        return _jerr(400, "bad_request")
+    new_state = body["on"]
+    since = time.time() if new_state else 0.0
+    try:
+        await set_setting("publish_paused", "true" if new_state else "false")
+        await set_setting("publish_paused_since", str(int(since)))
+    except Exception as e:
+        logging.error(f"Админка: не удалось сохранить паузу публикаций: {e}")
+        return _jerr(503, "db")
+    PUBLISH_PAUSED, PUBLISH_PAUSED_SINCE = new_state, since
+    _PAUSE_REMIND["t"] = 0.0
+    await alog(uid, "publish_pause", "", ("остановлены" if new_state else "возобновлены") + " (сайт)")
+    from types import SimpleNamespace   # то, что нужно _notify_pause_change: id и full_name
+    spawn(_notify_pause_change(SimpleNamespace(id=uid, full_name=await _plain_name(uid)), new_state))
+    return web.json_response({"ok": True, "paused": new_state}, headers=_NOSTORE)
+
+async def handle_adm_recruit(request):
+    uid, err = await _adm_auth(request, write=True)
+    if err: return err
+    body = await _read_json(request)
+    kind, op = body.get("kind"), body.get("open")
+    if kind not in ("helper", "secret") or not isinstance(op, bool):
+        return _jerr(400, "bad_request")
+    key = "helper_recruitment" if kind == "helper" else "secret_recruitment"
+    await set_setting(key, "true" if op else "false")
+    if op and kind == "secret":
+        try:
+            ep = int((await get_setting("secret_recruit_epoch", "0")) or 0)
+        except ValueError:
+            ep = 0
+        await set_setting("secret_recruit_epoch", str(ep + 1))
+    if op:
+        spawn(notify_recruit_open(kind, uid))
+    await alog(uid, "recruit_helper" if kind == "helper" else "recruit_secret", "", ("открыт" if op else "закрыт") + " (сайт)")
+    _SITE_FLAGS["t"] = 0.0
+    return web.json_response({"ok": True}, headers=_NOSTORE)
+
+async def handle_adm_event(request):
+    uid, err = await _adm_auth(request, write=True)
+    if err: return err
+    body = await _read_json(request)
+    mode = str(body.get("mode", ""))
+    if mode and mode not in EVENTS:
+        return _jerr(400, "bad_request")
+    days = body.get("days", 7)
+    if not isinstance(days, int) or not (1 <= days <= 60):
+        days = 7
+    await set_setting("event_mode", mode)
+    if mode:
+        await set_setting("event_until", str(time.time() + days * 86400))
+    await alog(uid, "event", mode or "off", f"{days} дн. (сайт)" if mode else "выключен (сайт)")
+    _EVENT_CACHE["t"] = 0.0
+    _SITE_FLAGS["t"] = 0.0
+    return web.json_response({"ok": True}, headers=_NOSTORE)
+
+async def handle_adm_channel(request):
+    uid, err = await _adm_auth(request)
+    if err: return err
+    d = await channel_analytics(force=request.query.get("force") == "1")
+    return web.json_response(d, headers=_NOSTORE)
+
 async def handle_admin_log(request):
     sess = _sess_from_request(request)
     if not sess:
@@ -13039,6 +13900,16 @@ async def web_server():
     app.router.add_post("/api/faq/vote", handle_faq_vote)
     app.router.add_get("/api/faq/votes", handle_faq_votes)
     app.router.add_get("/api/admin/log", handle_admin_log)
+    app.router.add_get("/api/admin/overview", handle_adm_overview)
+    app.router.add_get("/api/admin/tickets", handle_adm_tickets)
+    app.router.add_get("/api/admin/ticket/{id}", handle_adm_ticket)
+    app.router.add_get("/api/admin/helpers", handle_adm_helpers)
+    app.router.add_get("/api/admin/channel", handle_adm_channel)
+    app.router.add_post("/api/admin/ticket/{id}/reply", handle_adm_reply)
+    app.router.add_post("/api/admin/ticket/{id}/close", handle_adm_close)
+    app.router.add_post("/api/admin/pause", handle_adm_pause)
+    app.router.add_post("/api/admin/recruit", handle_adm_recruit)
+    app.router.add_post("/api/admin/event", handle_adm_event)
     app.router.add_post("/api/login/start", handle_login_start)
     app.router.add_post("/api/login/check", handle_login_check)
     app.router.add_post("/api/logout", handle_logout)
@@ -13095,6 +13966,8 @@ async def main():
     spawn(_supervised(health_watchdog_worker))
     spawn(_supervised(prelink_renew_reminder_worker))
     spawn(_supervised(referral_worker))
+    spawn(_supervised(toh_watch_worker))
+    spawn(_supervised(channel_stats_worker))
     spawn(_supervised(userbot_keepalive_worker))
     for _try in range(1, 7):   # Telegram может на минуту отдать Bad Gateway: ждём и повторяем
         try:

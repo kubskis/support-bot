@@ -148,6 +148,9 @@
   }
   function adminCards(a){
     var out=[];
+    var gate=card('Админка'); gate.classList.add('staff','wide');
+    gate.appendChild(note('Все обращения с поиском, архив ответов по хелперам, ответ игроку и закрытие, пауза публикаций, наборы и аналитика канала.'));
+    gate.appendChild(link('btn','Открыть админку','/admin')); out.push(gate);
     var team=card('Общий рейтинг команды'); team.classList.add('staff','wide');
     if(a.team&&a.team.length){
       var ul=el('ul','tlist trank');

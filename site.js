@@ -42,9 +42,25 @@
     });
   }
 
+  // праздничный режим: оформление и баннер. Последнее состояние запоминается, чтобы страница не мигала при загрузке
+  var EVENTS={halloween:{icon:'🎃',text:'Хэллоуин в Tower of Secrets! Праздничные акции смотрите в разделе «Услуги».'},
+              newyear:{icon:'🎄',text:'С наступающим Новым годом! Праздничные акции смотрите в разделе «Услуги».'}};
+  function applyEvent(name){
+    Object.keys(EVENTS).forEach(function(k){root.classList.remove('ev-'+k)});
+    var old=document.querySelector('.evbanner'); if(old) old.remove();
+    var lg=document.querySelector('.logo'); if(lg) lg.removeAttribute('data-ev');
+    if(!name||!EVENTS[name]) return;
+    root.classList.add('ev-'+name);
+    var b=el('div','evbanner',EVENTS[name].icon+' '+EVENTS[name].text);
+    b.setAttribute('role','note');
+    var nav=document.querySelector('.nav'); if(nav&&nav.parentNode) nav.parentNode.insertBefore(b,nav);
+  }
+  try{applyEvent(localStorage.getItem('tos_event')||'')}catch(e){}
+
   fetch('/api/status',{cache:'no-store'}).then(function(r){return r.json()}).then(function(d){
     var ok=d&&d.ok&&(d.health==='ok'||d.bot==='up');set(ok?'ok':'bad',ok?'бот работает':'есть проблемы');
     applyRecruit(d&&d.recruit); applyFeatures(d);
+    var evn=(d&&d.event)||''; try{localStorage.setItem('tos_event',evn)}catch(e){} applyEvent(evn);
   }).catch(function(){set('bad','нет связи')});
 
   // лента секреток (только тип, время и статус; ссылок на серверы тут нет)
