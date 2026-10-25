@@ -13096,20 +13096,42 @@ async def main():
     spawn(_supervised(prelink_renew_reminder_worker))
     spawn(_supervised(referral_worker))
     spawn(_supervised(userbot_keepalive_worker))
-    try:
-        me_bot = await bot.get_me()
-        await bot.delete_webhook(drop_pending_updates=False)   # вебхук мешал бы polling
-        logging.info(f"Бот @{me_bot.username} проверен, начинаю получать сообщения.")
-    except Exception as e:
-        logging.error(f"НЕ УДАЛОСЬ связаться с Telegram Bot API (проверьте BOT_TOKEN/сеть): {e}")
+    for _try in range(1, 7):   # Telegram может на минуту отдать Bad Gateway: ждём и повторяем
+        try:
+            me_bot = await bot.get_me()
+            await bot.delete_webhook(drop_pending_updates=False)   # вебхук мешал бы polling
+            logging.info(f"Бот @{me_bot.username} проверен, начинаю получать сообщения.")
+            break
+        except Exception as e:
+            logging.error(f"НЕ УДАЛОСЬ связаться с Telegram Bot API (попытка {_try}/6; проверьте BOT_TOKEN/сеть): {e}")
+            if "Unauthorized" in str(e):
+                break
+            await asyncio.sleep(min(5 * _try, 20))
     spawn(_restore_delayed_publishes())
     logging.info("Бот успешно запущен и готов к работе!")
     
     try:
-        await dp.start_polling(bot)
+        _fails = 0
+        while True:
+            _t0 = time.monotonic()
+            try:
+                # сессию бота не закрываем между попытками: сбой Telegram не должен ронять весь процесс
+                await dp.start_polling(bot, close_bot_session=False)
+                break   # штатная остановка
+            except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
+                raise
+            except Exception as e:
+                _fails = 1 if time.monotonic() - _t0 > 120 else _fails + 1
+                _wait = min(5 * _fails, 60)
+                logging.error(f"Polling прервался ({type(e).__name__}: {e}). Перезапуск через {_wait} с.")
+                await asyncio.sleep(_wait)
     finally:
         if userbot and userbot.is_connected():
             await userbot.disconnect()
+        try:
+            await bot.session.close()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     try:
