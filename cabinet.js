@@ -149,7 +149,7 @@
   function adminCards(a){
     var out=[];
     var gate=card('Админка'); gate.classList.add('staff','wide');
-    gate.appendChild(note('Все обращения с поиском, архив ответов по хелперам, ответ игроку и закрытие, пауза публикаций, наборы и аналитика канала.'));
+    gate.appendChild(note('Все обращения с поиском и цепочкой «кто брал → кому передали», ответ игроку и закрытие, пауза публикаций, наборы и аналитика канала.'));
     gate.appendChild(link('btn','Открыть админку','/admin')); out.push(gate);
     var team=card('Общий рейтинг команды'); team.classList.add('staff','wide');
     if(a.team&&a.team.length){
@@ -269,8 +269,10 @@
     var t=el('div'); t.appendChild(el('h2',null,'Здравствуйте'+(d.user&&d.user.name?', '+d.user.name:'')+'!')); t.appendChild(note('ID в Telegram: '+(d.user?d.user.id:''),'cab-note small'));
     head.appendChild(t);
     var out=el('button','btn alt','Выйти'); out.type='button';
-    out.addEventListener('click',function(){api('/api/logout',{method:'POST'}).then(function(){location.reload()},function(){location.reload()})});
-    head.appendChild(out); root.appendChild(head);
+    out.addEventListener('click',function(){try{sessionStorage.clear()}catch(e){} api('/api/logout',{method:'POST'}).then(function(){location.reload()},function(){location.reload()})});
+    var hb=el('div','cab-headbtns');
+    if(d.staff&&d.staff.roles&&d.staff.roles.indexOf('admin')>=0){var ab=link('btn','⚙ Админка','/admin'); hb.appendChild(ab)}
+    hb.appendChild(out); head.appendChild(hb); root.appendChild(head);
 
     if(d.banned){
       var w=el('div','warn'); w.appendChild(el('span','wi','⛔')); 
@@ -347,16 +349,23 @@
     act.appendChild(row2); root.appendChild(act);
   }
 
+  function meCached(){try{var v=JSON.parse(sessionStorage.getItem('tos_me')||'null'); return v&&Date.now()-v.t<1800000?v.d:null}catch(e){return null}}
   function init(){
-    viewLoading();
+    var cached=meCached(), shown=null;
+    if(cached){shown=JSON.stringify(cached); viewCabinet(cached)} else viewLoading();   // сразу показываем прошлый вид, пока грузятся свежие данные
     api('/api/me').then(function(r){
       if(r.status===401) return null;
       if(!r.ok) throw 0; return r.json();
     }).then(function(d){
-      if(d){viewCabinet(d); return}
+      if(d){
+        try{sessionStorage.setItem('tos_me',JSON.stringify({t:Date.now(),d:d}))}catch(e){}
+        if(JSON.stringify(d)!==shown) viewCabinet(d);
+        return;
+      }
+      try{sessionStorage.removeItem('tos_me')}catch(e){}
       var s=stored();
       if(s&&s.code&&Date.now()-s.t<s.ttl) viewWait(s); else viewLogin();
-    }).catch(viewError);
+    }).catch(function(e){if(!cached) viewError(e)});
   }
   init();
 })();

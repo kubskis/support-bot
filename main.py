@@ -10701,6 +10701,7 @@ async def take_ticket_handler(call: CallbackQuery):
     agent_number = await get_or_create_agent_number(call.from_user.id)
     await activate_ticket(ticket_id, call.from_user.id)
     await alog(call.from_user.id, "ticket_take", f"№{ticket_id}")
+    await tlog(ticket_id, "system", call.from_user.id, "taken")
     await call.answer("✅ Заявка взята в работу!")
 
     try:
@@ -11185,6 +11186,7 @@ async def cmd_give_ticket(message: Message, command: CommandObject):
     if not await asyncio.to_thread(_reset):
         await message.answer(f"❌ Заявка №{ticket_id} уже изменилась, попробуйте ещё раз.", parse_mode="HTML")
         return
+    await tlog(ticket_id, "system", adm_id, "transferred")   # кто вёл и отдал; новый хелпер появится записью «взял»
 
     try:
         await bot.send_message(
@@ -13330,8 +13332,25 @@ async def _site_publisher_stats(uid: int) -> dict:
 async def _site_admin_stats() -> dict:
     """Полная статистика проекта для главных админов. Кэш 60 с (общий для всех админов)."""
     now = time.time()
-    if _ADMIN_STATS_CACHE["data"] is not None and now - _ADMIN_STATS_CACHE["t"] < 60:
-        return _ADMIN_STATS_CACHE["data"]
+    if _ADMIN_STATS_CACHE["data"] is not None:
+        if now - _ADMIN_STATS_CACHE["t"] < 60:
+            return _ADMIN_STATS_CACHE["data"]
+        if now - _ADMIN_STATS_CACHE["t"] < 1800:
+            # данные чуть устарели: отдаём сразу, а свежие досчитываем в фоне (страница не ждёт)
+            if not _ADMIN_STATS_CACHE.get("busy"):
+                _ADMIN_STATS_CACHE["busy"] = True
+                async def _refresh():
+                    try:
+                        await _site_admin_stats_compute()
+                    except Exception as e:
+                        logging.warning(f"Статистика админки: фоновое обновление не удалось: {e}")
+                    finally:
+                        _ADMIN_STATS_CACHE["busy"] = False
+                spawn(_refresh())
+            return _ADMIN_STATS_CACHE["data"]
+    return await _site_admin_stats_compute()
+
+async def _site_admin_stats_compute() -> dict:
     ok = _rater_filter()
     out = {}
     total, closed, rejected, avg = await get_tickets_stats()
@@ -13402,7 +13421,7 @@ async def _site_admin_stats() -> dict:
         logging.warning(f"Кабинет: статистика FAQ: {e}")
         out["faq"] = []
     out["recruit_subs"] = {"helper": await recruit_sub_count("helper"), "secret": await recruit_sub_count("secret")}
-    _ADMIN_STATS_CACHE.update(t=now, data=out)
+    _ADMIN_STATS_CACHE.update(t=time.time(), data=out)
     return out
 
 async def _site_staff(uid: int):
@@ -13608,7 +13627,9 @@ async def handle_adm_tickets(request):
         where.append("t.category = %s"); params.append(cat)
     adm = q.get("admin", "")
     if adm.isdigit():
-        where.append("t.admin_id = %s"); params.append(int(adm))
+        where.append("(t.admin_id = %s OR EXISTS (SELECT 1 FROM ticket_messages x WHERE x.ticket_id = t.ticket_id "
+                     "AND x.sender = 'system' AND x.text = 'taken' AND x.sender_id = %s))")
+        params += [int(adm), int(adm)]
     before = q.get("before", "")
     if before.isdigit():
         where.append("t.ticket_id < %s"); params.append(int(before))
@@ -13625,16 +13646,31 @@ async def handle_adm_tickets(request):
         rows = await _db_all(
             "SELECT t.ticket_id, t.user_id, u.username, t.status, t.category, t.admin_id, a.agent_number, "
             "EXTRACT(EPOCH FROM t.created_at), EXTRACT(EPOCH FROM t.updated_at), r.score, "
-            "(SELECT COUNT(*) FROM ticket_messages m WHERE m.ticket_id = t.ticket_id AND m.sender <> 'system') "
+            "(SELECT COUNT(*) FROM ticket_messages m WHERE m.ticket_id = t.ticket_id AND m.sender <> 'system'), "
+            "(SELECT ARRAY_AGG(m.sender_id ORDER BY m.id) FROM ticket_messages m WHERE m.ticket_id = t.ticket_id AND m.sender = 'system' AND m.text = 'taken') "
             "FROM tickets t LEFT JOIN users u ON u.user_id = t.user_id LEFT JOIN admin_agents a ON a.admin_id = t.admin_id "
             "LEFT JOIN ratings r ON r.ticket_id = t.ticket_id"
             + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY t.ticket_id DESC LIMIT 31", tuple(params))
     except Exception as e:
         logging.warning(f"/api/admin/tickets: {e}")
         return _jerr(503, "db")
-    items = [{"id": int(r[0]), "user": int(r[1]) if r[1] else None, "uname": r[2] or "", "status": r[3], "cat": _CAT_NAMES.get(r[4], str(r[4] or "")),
-              "admin": int(r[5]) if r[5] else None, "agent": r[6], "created": int(r[7] or 0), "updated": int(r[8] or 0),
-              "score": r[9], "msgs": int(r[10] or 0)} for r in rows[:30]]
+    names = {}
+    async def _nm(i):
+        if i not in names:
+            names[i] = await _plain_name(i)
+        return names[i]
+    items = []
+    for r in rows[:30]:
+        chain_ids = [int(x) for x in (r[11] or []) if x]
+        if r[5] and (not chain_ids or chain_ids[-1] != int(r[5])):
+            chain_ids.append(int(r[5]))      # старые обращения (до журнала) и текущий хелпер
+        chain = []
+        for cid in chain_ids:
+            if not chain or chain[-1]["id"] != cid:
+                chain.append({"id": cid, "name": await _nm(cid)})
+        items.append({"id": int(r[0]), "user": int(r[1]) if r[1] else None, "uname": r[2] or "", "status": r[3], "cat": _CAT_NAMES.get(r[4], str(r[4] or "")),
+                      "admin": int(r[5]) if r[5] else None, "agent": r[6], "created": int(r[7] or 0), "updated": int(r[8] or 0),
+                      "score": r[9], "msgs": int(r[10] or 0), "chain": chain[:6]})
     return web.json_response({"items": items, "more": len(rows) > 30}, headers=_NOSTORE)
 
 async def handle_adm_ticket(request):
@@ -13655,19 +13691,29 @@ async def handle_adm_ticket(request):
         "SELECT sender, sender_id, text, media, via, EXTRACT(EPOCH FROM created_at) FROM ticket_messages WHERE ticket_id = %s ORDER BY id LIMIT 500", (tid,))
     targets = await _db_all("SELECT nick FROM complaint_targets WHERE ticket_id = %s ORDER BY id", (tid,))
     names = {}
-    for sid in {m[1] for m in msgs if m[0] == "admin" and m[1]} | ({t[5]} if t[5] else set()):
+    for sid in {m[1] for m in msgs if m[0] in ("admin", "system") and m[1]} | ({t[5]} if t[5] else set()):
         names[int(sid)] = await _plain_name(int(sid))
     timeline = []
     for sender, sid, text, media, via, ts in msgs:
         if sender == "system":
-            label = {"closed": "Обращение закрыто", "rejected": "Обращение отклонено"}.get(text, text)
+            label = {"closed": "Обращение закрыто", "rejected": "Обращение отклонено", "taken": "Взял в работу",
+                     "transferred": "Передал обращение другому хелперу"}.get(text, text)
             timeline.append({"kind": "system", "text": label, "at": int(ts), "who": names.get(int(sid), "") if sid else ""})
         else:
             timeline.append({"kind": sender, "text": text or "", "media": media or "", "via": via, "at": int(ts),
                              "who": names.get(int(sid), "") if (sender == "admin" and sid) else ""})
     link = _ticket_url(t[10] or t[11])
+    chain_ids = []
+    for sender, sid, text, *_ in msgs:
+        if sender == "system" and text == "taken" and sid and (not chain_ids or chain_ids[-1] != int(sid)):
+            chain_ids.append(int(sid))
+    if t[5] and (not chain_ids or chain_ids[-1] != int(t[5])):
+        chain_ids.append(int(t[5]))
+    chain = []
+    for cid in chain_ids[:8]:
+        chain.append({"id": cid, "name": names.get(cid) or await _plain_name(cid)})
     out = {
-        "id": int(t[0]), "user": int(t[1]) if t[1] else None, "uname": t[2] or "", "status": t[3], "cat": _CAT_NAMES.get(t[4], str(t[4] or "")),
+        "chain": chain, "id": int(t[0]), "user": int(t[1]) if t[1] else None, "uname": t[2] or "", "status": t[3], "cat": _CAT_NAMES.get(t[4], str(t[4] or "")),
         "admin": int(t[5]) if t[5] else None, "admin_name": names.get(int(t[5]), "") if t[5] else "", "agent": t[6],
         "created": int(t[7] or 0), "updated": int(t[8] or 0), "card": _plain_card(t[9])[:3500], "link": link,
         "score": rt[0] if rt else None, "review": (rt[1] or "") if rt else "",

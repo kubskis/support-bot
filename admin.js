@@ -27,10 +27,11 @@
     c.appendChild(note(code===401?'Войдите в личный кабинет через Telegram, затем вернитесь сюда.':'У вашего аккаунта нет доступа к админке. Права проверяет сервер при каждом действии.'));
     c.appendChild(link('btn','Перейти в кабинет','/cabinet')); root.appendChild(c);
   }
-  var TABS=[['overview','Обзор'],['tickets','Обращения'],['helpers','Хелперы'],['control','Управление'],['channel','Канал']];
+  var TABS=[['overview','Обзор'],['tickets','Обращения'],['control','Управление'],['channel','Канал']];
   function shell(){
     clear(root);
-    var bar=el('div','chips adm-tabs'); bar.setAttribute('role','tablist');
+    var back=link('btn alt adm-back','← В кабинет','/cabinet'); back.setAttribute('aria-label','Вернуться в личный кабинет');
+    var bar=el('div','chips adm-tabs'); bar.setAttribute('role','tablist'); bar.appendChild(back);
     TABS.forEach(function(t){var b=btn(t[1],null,function(){go(t[0])}); b.setAttribute('role','tab'); b.setAttribute('aria-pressed',state.tab===t[0]?'true':'false'); bar.appendChild(b)});
     root.appendChild(bar);
     pane=el('div'); root.appendChild(pane);
@@ -38,7 +39,7 @@
   function go(tab){state.tab=tab; try{history.replaceState(null,'','#'+tab)}catch(e){} shell(); render()}
   function render(){
     pane.appendChild(note('Загружаю…'));
-    ({overview:tabOverview,tickets:tabTickets,helpers:tabHelpers,control:tabControl,channel:tabChannel})[state.tab]();
+    ({overview:tabOverview,tickets:tabTickets,control:tabControl,channel:tabChannel})[state.tab]();
   }
   function fail(d){
     if(d&&(d._status===401||d._status===403)){viewDenied(d._status); return true}
@@ -47,9 +48,21 @@
   function tiles(list){var g=el('div','stats'); list.forEach(function(x){var s=el('div','stat'); s.appendChild(el('b',null,String(x[0]))); s.appendChild(el('span',null,x[1])); g.appendChild(s)}); return g}
 
   // ---------- обзор ----------
+  function cacheGet(k){try{var v=JSON.parse(sessionStorage.getItem('adm:'+k)||'null'); return v&&Date.now()-v.t<600000?v.d:null}catch(e){return null}}
+  function cacheSet(k,d){try{sessionStorage.setItem('adm:'+k,JSON.stringify({t:Date.now(),d:d}))}catch(e){}}
   function tabOverview(){
+    var cached=cacheGet('overview'), paintedFor=null;
+    if(cached){paintOverview(cached); paintedFor=JSON.stringify(cached)}
     api('/api/admin/overview').then(function(d){
-      if(fail(d)) return; clear(pane);
+      if(fail(d)) return;
+      if(!d.error){cacheSet('overview',d); if(JSON.stringify(d)===paintedFor) return}
+      if(state.tab!=='overview') return;
+      paintOverview(d);
+    }).catch(function(){if(!cached){clear(pane); pane.appendChild(note('Не удалось загрузить. Обновите страницу.'))}});
+  }
+  function paintOverview(d){
+    {
+      clear(pane);
       if(d.error){pane.appendChild(note(errText(d))); return}
       state.me=d.me;
       var t=d.tickets||{};
@@ -82,9 +95,9 @@
         d.team.forEach(function(x,i){var li=el('li'); li.appendChild(el('span','medal',['🥇','🥈','🥉'][i]||(i+1)+'.')); li.appendChild(el('span','tc',x.name+(x.agent?' · агент #'+x.agent:''))); li.appendChild(el('b',null,x.rated?x.avg+' / 5':'—')); li.appendChild(el('span','tm','закрыто '+x.closed+', оценок '+x.rated)); u.appendChild(li)});
         tm.appendChild(u);
       } else tm.appendChild(note('Пока нет закрытых обращений.'));
-      tm.appendChild(btn('Все ответы хелперов →',null,function(){go('helpers')}));
+      tm.appendChild(btn('Все обращения →',null,function(){go('tickets')}));
       pane.appendChild(tm);
-    });
+    }
   }
 
   // ---------- обращения ----------
@@ -102,8 +115,12 @@
     [['','Все типы'],['complaint','Жалобы'],['appeal','Обжалования'],['question','Вопросы'],['friends','Друзья']].forEach(function(o){var op=el('option',null,o[1]); op.value=o[0]; cat.appendChild(op)}); cat.value=f.cat;
     var go_=btn('Найти','btn',function(){f.q=q.value.trim(); f.cat=cat.value; tabTickets()});
     q.addEventListener('keydown',function(e){if(e.key==='Enter') go_.click()});
-    form.appendChild(q); form.appendChild(cat); form.appendChild(go_); c.appendChild(form);
-    if(f.admin){var p=note('Показаны обращения одного хелпера. ','cab-note small'); p.appendChild(btn('Сбросить',null,function(){f.admin=''; tabTickets()})); c.appendChild(p)}
+    var who=el('select'); who.setAttribute('aria-label','Хелпер'); var o0=el('option',null,'Все хелперы'); o0.value=''; who.appendChild(o0);
+    function fillWho(items){items.forEach(function(h){var op=el('option',null,h.name); op.value=String(h.id); who.appendChild(op)}); who.value=f.admin||''}
+    var hc=cacheGet('helpers');
+    if(hc) fillWho(hc); else api('/api/admin/helpers?days=all').then(function(d){if(d&&d.items){var l=d.items.map(function(h){return {id:h.id,name:h.name}}); cacheSet('helpers',l); fillWho(l)}});
+    who.addEventListener('change',function(){f.admin=who.value; f.q=q.value.trim(); f.cat=cat.value; tabTickets()});
+    form.appendChild(q); form.appendChild(cat); form.appendChild(who); form.appendChild(go_); c.appendChild(form);
     tkBox=el('ul','tlist adm-tk'); c.appendChild(tkBox);
     tkMore=btn('Показать ещё',null,function(){loadTickets(false)}); tkMore.hidden=true; c.appendChild(tkMore);
     pane.appendChild(c); tkLast=0; loadTickets(true);
@@ -121,10 +138,19 @@
         var li=el('li','tk'); var a=el('button','tk-b'); a.type='button';
         a.appendChild(el('b',null,'№'+t.id)); a.appendChild(el('span','pill '+(t.status==='closed'?'ok':'off'),ST[t.status]||t.status));
         a.appendChild(el('span','tc',t.cat+(t.uname?' · @'+t.uname:' · ID '+(t.user||'?'))));
-        a.appendChild(el('span','tm',(t.agent?'агент #'+t.agent+' · ':'')+(t.score?'⭐'+t.score+' · ':'')+(t.msgs?t.msgs+' сообщ. · ':'')+dt(t.updated)));
+        var ch=el('span','chain'); chainInto(ch,t.chain,t.status); a.appendChild(ch);
+        a.appendChild(el('span','tm',(t.score?'⭐'+t.score+' · ':'')+(t.msgs?t.msgs+' сообщ. · ':'')+dt(t.updated)));
         a.addEventListener('click',function(){openTicket(t.id)}); li.appendChild(a); tkBox.appendChild(li); tkLast=t.id;
       });
       tkMore.hidden=!d.more;
+    });
+  }
+  function chainInto(box,chain,status){
+    if(!chain||!chain.length){box.appendChild(el('span','tm',status==='pending'?'Пока никто не взял':'Хелпер неизвестен')); return}
+    box.appendChild(el('span','tm',chain.length>1?'Передавали: ':'Вёл: '));
+    chain.forEach(function(h,i){
+      if(i){var ar=el('span','arrow','→'); ar.setAttribute('aria-label','передал'); box.appendChild(ar)}
+      box.appendChild(el('b',i===chain.length-1&&chain.length>1?'h last':'h',h.name));
     });
   }
   function bubble(m){
@@ -143,7 +169,8 @@
       var ul=el('ul','tlist');
       function row(a,b){var li=el('li'); li.appendChild(el('span','tc',a)); li.appendChild(el('b',null,b)); ul.appendChild(li)}
       row('Статус',ST[t.status]||t.status); row('Тип',t.cat); row('Игрок',(t.uname?'@'+t.uname+' · ':'')+'ID '+(t.user||'?'));
-      row('Хелпер',t.admin?(t.admin_name||('ID '+t.admin))+(t.agent?' · агент #'+t.agent:''):'не назначен');
+      row('Хелпер сейчас',t.admin?(t.admin_name||('ID '+t.admin))+(t.agent?' · агент #'+t.agent:''):(t.status==='pending'?'не назначен':'—'));
+      if(t.chain&&t.chain.length>1) row('Цепочка передачи',t.chain.map(function(h){return h.name}).join(' → '));
       row('Создано',dt(t.created)); row('Обновлено',dt(t.updated)); if(t.score) row('Оценка игрока','⭐ '+t.score+' / 5');
       body.appendChild(ul);
       if(t.review) {body.appendChild(el('h3','cab-sub','Отзыв игрока')); body.appendChild(el('div','msg user',t.review))}
@@ -171,29 +198,6 @@
         });
         row_.appendChild(send); row_.appendChild(close); body.appendChild(ta); body.appendChild(row_); body.appendChild(msg);
       } else if(t.status==='pending') body.appendChild(note('Обращение ещё никто не взял: сначала его берёт хелпер в группе поддержки.','cab-note small'));
-    });
-  }
-
-  // ---------- хелперы ----------
-  function tabHelpers(){
-    clear(pane); var c=card('Ответы и результаты хелперов');
-    var chips=el('div','chips');
-    [['7','7 дней'],['30','30 дней'],['365','Год'],['all','Всё время']].forEach(function(p){var b=btn(p[1],null,function(){state.helperDays=p[0]; tabHelpers()}); b.setAttribute('aria-pressed',state.helperDays===p[0]?'true':'false'); chips.appendChild(b)});
-    c.appendChild(chips); var box=el('div'); c.appendChild(box); box.appendChild(note('Загружаю…')); pane.appendChild(c);
-    api('/api/admin/helpers?days='+state.helperDays).then(function(d){
-      if(fail(d)) return; clear(box);
-      if(d.error){box.appendChild(note(errText(d))); return}
-      if(!d.items.length){box.appendChild(note('За этот период обращений нет.')); return}
-      var ul=el('ul','tlist adm-tk');
-      d.items.forEach(function(h){
-        var li=el('li'); li.appendChild(el('b',null,h.name+(h.agent?' · агент #'+h.agent:'')));
-        li.appendChild(el('span','tm','закрыто '+h.closed+' · отклонено '+h.rejected+' · в работе '+h.active));
-        li.appendChild(el('span','tm',(h.avg?'⭐ '+h.avg+' ('+h.rated+' оц.)':'без оценок')+' · первый ответ: '+(h.first_reply_min!==null?dur(h.first_reply_min):'нет данных')));
-        li.appendChild(btn('Смотреть обращения',null,function(){state.tickets={status:'',cat:'',admin:String(h.id),q:''}; go('tickets')}));
-        ul.appendChild(li);
-      });
-      box.appendChild(ul);
-      box.appendChild(note('«Первый ответ» считается по обращениям, начатым после обновления бота: раньше переписка не сохранялась. В списке обращений хелпера видны оценки и отзывы игроков, а внутри каждого обращения вся переписка.','cab-note small'));
     });
   }
 
@@ -251,9 +255,6 @@
     load(false);
   }
 
-  var h=(location.hash||'').slice(1); if(['overview','tickets','helpers','control','channel'].indexOf(h)>=0) state.tab=h;
-  api('/api/admin/overview').then(function(d){
-    if(d._status===401||d._status===403){viewDenied(d._status); return}
-    shell(); render();
-  }).catch(function(){clear(root); root.appendChild(note('Сайт не смог связаться с ботом. Обновите страницу через минуту.'))});
+  var h=(location.hash||'').slice(1); if(['overview','tickets','control','channel'].indexOf(h)>=0) state.tab=h;
+  shell(); render();   // без предварительного запроса: права проверит первый же запрос вкладки
 })();

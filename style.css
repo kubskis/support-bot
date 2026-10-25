@@ -371,3 +371,10 @@ button.btn:disabled{opacity:.6;cursor:default}
 .adm-col i.n{background:var(--amber)}
 .adm-col i.d{background:var(--ok)}
 .adm-col span{position:absolute;bottom:0;left:0;right:0;text-align:center;font-size:11px;color:var(--muted)}
+
+.adm-tabs .adm-back{margin-right:6px}
+.cab-headbtns{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+.adm-tk .chain{display:flex;flex-wrap:wrap;align-items:center;gap:4px 6px;flex-basis:100%}
+.adm-tk .chain .h{font-weight:600}
+.adm-tk .chain .h.last{color:var(--accent)}
+.adm-tk .chain .arrow{color:var(--muted,inherit);opacity:.8}
