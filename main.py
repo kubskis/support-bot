@@ -11499,7 +11499,6 @@ async def rating_feedback_not_text(message: Message):
 # ----------------------------------------------------------------------
 # ДИАЛОГ В ЛС С ПОЛЬЗОВАТЕЛЕМ (ОТПРАВКА В ТЕМУ ПОДДЕРЖКИ)
 # ----------------------------------------------------------------------
-@router.message(F.chat.type == "private")
 async def user_private_message(message: Message, state: FSMContext):
     await register_user(message.from_user.id)
     if await is_banned(message.from_user.id): return
@@ -14456,6 +14455,10 @@ async def web_server():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
     logging.info(f"Health-check сервер запущен на порту {port}")
+
+# Общий обработчик личных сообщений регистрируем ПОСЛЕДНИМ: aiogram берёт первый подходящий обработчик,
+# и если он стоит раньше команд (/monitor, /event, /tohwatch), те никогда не срабатывают.
+router.message.register(user_private_message, F.chat.type == "private")
 
 async def main():
     global MAINTENANCE_ON, TEST_MODE_ON, TEST_CHANNEL_ID, TEST_STARTED_AT, PUBLISH_PAUSED, PUBLISH_PAUSED_SINCE
