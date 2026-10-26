@@ -1,0 +1,71 @@
+# Бесплатный внешний мониторинг бота: раз в ~5 минут GitHub обращается к /health
+# и пишет в Telegram, когда бот упал и когда снова заработал (только при смене состояния).
+#
+# Нужно один раз добавить два секрета в Settings -> Secrets and variables -> Actions:
+#   ALERT_BOT_TOKEN  токен отдельного бота-оповещателя (создайте нового в @BotFather)
+#   ALERT_CHAT_ID    ваш Telegram ID (число); нажмите Start у этого бота, иначе он не сможет вам писать
+name: Мониторинг бота
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    env:
+      URL: https://towerofsecrets.run.place/health
+      TG_TOKEN: ${{ secrets.ALERT_BOT_TOKEN }}
+      TG_CHAT: ${{ secrets.ALERT_CHAT_ID }}
+    steps:
+      - name: Вспомнить прошлое состояние
+        uses: actions/cache/restore@v4
+        with:
+          path: state.txt
+          key: uptime-state-${{ github.run_id }}
+          restore-keys: uptime-state-
+
+      - name: Проверить /health
+        run: |
+          prev=$(cat state.txt 2>/dev/null || echo up)
+          now=down
+          detail=""
+          for i in 1 2 3; do
+            body=$(curl -sS --max-time 20 -w '\n%{http_code}' "$URL" 2>&1) || true
+            code=$(printf '%s' "$body" | tail -n1)
+            text=$(printf '%s' "$body" | head -n1)
+            if [ "$code" = "200" ] && [ "$text" = "ok" ]; then now=up; break; fi
+            detail="код ${code:-нет ответа}: ${text:0:150}"
+            sleep 20
+          done
+          send() {
+            if [ -z "$TG_TOKEN" ] || [ -z "$TG_CHAT" ]; then echo "Секреты оповещения не заданы, сообщение не отправлено."; return; fi
+            curl -sS --max-time 20 "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TG_CHAT}" --data-urlencode "text=$1" > /dev/null || true
+          }
+          echo "прошлое: $prev, сейчас: $now"
+          if [ "$now" != "$prev" ]; then
+            if [ "$now" = "down" ]; then
+              send "🔴 Бот не отвечает: ${URL}
+          ${detail}"
+            else
+              send "🟢 Бот снова отвечает: ${URL}"
+            fi
+          fi
+          echo "$now" > state.txt
+
+      - name: Запомнить состояние
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: state.txt
+          key: uptime-state-${{ github.run_id }}
