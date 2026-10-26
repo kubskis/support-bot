@@ -12653,7 +12653,8 @@ async def userbot_watchdog_worker():
 # СТОРОЖ ЗДОРОВЬЯ БОТА: Bot API, база данных, «сколько бот был выключен»
 # ----------------------------------------------------------------------
 HEALTH_ALERT_AFTER = 300      # сек: о проблеме сообщаем, если она тянется дольше 5 минут
-_health = {"bad_since": None, "reason": "", "alerted": False, "last_ok": None}
+_health = {"bad_since": None, "reason": "", "alerted": False, "last_ok": None, "last_check": None}
+_PROC_START = time.time()
 _STARTED_AT = time.time()
 _LOG_PRUNE = {"t": 0.0}
 _ERR_TIMES: list = []          # моменты необработанных ошибок в обработчиках (для всплесков)
@@ -12731,6 +12732,7 @@ async def health_watchdog_worker():
         try:
             reason = await _health_check_once()
             now = time.time()
+            _health["last_check"] = now
             if reason:
                 if _health["bad_since"] is None:
                     _health["bad_since"] = now
@@ -14534,8 +14536,13 @@ async def handle_api_status(request):
 
 async def handle_health(request):
     """Для внешнего монитора (UptimeRobot и т.п.): 200, пока всё хорошо, 503 при затяжном сбое."""
-    if _health["bad_since"] is not None and time.time() - _health["bad_since"] >= 120:
+    now = time.time()
+    if _health["bad_since"] is not None and now - _health["bad_since"] >= 120:
         return web.Response(status=503, text=f"unhealthy: {_health['reason']}")
+    # сторож перестал отмечаться (зависла основная петля) — тоже сбой; первые 3 минуты после запуска не считаем
+    last = _health.get("last_check")
+    if now - _PROC_START > 180 and (last is None or now - last > 300):
+        return web.Response(status=503, text="unhealthy: сторож здоровья не отвечает")
     return web.Response(text="ok")
 
 async def web_server():
