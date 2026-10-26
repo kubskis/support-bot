@@ -1245,6 +1245,14 @@ def _init_db_sync():
                     last_used TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE (user_id, nick_lower)
                 );
+                CREATE TABLE IF NOT EXISTS post_log (
+                    id BIGSERIAL PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    group_msg_id BIGINT NOT NULL,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS post_log_kind_ts_idx ON post_log (kind, created_at);
                 CREATE TABLE IF NOT EXISTS channel_stats (
                     day DATE PRIMARY KEY,
                     subs INTEGER NOT NULL
@@ -1488,6 +1496,7 @@ def _init_db_sync():
                 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS last_unassigned_remind TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP;
                 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS card_text TEXT DEFAULT NULL;
                 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS card_msg_id BIGINT DEFAULT NULL;
+                ALTER TABLE tickets ADD COLUMN IF NOT EXISTS nopost BOOLEAN DEFAULT FALSE;
                 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS card_kind TEXT DEFAULT NULL;
                 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS link_msg_id BIGINT DEFAULT NULL;
                 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS user_close_offered BOOLEAN DEFAULT FALSE;
@@ -3120,16 +3129,27 @@ def publisher_menu_kb():
         [IB(text="📢 Привязать канал", callback_data="pub_bind_channel")]
     ])
 
-def take_ticket_kb(ticket_id: int):
-    return InlineKeyboardMarkup(inline_keyboard=[[
+def take_ticket_kb(ticket_id: int, nopost: bool = False):
+    rows = [[
         IB(text="🟢 Начать работу", callback_data=f"take_{ticket_id}"),
         IB(text="🔴 Отклонить тикет", callback_data=f"reject_{ticket_id}")
-    ]])
+    ]]
+    if nopost:
+        rows.append([IB(text="🚫 Нет такого поста", callback_data=f"nopost_{ticket_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
-def close_ticket_kb(ticket_id: int, admin_id: int):
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        IB(text="🔒 Закрыть тикет", callback_data=f"close_{ticket_id}_{admin_id}")
-    ]])
+def close_ticket_kb(ticket_id: int, admin_id: int, nopost: bool = False):
+    rows = [[IB(text="🔒 Закрыть тикет", callback_data=f"close_{ticket_id}_{admin_id}")]]
+    if nopost:
+        rows.append([IB(text="🚫 Нет такого поста", callback_data=f"nopost_{ticket_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+async def _ticket_nopost(ticket_id: int) -> bool:
+    try:
+        r = await _db_one("SELECT nopost FROM tickets WHERE ticket_id = %s", (ticket_id,))
+        return bool(r and r[0])
+    except Exception:
+        return False
 
 def solved_kb(ticket_id: int):
     return InlineKeyboardMarkup(inline_keyboard=[[
@@ -3248,7 +3268,7 @@ def appeal_servers_kb():
 # ----------------------------------------------------------------------
 # ОТПРАВКА БИЛЕТА С МЕДИА (В ТЕМУ ПОДДЕРЖКИ)
 # ----------------------------------------------------------------------
-async def dispatch_ticket_to_admin(user_id: int, user, category: str, text: str, photos: List[str]):
+async def dispatch_ticket_to_admin(user_id: int, user, category: str, text: str, photos: List[str], post_info: dict = None):
     user_mention = get_user_mention(user)
 
     cat_titles = {
@@ -3278,6 +3298,13 @@ async def dispatch_ticket_to_admin(user_id: int, user, category: str, text: str,
             rep_line, targets = "", []
 
     ticket_id = await create_ticket(user_id, category, "")
+    nopost = bool(post_info and post_info.get("nopost"))
+    take_kb = take_ticket_kb(ticket_id, nopost=nopost)
+    if nopost:
+        try:
+            await _db_exec("UPDATE tickets SET nopost = TRUE WHERE ticket_id = %s", (ticket_id,))
+        except Exception as e:
+            logging.warning(f"Тикет #{ticket_id}: не записан признак «поста нет»: {e}")
     if targets:
         try:
             await _record_complaint_targets(ticket_id, user_id, targets)
@@ -3315,12 +3342,12 @@ async def dispatch_ticket_to_admin(user_id: int, user, category: str, text: str,
                 if _is_vid(photos[0]):
                     sent = await bot.send_video(
                         ADMIN_CHAT_ID, video=_fid(photos[0]), caption=admin_card_text,
-                        reply_markup=take_ticket_kb(ticket_id), message_thread_id=TOPIC_SUPPORT_ID, parse_mode="HTML"
+                        reply_markup=take_kb, message_thread_id=TOPIC_SUPPORT_ID, parse_mode="HTML"
                     )
                 else:
                     sent = await bot.send_photo(
                         ADMIN_CHAT_ID, photo=photos[0], caption=admin_card_text,
-                        reply_markup=take_ticket_kb(ticket_id), message_thread_id=TOPIC_SUPPORT_ID, parse_mode="HTML"
+                        reply_markup=take_kb, message_thread_id=TOPIC_SUPPORT_ID, parse_mode="HTML"
                     )
                 await map_message(sent.message_id, user_id, ticket_id)
                 _card_msg, _card_kind, _link_msg = sent.message_id, "photo", sent.message_id
@@ -3332,7 +3359,7 @@ async def dispatch_ticket_to_admin(user_id: int, user, category: str, text: str,
                     sm = await bot.send_photo(ADMIN_CHAT_ID, photo=photos[0], message_thread_id=TOPIC_SUPPORT_ID)
                 await map_message(sm.message_id, user_id, ticket_id)
                 sent = await bot.send_message(
-                    ADMIN_CHAT_ID, card_html, reply_markup=take_ticket_kb(ticket_id),
+                    ADMIN_CHAT_ID, card_html, reply_markup=take_kb,
                     message_thread_id=TOPIC_SUPPORT_ID, parse_mode="HTML"
                 )
                 await map_message(sent.message_id, user_id, ticket_id)
@@ -3349,7 +3376,7 @@ async def dispatch_ticket_to_admin(user_id: int, user, category: str, text: str,
                     await map_message(m.message_id, user_id, ticket_id)
                 if long_card:
                     ctrl_msg = await bot.send_message(
-                        ADMIN_CHAT_ID, card_html, reply_markup=take_ticket_kb(ticket_id),
+                        ADMIN_CHAT_ID, card_html, reply_markup=take_kb,
                         message_thread_id=TOPIC_SUPPORT_ID, parse_mode="HTML"
                     )
                     _kind = "text"
@@ -3357,14 +3384,14 @@ async def dispatch_ticket_to_admin(user_id: int, user, category: str, text: str,
                     ctrl_msg = await bot.send_message(
                         ADMIN_CHAT_ID,
                         f"👆 <i>Управление заявкой №{ticket_id} (прикреплено файлов: {len(photos)}):</i>",
-                        reply_markup=take_ticket_kb(ticket_id), message_thread_id=TOPIC_SUPPORT_ID, parse_mode="HTML"
+                        reply_markup=take_kb, message_thread_id=TOPIC_SUPPORT_ID, parse_mode="HTML"
                     )
                     _kind = "ctrl"
                 await map_message(ctrl_msg.message_id, user_id, ticket_id)
                 _card_msg, _card_kind, _link_msg = ctrl_msg.message_id, _kind, sent_group[0].message_id
         else:
             sent = await bot.send_message(
-                ADMIN_CHAT_ID, card_html, reply_markup=take_ticket_kb(ticket_id),
+                ADMIN_CHAT_ID, card_html, reply_markup=take_kb,
                 message_thread_id=TOPIC_SUPPORT_ID, parse_mode="HTML"
             )
             await map_message(sent.message_id, user_id, ticket_id)
@@ -3384,6 +3411,18 @@ async def dispatch_ticket_to_admin(user_id: int, user, category: str, text: str,
         await asyncio.to_thread(_save_card_ref)
     except Exception as e:
         logging.error(f"Тикет #{ticket_id}: не удалось сохранить ссылку на карточку: {e}")
+
+    ping_uid = (post_info or {}).get("ping")
+    if ping_uid and int(ping_uid) != int(user_id) and not TEST_MODE_ON:
+        try:   # публикатор найденного поста: отмечаем, чтобы было видно, чья это жалоба или обжалование
+            kind_txt = "жалоба" if category == "complaint" else "обжалование"
+            await bot.send_message(
+                ADMIN_CHAT_ID,
+                f"🔔 {await _mention_html(int(ping_uid))}, на ваш пост поступило: <b>{kind_txt}</b> №{ticket_id}. "
+                f'<a href="{_ticket_url(_link_msg)}">Открыть заявку</a>',
+                message_thread_id=TOPIC_SUPPORT_ID, parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
+        except Exception as e:
+            logging.warning(f"Тикет #{ticket_id}: не удалось отметить публикатора: {e}")
 
     return ticket_id
 
@@ -5444,13 +5483,14 @@ async def pub_confirm(call: CallbackQuery, state: FSMContext):
 
                 # 2. Мгновенно отправляем фото в тему "Секретки" (в тест-режиме стаффу ничего не шлём)
                 if not TEST_MODE_ON:
-                    await bot.send_photo(
+                    _sc = await bot.send_photo(
                         chat_id=ADMIN_CHAT_ID,
                         photo=data["photo_id"],
                         caption=staff_caption,
                         message_thread_id=TOPIC_SECRETS_ID,
                         parse_mode="HTML"
                     )
+                    await plog("secret", call.from_user.id, _sc.message_id)
 
                 # 2.1 Предссылки (одновременно со стаффом)
                 spawn(send_prelinks(
@@ -5849,10 +5889,11 @@ async def _sab_core(user, data, ch_id) -> tuple:
     )
     try:
         if not TEST_MODE_ON:
-            await bot.send_message(
+            _sm = await bot.send_message(
                 chat_id=ADMIN_CHAT_ID, text=staff_sab_text, message_thread_id=TOPIC_SECRETS_ID,
                 parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True)
             )
+            await plog("saboteur", user.id, _sm.message_id)
     except Exception as ex_st:
         logging.warning(f"Ошибка карточки стаффу (саботер): {ex_st}")
     await call_staff(f"<b>Новый сервер саботера!</b> У вас {STAFF_DELAY_SECONDS} сек. приоритета до предссылок (канал через {CHANNEL_DELAY_SECONDS} сек.)!", exclude_ids=[user.id])
@@ -5912,10 +5953,11 @@ async def _farm_core(user, data, ch_id) -> tuple:
     )
     try:
         if not TEST_MODE_ON:
-            await bot.send_message(
+            _sm = await bot.send_message(
                 chat_id=ADMIN_CHAT_ID, text=staff_text, message_thread_id=TOPIC_SECRETS_ID,
                 parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True)
             )
+            await plog("farm", user.id, _sm.message_id)
     except Exception as ex_st:
         logging.warning(f"Ошибка карточки стаффу (фарм): {ex_st}")
     await call_staff(f"<b>Новый фарм сервер!</b> У вас {STAFF_DELAY_SECONDS} сек. приоритета до предссылок (канал через {CHANNEL_DELAY_SECONDS} сек.)!", exclude_ids=[user.id])
@@ -10229,26 +10271,360 @@ async def process_c_server_choice(call: CallbackQuery, state: FSMContext):
         "cmp_srv_mutator": "Бейдж мутатор"
     }
     chosen_server = srv_types.get(call.data, "Не указан")
-    await state.update_data(c_place=chosen_server)
+    await state.update_data(c_place=chosen_server, c_kind=call.data[8:])
     await state.set_state(Form.complaint_time)
     await call.message.edit_text(
         f"Выбран сервер: <b>{chosen_server}</b>{_rules_hint(call.data[8:], 'complaint')}\n\n"
-        f"{NUM_4} {ICON_TIMER} <b>Укажите время публикации поста:</b>\n"
-        "<i>(Укажите примерное или точное время публикации поста по МСК, например: <code>18:45</code> или <code>18:45:20 28.09</code>)</i>",
+        f"{NUM_4} {_time_prompt()}",
         parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True)
     )
     await call.answer()
 
-@router.message(Form.complaint_time, F.text)
-async def process_c_time(message: Message, state: FSMContext):
-    await state.update_data(c_time=message.text.strip())
+# ----------------------------------------------------------------------
+# ВРЕМЯ ПОСТА В ЖАЛОБЕ / ОБЖАЛОВАНИИ: разбор, подтверждение «по МСК», поиск поста ±5 минут
+# ----------------------------------------------------------------------
+_MONTH_WORDS = {"янв": 1, "фев": 2, "мар": 3, "апр": 4, "май": 5, "мая": 5, "июн": 6, "июл": 7, "авг": 8, "сен": 9, "окт": 10, "ноя": 11, "дек": 12}
+_MONTH_GEN = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря"]
+POST_TOL_MIN = 5   # допуск поиска поста: плюс-минус столько минут
+
+def _month_from_word(w: str):
+    w = (w or "").lower().replace("ё", "е")
+    for k, v in _MONTH_WORDS.items():
+        if w.startswith(k):
+            return v
+    return None
+
+def parse_post_time(raw: str, now: datetime):
+    """Понимает время и дату в любом порядке и с любыми разделителями: 18:45 5.02, 5 февраля 18:45, 18-45 05,02, вчера 18:45.
+    Возвращает словарь или None, если время распознать нельзя. now: текущее время по МСК (aware)."""
+    s = (raw or "").lower().replace("ё", "е")
+    s = re.sub(r"\b(мск|msk|по москве|москва)\b", " ", s)
+    s = re.sub(r"\b(года?|г)\b\.?", " ", s)
+    s = re.sub(r"[;,]", " ", s)
+    rel = None
+    for word, off in (("позавчера", 2), ("вчера", 1), ("сегодня", 0)):
+        if word in s:
+            rel = off
+            s = s.replace(word, " ")
+            break
+    hour = minute = None
+    sec = None
+    day = month = year = None
+
+    m = re.search(r"(\d{1,2})\s*([а-я]{3,9})", s)
+    if m and _month_from_word(m.group(2)):
+        day, month = int(m.group(1)), _month_from_word(m.group(2))
+        s = s[:m.start()] + " " + s[m.end():]
+    else:
+        m = re.search(r"([а-я]{3,9})\s*(\d{1,2})(?!\d)", s)
+        if m and _month_from_word(m.group(1)):
+            day, month = int(m.group(2)), _month_from_word(m.group(1))
+            s = s[:m.start()] + " " + s[m.end():]
+    m = re.search(r"(?<!\d)(\d{1,2})\s*:\s*(\d{2})(?:\s*:\s*(\d{2}))?(?!\d)", s)
+    if m:
+        hour, minute = int(m.group(1)), int(m.group(2))
+        sec = int(m.group(3)) if m.group(3) else None
+        s = s[:m.start()] + " " + s[m.end():]
+    else:
+        m = re.search(r"(?<!\d)(\d{1,2})\s*ч\w*\s*(\d{1,2})?\s*(?:м\w*)?", s)
+        if m:
+            hour, minute = int(m.group(1)), int(m.group(2) or 0)
+            s = s[:m.start()] + " " + s[m.end():]
+    nums = [int(x) for x in re.findall(r"\d+", s)]
+    longs = [x for x in re.findall(r"\d+", s) if len(x) > 2]
+    if hour is None:
+        # время без двоеточия: 18.45, 18-45, 18 45; дата может стоять перед ним или после
+        small = re.findall(r"\d{1,2}(?!\d)", " ".join(re.findall(r"\d+", s))) if not longs else []
+        small = [int(x) for x in re.findall(r"\b\d{1,2}\b", s)]
+        if len(small) >= 2 and small[0] <= 23 and small[1] <= 59:
+            hour, minute = small[0], small[1]
+            nums = [int(x) for x in re.findall(r"\d+", s)][2:]
+        elif len(small) >= 4 and small[-2] <= 23 and small[-1] <= 59:
+            hour, minute = small[-2], small[-1]
+            nums = [int(x) for x in re.findall(r"\d+", s)][:-2]
+        else:
+            return None
+    if day is None:
+        if len(nums) == 1 and nums[0] <= 31:
+            day, month = nums[0], now.month
+        elif len(nums) in (2, 3):
+            a, b = nums[0], nums[1]
+            day, month = a, b
+            if month > 12 and day <= 12:
+                day, month = b, a
+            if len(nums) == 3:
+                y = nums[2]
+                year = y + 2000 if y < 100 else y
+        elif len(nums) > 3:
+            return None
+    else:
+        for x in nums:
+            if x >= 100 or 20 <= x <= 99 and year is None and len(nums) == 1:
+                year = x + 2000 if x < 100 else x
+    if not (0 <= hour <= 23 and 0 <= minute <= 59 and (sec is None or 0 <= sec <= 59)):
+        return None
+    tz = now.tzinfo
+    date_given = day is not None
+    assumed = None
+    try:
+        if date_given:
+            y = year or now.year
+            dt = datetime(y, month, day, hour, minute, sec or 0, tzinfo=tz)
+            if not year and dt > now + timedelta(days=30):   # дата «из будущего» на пару дней — опечатка (покажем предупреждение), на месяцы — прошлый год
+                dt = dt.replace(year=y - 1)
+        else:
+            base = (now - timedelta(days=rel)).date() if rel is not None else now.date()
+            dt = datetime(base.year, base.month, base.day, hour, minute, sec or 0, tzinfo=tz)
+            if rel is None:
+                assumed = "today"
+                if dt > now + timedelta(minutes=2):
+                    dt -= timedelta(days=1)
+                    assumed = "yesterday"
+            else:
+                date_given = True
+    except ValueError:
+        return None
+    return {"dt": dt, "date_given": date_given, "assumed": assumed, "has_sec": sec is not None, "future": dt > now + timedelta(minutes=5)}
+
+def _fmt_pt(dt: datetime, with_sec: bool = False) -> str:
+    return f"{dt.hour:02d}:{dt.minute:02d}" + (f":{dt.second:02d}" if with_sec else "") + f", {dt.day} {_MONTH_GEN[dt.month - 1]} {dt.year}"
+
+def _fmt_pt_short(dt: datetime, with_sec: bool = False) -> str:
+    return f"{dt.hour:02d}:{dt.minute:02d}" + (f":{dt.second:02d}" if with_sec else "") + f" {dt.day:02d}.{dt.month:02d}.{dt.year}"
+
+def _time_prompt() -> str:
+    now = datetime.now(MSK_TZ)
+    return (
+        f"{ICON_TIMER} <b>Укажите точное время публикации поста по МСК:</b>\n"
+        "Пишите в формате <code>чч:мм дд.мм</code>, например <code>18:45 28.10</code>. Секунды можно не указывать.\n\n"
+        "⚠️ Время на посте в Telegram показывается по <b>вашему</b> часовому поясу. Если он не московский, пересчитайте на Москву (UTC+3).\n"
+        f"<i>Сейчас по МСК: {_fmt_pt(now)}</i>"
+    )
+
+def _time_confirm_kb(prefix: str, parsed: bool):
+    yes = "✅ Да, это время по МСК" if parsed else "📨 Отправить как есть"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [IB(text=yes, callback_data=f"{prefix}time_ok")],
+        [IB(text="✏️ Ввести заново", callback_data=f"{prefix}time_re")],
+    ])
+
+_POST_KIND_TITLES = {"secret": "секретка", "saboteur": "поиск саботёра", "farm": "фарм сервер", "researcher": "бейдж исследователя", "mutator": "бейдж мутатора"}
+
+def _channel_post_link(channel_id, message_id) -> str:
+    if not message_id:
+        return ""
+    cid = str(channel_id or "")
+    if cid.startswith("@"):
+        return f"https://t.me/{cid[1:]}/{message_id}"
+    if cid.startswith("-100"):
+        return f"https://t.me/c/{cid[4:]}/{message_id}"
+    return ""
+
+async def find_posts_near(kind: str, dt: datetime, with_sec: bool) -> list:
+    """Посты выбранного типа в окне ±POST_TOL_MIN минут. Возвращает до 4 штук, ближайшие первыми."""
+    lo = dt - timedelta(minutes=POST_TOL_MIN)
+    hi = dt + timedelta(minutes=POST_TOL_MIN, seconds=0 if with_sec else 59)
+    queries = {
+        "secret": "SELECT user_id, created_at, channel_id, message_id FROM secret_posts WHERE created_at BETWEEN %s AND %s "
+                  "ORDER BY ABS(EXTRACT(EPOCH FROM (created_at - %s))) LIMIT 4",
+        "saboteur": "SELECT s.user_id, s.created_at, p.channel_id, p.message_id FROM saboteur_servers s JOIN saboteur_posts p ON p.id = s.post_id "
+                    "WHERE s.created_at BETWEEN %s AND %s ORDER BY ABS(EXTRACT(EPOCH FROM (s.created_at - %s))) LIMIT 4",
+        "farm": "SELECT s.user_id, s.created_at, p.channel_id, p.message_id FROM farm_servers s JOIN farm_posts p ON p.id = s.post_id "
+                "WHERE s.created_at BETWEEN %s AND %s ORDER BY ABS(EXTRACT(EPOCH FROM (s.created_at - %s))) LIMIT 4",
+        "researcher": "SELECT user_id, created_at, channel_id, message_id FROM researcher_badges WHERE created_at BETWEEN %s AND %s "
+                      "ORDER BY ABS(EXTRACT(EPOCH FROM (created_at - %s))) LIMIT 4",
+        "mutator": "SELECT user_id, created_at, channel_id, message_id FROM mutator_badges WHERE created_at BETWEEN %s AND %s "
+                   "ORDER BY ABS(EXTRACT(EPOCH FROM (created_at - %s))) LIMIT 4",
+    }
+    q = queries.get(kind)
+    if not q:
+        return []
+    rows = await _db_all(q, (lo, hi, dt))
+    res = []
+    for uid, ts, ch, mid in rows:
+        gid = None
+        if kind in ("secret", "saboteur", "farm"):
+            try:
+                g = await _db_one(
+                    "SELECT group_msg_id FROM post_log WHERE kind = %s AND user_id = %s AND ABS(EXTRACT(EPOCH FROM (created_at - %s))) < 180 "
+                    "ORDER BY ABS(EXTRACT(EPOCH FROM (created_at - %s))) LIMIT 1", (kind, uid, ts, ts))
+                gid = g[0] if g else None
+            except Exception as e:
+                logging.warning(f"Поиск поста: журнал публикаций: {e}")
+        group_link = f"https://t.me/c/{str(ADMIN_CHAT_ID)[4:]}/{TOPIC_SECRETS_ID}/{gid}" if gid and str(ADMIN_CHAT_ID).startswith("-100") else ""
+        res.append({"user_id": int(uid) if uid else None, "ts": ts.astimezone(MSK_TZ), "group": group_link, "channel": _channel_post_link(ch, mid)})
+    return res
+
+async def plog(kind: str, user_id, group_msg_id):
+    """Запоминает карточку публикации в теме «Секретки»: по ней потом находим пост и публикатора. Не бросает исключений."""
+    try:
+        if group_msg_id:
+            await _db_exec("INSERT INTO post_log (kind, user_id, group_msg_id) VALUES (%s,%s,%s)", (kind, int(user_id), int(group_msg_id)))
+    except Exception as e:
+        logging.warning(f"Журнал публикаций: не записано: {e}")
+
+async def _build_time_result(raw: str, parsed: dict, kind: str) -> tuple:
+    """Возвращает (html для карточки заявки, post_info для dispatch_ticket_to_admin)."""
+    if not parsed:
+        return (f"<b>{html.escape(raw)}</b>\n⚠️ <i>Время не распознано, игрок подтвердил «как есть». Проверьте вручную.</i>", {"nopost": False})
+    dt = parsed["dt"]
+    line = f"<b>{_fmt_pt_short(dt, parsed['has_sec'])} (МСК)</b>"
+    if parsed["assumed"]:
+        line += " <i>(дату игрок не указал, считаем " + ("вчера" if parsed["assumed"] == "yesterday" else "сегодня") + ")</i>"
+    if raw.strip():
+        line += f"\n<i>Как написал игрок: «{html.escape(raw.strip()[:80])}»</i>"
+    try:
+        found = await find_posts_near(kind, dt, parsed["has_sec"])
+    except Exception as e:
+        logging.warning(f"Поиск поста по времени: {e}")
+        return (line + "\n⚠️ <i>Автопоиск поста не сработал, проверьте вручную.</i>", {"nopost": False})
+    title = _POST_KIND_TITLES.get(kind, kind)
+    if not found:
+        line += (f"\n⚠️ <b>Пост типа «{html.escape(title)}» в это время (±{POST_TOL_MIN} мин) не найден.</b> "
+                 "Возможно, игрок ошибся со временем или поясом. Поищите сами; если поста нет, нажмите «🚫 Нет такого поста» — игроку уйдёт готовый отказ.")
+        return (line, {"nopost": True})
+    line += f"\n🔎 <b>Найдено постов: {len(found)}</b> (±{POST_TOL_MIN} мин):"
+    for c in found[:3]:
+        who = await _mention_html(c["user_id"]) if c["user_id"] else "неизвестно"
+        links = []
+        if c["group"]:
+            links.append(f'<a href="{c["group"]}">карточка в чате</a>')
+        if c["channel"]:
+            links.append(f'<a href="{c["channel"]}">пост в канале</a>')
+        line += f"\n• {c['ts'].strftime('%H:%M:%S')} · 👤 {who}" + (" · " + " · ".join(links) if links else "")
+    info = {"nopost": False}
+    if len(found) == 1 and found[0]["user_id"]:
+        info["ping"] = found[0]["user_id"]
+    return (line, info)
+
+async def _time_received(message: Message, state: FSMContext, prefix: str):
+    raw = (message.text or "").strip()
+    parsed = parse_post_time(raw, datetime.now(MSK_TZ))
+    await state.update_data(**{f"{prefix}_time": raw, f"{prefix}_time_iso": parsed["dt"].isoformat() if parsed else "",
+                               f"{prefix}_time_sec": bool(parsed and parsed["has_sec"])})
+    now = datetime.now(MSK_TZ)
+    if not parsed:
+        text = (f"🤔 Не получилось точно разобрать «{html.escape(raw[:80])}».\n\n"
+                "Лучше написать так: <code>чч:мм дд.мм</code>, например <code>18:45 28.10</code>. Можно ввести заново или отправить как есть: тогда хелпер проверит время вручную.")
+    else:
+        extra = ""
+        if parsed["assumed"] == "yesterday":
+            extra = "\n📅 Дату вы не указали, а это время сегодня ещё не наступило, поэтому беру <b>вчера</b>. Если пост был в другой день, введите заново с датой."
+        elif parsed["assumed"] == "today":
+            extra = "\n📅 Дату вы не указали, беру <b>сегодня</b>. Если пост был в другой день, введите заново с датой."
+        if parsed["future"]:
+            extra += "\n⚠️ Это время ещё не наступило. Проверьте число и месяц."
+        text = (f"🕒 Вы указали: <b>{_fmt_pt(parsed['dt'], parsed['has_sec'])}</b>{extra}\n\n"
+                "❓ <b>Вы уверены, что это время по МСК (Москва, UTC+3)?</b>\n"
+                "Время на посте в Telegram показывается по вашему часовому поясу. От точной минуты зависит, найдём ли мы пост.\n"
+                f"<i>Сейчас по МСК: {_fmt_pt(now)}</i>")
+    await message.answer(text, reply_markup=_time_confirm_kb(prefix, bool(parsed)), parse_mode="HTML")
+
+async def _time_ok(call: CallbackQuery, state: FSMContext, prefix: str):
+    data = await state.get_data()
+    raw = data.get(f"{prefix}_time", "")
+    iso = data.get(f"{prefix}_time_iso", "")
+    kind = data.get(f"{prefix}_kind", "")
+    parsed = None
+    if iso:
+        try:
+            parsed = parse_post_time(raw, datetime.now(MSK_TZ))
+            if parsed:
+                parsed["dt"] = datetime.fromisoformat(iso)
+                parsed["has_sec"] = bool(data.get(f"{prefix}_time_sec"))
+        except Exception:
+            parsed = None
+    txt, info = await _build_time_result(raw, parsed, kind)
+    await state.update_data(**{f"{prefix}_time_txt": txt, f"{prefix}_post_info": info})
+    try:
+        await call.message.edit_text(f"{ICON_CHECK} Время принято: <b>{html.escape(raw[:80])}</b> (по МСК).", parse_mode="HTML")
+    except Exception:
+        pass
+
+async def _time_again(call: CallbackQuery):
+    try:
+        await call.message.edit_text(_time_prompt(), parse_mode="HTML")
+    except Exception:
+        await call.message.answer(_time_prompt(), parse_mode="HTML")
+
+@router.callback_query(F.data == "ctime_ok", Form.complaint_time)
+async def ctime_ok(call: CallbackQuery, state: FSMContext):
+    await _time_ok(call, state, "c")
     await state.set_state(Form.complaint_photos)
-    await message.answer(
+    await call.message.answer(
         f"{NUM_5} {ICON_PHOTO} <b>Прикрепите доказательства (до 5 фото или видео):</b>\n\n"
         "⚠️ <b>Важно:</b> фото строго запрещено обрезать! Плашка уровней и чат сервера должны быть отчётливо видны.",
-        reply_markup=skip_photo_kb("complaint"),
-        parse_mode="HTML"
-    )
+        reply_markup=skip_photo_kb("complaint"), parse_mode="HTML")
+    await call.answer()
+
+@router.callback_query(F.data == "ctime_re", Form.complaint_time)
+async def ctime_re(call: CallbackQuery):
+    await _time_again(call)
+    await call.answer()
+
+@router.callback_query(F.data == "atime_ok", Form.appeal_time)
+async def atime_ok(call: CallbackQuery, state: FSMContext):
+    await _time_ok(call, state, "a")
+    await state.set_state(Form.appeal_reason)
+    await call.message.answer(
+        f"{NUM_4} <b>Почему мы должны снять с вас бан?</b>\n"
+        "<i>(Подробно опишите вашу ситуацию и почему вы считаете блокировку ошибочной)</i>",
+        parse_mode="HTML")
+    await call.answer()
+
+@router.callback_query(F.data == "atime_re", Form.appeal_time)
+async def atime_re(call: CallbackQuery):
+    await _time_again(call)
+    await call.answer()
+
+NOPOST_REASON = ("Указанный вами пост не найден: в это время по МСК такой публикации не было. "
+                 "Проверьте время и подайте заявку заново. Время нужно писать точно и по МСК в формате чч:мм дд.мм (например 18:45 28.10).")
+
+@router.callback_query(F.data.startswith("nopost_"))
+async def nopost_handler(call: CallbackQuery):
+    try:
+        ticket_id = int(call.data.split("_")[1])
+    except (IndexError, ValueError):
+        await call.answer(); return
+    if call.message.chat.id != ADMIN_CHAT_ID and not await is_support_member(call.from_user.id):
+        await call.answer("❌ У вас нет прав хелпера!", show_alert=True)
+        return
+    info = await get_ticket_info(ticket_id)
+    if not info:
+        await call.answer("❌ Заявка не найдена в базе!", show_alert=True)
+        return
+    user_id, adm_id, status, card = info
+    if status not in ("pending", "active"):
+        await call.answer("❌ Заявка уже обработана!", show_alert=True)
+        return
+    if status == "active" and adm_id != call.from_user.id and not await is_main_admin(call.from_user.id):
+        await call.answer("❌ Эту заявку ведёт другой админ.", show_alert=True)
+        return
+    await call.answer("Отказ отправлен игроку.")
+    agent_no = await get_or_create_agent_number(call.from_user.id)
+    await close_ticket_db(ticket_id, "rejected", admin_id=call.from_user.id)
+    await alog(call.from_user.id, "ticket_reject", f"№{ticket_id}", "пост не найден (автоотказ)")
+    await tlog(ticket_id, "admin", call.from_user.id, f"Причина отказа: {NOPOST_REASON}")
+    try:
+        await bot.send_message(user_id, f"{ICON_CROSS} Заявка <b>№{ticket_id}</b> отклонена.\n<b>Причина:</b> {html.escape(NOPOST_REASON)}",
+                               parse_mode="HTML", reply_markup=await main_keyboard(user_id))
+    except Exception as e:
+        logging.warning(f"Не удалось отправить автоотказ пользователю {user_id}: {e}")
+    base = card or call.message.caption or call.message.text or f"Заявка <b>№{ticket_id}</b>"
+    new_text = (f"{base}\n\n🔴 <b>Заявка №{ticket_id} отклонена</b> администратором {call.from_user.mention_html()} (Агент #{agent_no}).\n"
+                "<b>Причина:</b> пост не найден (автоответ).")
+    try:
+        if call.message.photo or call.message.video:
+            await call.message.edit_caption(caption=html_cut(new_text, 1024), reply_markup=None, parse_mode="HTML")
+        else:
+            await call.message.edit_text(text=html_cut(new_text, 4096), reply_markup=None, parse_mode="HTML")
+    except Exception as e:
+        logging.error(f"Не удалось обновить карточку после автоотказа №{ticket_id}: {e}")
+
+@router.message(Form.complaint_time, F.text)
+async def process_c_time(message: Message, state: FSMContext):
+    await _time_received(message, state, "c")
+
 
 @router.callback_query(F.data == "skip_photo_complaint", Form.complaint_photos)
 async def skip_c_photos(call: CallbackQuery, state: FSMContext):
@@ -10268,9 +10644,9 @@ async def skip_c_photos(call: CallbackQuery, state: FSMContext):
             f"Нарушитель(и): {nicks_formatted}\n"
             f"Суть нарушения: {html.escape(data.get('c_reason', ''))}\n"
             f"Где произошло нарушение: {html.escape(data.get('c_place', ''))}\n"
-            f"Время публикации поста: {html.escape(data.get('c_time', ''))}"
+            f"Время публикации поста: {(data.get('c_time_txt') or html.escape(data.get('c_time', '')))}"
         )
-        ticket_id = await dispatch_ticket_to_admin(call.from_user.id, call.from_user, "complaint", text, [])
+        ticket_id = await dispatch_ticket_to_admin(call.from_user.id, call.from_user, "complaint", text, [], post_info=data.get("c_post_info"))
         night_txt = get_night_notice()
         await call.message.edit_text(f"{ICON_CHECK} Жалоба №{ticket_id} отправлена!{night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
         await state.clear()
@@ -10314,10 +10690,10 @@ async def process_c_photo(message: Message, state: FSMContext):
             text = (
                 f"Нарушитель(и): {nicks_formatted}\n"
                 f"Суть нарушения: {html.escape(cur_data.get('c_reason', ''))}\n"
-                f"Где произошло нарушение: {html.escape(data.get('c_place', ''))}\n"
-                f"Время публикации поста: {html.escape(data.get('c_time', ''))}"
+                f"Где произошло нарушение: {html.escape(cur_data.get('c_place', ''))}\n"
+                f"Время публикации поста: {(cur_data.get('c_time_txt') or html.escape(cur_data.get('c_time', '')))}"
             )
-            ticket_id = await dispatch_ticket_to_admin(message.from_user.id, message.from_user, "complaint", text, photos)
+            ticket_id = await dispatch_ticket_to_admin(message.from_user.id, message.from_user, "complaint", text, photos, post_info=cur_data.get("c_post_info"))
             await state.clear()
             night_txt = get_night_notice()
             await message.answer(f"{ICON_CHECK} Жалоба №{ticket_id} отправлена! (Прикреплено файлов: {len(photos)}){night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
@@ -10338,9 +10714,9 @@ async def process_c_photo(message: Message, state: FSMContext):
             f"Нарушитель(и): {nicks_formatted}\n"
             f"Суть нарушения: {html.escape(data.get('c_reason', ''))}\n"
             f"Где произошло нарушение: {html.escape(data.get('c_place', ''))}\n"
-            f"Время публикации поста: {html.escape(data.get('c_time', ''))}"
+            f"Время публикации поста: {(data.get('c_time_txt') or html.escape(data.get('c_time', '')))}"
         )
-        ticket_id = await dispatch_ticket_to_admin(message.from_user.id, message.from_user, "complaint", text, photos)
+        ticket_id = await dispatch_ticket_to_admin(message.from_user.id, message.from_user, "complaint", text, photos, post_info=data.get("c_post_info"))
         await state.clear()
         night_txt = get_night_notice()
         await message.answer(f"{ICON_CHECK} Жалоба №{ticket_id} отправлена! (Прикреплено файлов: {len(photos)}){night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
@@ -10397,25 +10773,18 @@ async def process_a_server_choice(call: CallbackQuery, state: FSMContext):
         "app_srv_mutator": "Бейдж мутатор"
     }
     chosen_server = srv_types.get(call.data, "Не указан")
-    await state.update_data(a_place=chosen_server)
+    await state.update_data(a_place=chosen_server, a_kind=call.data[8:])
     await state.set_state(Form.appeal_time)
     await call.message.edit_text(
         f"Выбран сервер: <b>{chosen_server}</b>{_rules_hint(call.data[8:], 'appeal')}\n\n"
-        f"{NUM_3} {ICON_TIMER} <b>Укажите время публикации поста:</b>\n"
-        "<i>(Укажите примерное или точное время публикации поста по МСК, например: <code>18:45</code> или <code>18:45:20 28.09</code>)</i>",
+        f"{NUM_3} {_time_prompt()}",
         parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True)
     )
     await call.answer()
 
 @router.message(Form.appeal_time, F.text)
 async def process_a_time(message: Message, state: FSMContext):
-    await state.update_data(a_time=message.text.strip())
-    await state.set_state(Form.appeal_reason)
-    await message.answer(
-        f"{NUM_4} <b>Почему мы должны снять с вас бан?</b>\n"
-        "<i>(Подробно опишите вашу ситуацию и почему вы считаете блокировку ошибочной)</i>",
-        parse_mode="HTML"
-    )
+    await _time_received(message, state, "a")
 
 @router.message(Form.appeal_reason, F.text)
 async def process_a_reason(message: Message, state: FSMContext):
@@ -10440,10 +10809,10 @@ async def skip_a_photos(call: CallbackQuery, state: FSMContext):
         text = (
             f"Ник: {profile_str}\n"
             f"Сервер бана: {html.escape(data.get('a_place', ''))}\n"
-            f"Время публикации поста: {html.escape(data.get('a_time', ''))}\n"
+            f"Время публикации поста: {(data.get('a_time_txt') or html.escape(data.get('a_time', '')))}\n"
             f"Причина разбана: {html.escape(data.get('a_reason', ''))}"
         )
-        ticket_id = await dispatch_ticket_to_admin(call.from_user.id, call.from_user, "appeal", text, [])
+        ticket_id = await dispatch_ticket_to_admin(call.from_user.id, call.from_user, "appeal", text, [], post_info=data.get("a_post_info"))
         night_txt = get_night_notice()
         await call.message.edit_text(f"{ICON_CHECK} Обжалование №{ticket_id} отправлено!{night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
         await state.clear()
@@ -10482,10 +10851,10 @@ async def process_a_photo(message: Message, state: FSMContext):
             text = (
                 f"Ник: {profile_str}\n"
                 f"Сервер бана: {html.escape(cur_data.get('a_place', ''))}\n"
-                f"Время публикации поста: {html.escape(data.get('a_time', ''))}\n"
-                f"Причина разбана: {html.escape(data.get('a_reason', ''))}"
+                f"Время публикации поста: {(cur_data.get('a_time_txt') or html.escape(cur_data.get('a_time', '')))}\n"
+                f"Причина разбана: {html.escape(cur_data.get('a_reason', ''))}"
             )
-            ticket_id = await dispatch_ticket_to_admin(message.from_user.id, message.from_user, "appeal", text, photos)
+            ticket_id = await dispatch_ticket_to_admin(message.from_user.id, message.from_user, "appeal", text, photos, post_info=cur_data.get("a_post_info"))
             await state.clear()
             night_txt = get_night_notice()
             await message.answer(f"{ICON_CHECK} Обжалование №{ticket_id} отправлено! (Прикреплено файлов: {len(photos)}){night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
@@ -10500,10 +10869,10 @@ async def process_a_photo(message: Message, state: FSMContext):
         text = (
             f"Ник: {profile_str}\n"
             f"Сервер бана: {html.escape(data.get('a_place', ''))}\n"
-            f"Время публикации поста: {html.escape(data.get('a_time', ''))}\n"
+            f"Время публикации поста: {(data.get('a_time_txt') or html.escape(data.get('a_time', '')))}\n"
             f"Причина разбана: {html.escape(data.get('a_reason', ''))}"
         )
-        ticket_id = await dispatch_ticket_to_admin(message.from_user.id, message.from_user, "appeal", text, photos)
+        ticket_id = await dispatch_ticket_to_admin(message.from_user.id, message.from_user, "appeal", text, photos, post_info=data.get("a_post_info"))
         await state.clear()
         night_txt = get_night_notice()
         await message.answer(f"{ICON_CHECK} Обжалование №{ticket_id} отправлено! (Прикреплено файлов: {len(photos)}){night_txt}", reply_markup=user_cancel_kb(ticket_id), parse_mode="HTML")
@@ -10715,12 +11084,13 @@ async def take_ticket_handler(call: CallbackQuery):
 
     base_text = ticket_info[3] if ticket_info[3] else (call.message.caption or call.message.text or f"Заявка №{ticket_id}")
     new_text = base_text + f"\n\n🟢 <b>В работе у:</b> {call.from_user.mention_html()} (Агент #{agent_number})"
+    _np = await _ticket_nopost(ticket_id)
     
     try:
         if call.message.photo or call.message.video:
-            await call.message.edit_caption(caption=new_text, reply_markup=close_ticket_kb(ticket_id, call.from_user.id), parse_mode="HTML")
+            await call.message.edit_caption(caption=new_text, reply_markup=close_ticket_kb(ticket_id, call.from_user.id, nopost=_np), parse_mode="HTML")
         else:
-            await call.message.edit_text(text=new_text, reply_markup=close_ticket_kb(ticket_id, call.from_user.id), parse_mode="HTML")
+            await call.message.edit_text(text=new_text, reply_markup=close_ticket_kb(ticket_id, call.from_user.id, nopost=_np), parse_mode="HTML")
     except Exception as e:
         logging.error(f"Ошибка обновления карточки при взятии: {e}")
 
@@ -11116,7 +11486,7 @@ async def restore_take_card(ticket_id: int, status_line: str):
     row = await asyncio.to_thread(_q)
     msg_id, kind, card_text = row if row else (None, None, "")
     base = card_text or f"Заявка <b>№{ticket_id}</b>"
-    kb = take_ticket_kb(ticket_id)
+    kb = take_ticket_kb(ticket_id, nopost=await _ticket_nopost(ticket_id))
     if msg_id:
         try:
             if kind == "photo":
