@@ -1816,6 +1816,7 @@ ALOG_INFO = {
     "publish_pause": ("Публикации в канал", "settings"),
     "ticket_reply_web": ("Ответил игроку с сайта", "tickets"),
     "toh_update": ("Tower of Hell обновился", "system"),
+    "welcome_edit": ("Изменил приветствие бота", "settings"),
     "toh_watch": ("Слежение за обновлением игры", "settings"),
     "event": ("Праздничный режим", "settings"),
     "incident": ("Сбой бота", "system"),
@@ -2136,6 +2137,44 @@ async def touch_ticket(ticket_id: int, actor: str = 'user'):
                         (actor, ticket_id)
                     )
     await asyncio.to_thread(_query)
+
+_CAPTION_TYPES = {"photo", "video", "document", "audio", "animation", "voice"}
+
+def _ctype(m: Message) -> str:
+    """Тип сообщения обычной строкой ('photo', 'video'...): у Enum хэш не совпадает со строкой, поэтому приводим явно."""
+    ct = m.content_type
+    return str(getattr(ct, "value", ct))
+
+async def relay_message(src: Message, chat_id: int, header_html: str, body: str = "", thread_id: int = None, reply_markup=None) -> list:
+    """Пересылает сообщение ЛЮБОГО типа (текст, фото, видео, файл, голосовое, стикер, кружок...) с шапкой.
+    Возвращает id отправленных сообщений. Текст и подпись не теряются: если подпись не помещается (1024), текст идёт отдельным сообщением."""
+    kw = {"message_thread_id": thread_id} if thread_id else {}
+    body = (body or "").strip()
+    ids = []
+    ctype = _ctype(src)
+    if ctype == "text":
+        full = header_html + (f"\n\n{html.escape(body)}" if body else "")
+        m = await bot.send_message(chat_id, html_cut(full, 4000), parse_mode="HTML", reply_markup=reply_markup, **kw)
+        return [m.message_id]
+    if ctype in _CAPTION_TYPES:
+        with_body = header_html + (f"\n\n{html.escape(body)}" if body else "")
+        if html_visible_len(with_body) <= 1000:
+            caption, extra = with_body, ""
+        else:
+            caption, extra = header_html, body
+        m = await bot.copy_message(chat_id, from_chat_id=src.chat.id, message_id=src.message_id,
+                                   caption=caption, parse_mode="HTML", reply_markup=None if extra else reply_markup, **kw)
+        ids.append(m.message_id)
+        if extra:
+            m2 = await bot.send_message(chat_id, html_cut(html.escape(extra), 4000), parse_mode="HTML", reply_markup=reply_markup, **kw)
+            ids.append(m2.message_id)
+        return ids
+    # стикер, кружок, геолокация, контакт и т. п.: шапка отдельно, само сообщение копией
+    h = await bot.send_message(chat_id, header_html, parse_mode="HTML", **kw)
+    ids.append(h.message_id)
+    m = await bot.copy_message(chat_id, from_chat_id=src.chat.id, message_id=src.message_id, reply_markup=reply_markup, **kw)
+    ids.append(m.message_id)
+    return ids
 
 async def map_message(group_msg_id: int, user_id: int, ticket_id: int):
     def _query():
@@ -3081,6 +3120,7 @@ async def system_kb():
         [IB(text=f"🧪 Тест режим: {test_word}", callback_data="toggle_testmode"),
          IB(text="📡 Канал тест-режима", callback_data="set_test_channel")],
         [IB(text="👥 Публикаторы секреток", callback_data="sec_manage_pubs")],
+        [IB(text="👋 Приветствие бота", callback_data="adm_welcome")],
         [IB(text="👑 Главные админы поддержки", callback_data="manage_main_admins")],
         [IB(text="🔙 Назад", callback_data="back_to_adm")],
     ])
@@ -3624,6 +3664,100 @@ async def web_login_confirm(call: CallbackQuery):
         pass
     await call.answer()
 
+WELCOME_DEFAULT = (
+    '<tg-emoji emoji-id="5206693654990717395">🔥</tg-emoji>'
+    '<b>Добро пожаловать в поддержку Tower Of Hell Secrets (@ToHSecretss)!</b>'
+    '<tg-emoji emoji-id="5206693654990717395">🔥</tg-emoji>\n\n'
+    '<tg-emoji emoji-id="5208629654449064934">🔥</tg-emoji>'
+    '<i>Выберите нужный раздел на клавиатуре ниже</i>'
+)
+WELCOME_MAX = 950   # подпись к фото ограничена 1024 знаками; запас на строку праздничного режима
+
+async def get_welcome_html() -> str:
+    """Свой текст приветствия (HTML) или пустая строка, если используется стандартный."""
+    try:
+        return ((await get_setting("welcome_text", "")) or "").strip()
+    except Exception:
+        return ""
+
+class WelcomeAdminStates(StatesGroup):
+    waiting_text = State()
+
+def _welcome_menu_kb(custom: bool):
+    rows = [[IB(text="✏️ Изменить текст", callback_data="welcome_edit")]]
+    if custom:
+        rows.append([IB(text="♻️ Вернуть стандартный", callback_data="welcome_reset")])
+    rows.append([IB(text="🔙 Назад", callback_data="adm_system")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+async def _welcome_screen_text() -> tuple:
+    custom = await get_welcome_html()
+    head = ("👋 <b>Приветствие бота</b>\n\nТекст ниже показывается под фото при /start. "
+            f"Фото берётся из файла <code>{PHOTO_FILENAME}</code> в репозитории, поменять его можно только заменой файла.\n"
+            f"Сейчас: <b>{'свой текст' if custom else 'стандартный текст'}</b>.\n\n— — —\n")
+    return head + (custom or WELCOME_DEFAULT), bool(custom)
+
+@router.callback_query(F.data == "adm_welcome")
+async def adm_welcome(call: CallbackQuery, state: FSMContext):
+    if not await is_main_admin(call.from_user.id):
+        await call.answer("❌ Нет доступа", show_alert=True); return
+    await state.clear()
+    text, custom = await _welcome_screen_text()
+    try:
+        await call.message.edit_text(text, reply_markup=_welcome_menu_kb(custom), parse_mode="HTML")
+    except TelegramBadRequest:
+        await call.message.edit_text("👋 <b>Приветствие бота</b>\n\nТекущий текст показать не удалось (ошибка разметки). Задайте новый или верните стандартный.",
+                                     reply_markup=_welcome_menu_kb(True), parse_mode="HTML")
+    await call.answer()
+
+@router.callback_query(F.data == "welcome_edit")
+async def welcome_edit(call: CallbackQuery, state: FSMContext):
+    if not await is_main_admin(call.from_user.id):
+        await call.answer("❌ Нет доступа", show_alert=True); return
+    await state.set_state(WelcomeAdminStates.waiting_text)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[IB(text="Отмена", callback_data="adm_welcome")]])
+    await call.message.edit_text(
+        "✏️ Отправьте <b>новый текст приветствия одним сообщением</b>.\n\n"
+        "• Жирный, курсив, ссылки и эмодзи сохранятся в том виде, как вы их оформили.\n"
+        f"• Не больше <b>{WELCOME_MAX}</b> символов (подпись к фото ограничена Telegram).\n"
+        "• Фото остаётся прежним.", reply_markup=kb, parse_mode="HTML")
+    await call.answer()
+
+@router.message(WelcomeAdminStates.waiting_text, F.chat.type == "private")
+async def welcome_save(message: Message, state: FSMContext):
+    if not await is_main_admin(message.from_user.id):
+        await state.clear(); return
+    if not message.text:
+        await message.answer("Нужен текст одним сообщением (без фото и файлов). Отправьте текст или нажмите «Отмена» выше.")
+        return
+    if message.text.startswith("/"):
+        await state.clear()
+        await message.answer("Изменение приветствия отменено.")
+        return
+    plain_len = len(message.text)
+    if plain_len > WELCOME_MAX:
+        await message.answer(f"❌ Слишком длинно: {plain_len} символов, максимум {WELCOME_MAX}. Сократите текст и отправьте снова.")
+        return
+    new_html = message.html_text
+    await set_setting("welcome_text", new_html)
+    await state.clear()
+    await alog(message.from_user.id, "welcome_edit", "", f"{plain_len} симв.")
+    text, custom = await _welcome_screen_text()
+    try:
+        await message.answer("✅ Приветствие сохранено. Так оно выглядит:\n\n— — —\n" + new_html, parse_mode="HTML", reply_markup=_welcome_menu_kb(True))
+    except TelegramBadRequest:
+        await message.answer("✅ Сохранено, но показать предпросмотр не удалось. Проверьте через /start.", reply_markup=_welcome_menu_kb(True))
+
+@router.callback_query(F.data == "welcome_reset")
+async def welcome_reset(call: CallbackQuery, state: FSMContext):
+    if not await is_main_admin(call.from_user.id):
+        await call.answer("❌ Нет доступа", show_alert=True); return
+    await set_setting("welcome_text", "")
+    await alog(call.from_user.id, "welcome_edit", "", "возвращён стандартный")
+    await call.answer("Вернул стандартный текст.")
+    text, custom = await _welcome_screen_text()
+    await call.message.edit_text(text, reply_markup=_welcome_menu_kb(custom), parse_mode="HTML")
+
 async def _start_welcome(message: Message, state: FSMContext):
     try:
         await register_user(message.from_user.id)
@@ -3641,33 +3775,27 @@ async def _start_welcome(message: Message, state: FSMContext):
     await state.clear()
     kb = await main_keyboard(message.from_user.id)
 
-    welcome_caption = (
-        '<tg-emoji emoji-id="5206693654990717395">🔥</tg-emoji>'
-        '<b>Добро пожаловать в поддержку Tower Of Hell Secrets (@ToHSecretss)!</b>'
-        '<tg-emoji emoji-id="5206693654990717395">🔥</tg-emoji>\n\n'
-        '<tg-emoji emoji-id="5208629654449064934">🔥</tg-emoji>'
-        '<i>Выберите нужный раздел на клавиатуре ниже</i>'
-    )
+    custom = await get_welcome_html()
+    welcome_caption = custom or WELCOME_DEFAULT
     welcome_caption += await _event_line()
 
-    if os.path.exists(PHOTO_FILENAME):
+    for caption in ([welcome_caption] if not custom else [welcome_caption, WELCOME_DEFAULT + await _event_line()]):
+        # если собственный текст Telegram не принял (редкая ошибка разметки), показываем стандартный, а не молчим
+        if os.path.exists(PHOTO_FILENAME):
+            try:
+                await message.answer_photo(photo=FSInputFile(PHOTO_FILENAME), caption=html_cut(caption, 1024), reply_markup=kb, parse_mode="HTML")
+                return
+            except TelegramBadRequest as e:
+                logging.error(f"Приветствие: Telegram не принял фото/текст ({e})")
+                continue
+            except Exception as e:
+                logging.error(f"Не удалось отправить локальное фото {PHOTO_FILENAME}: {e}")
         try:
-            photo_file = FSInputFile(PHOTO_FILENAME)
-            await message.answer_photo(
-                photo=photo_file,
-                caption=welcome_caption,
-                reply_markup=kb,
-                parse_mode="HTML"
-            )
+            await message.answer(text=caption, reply_markup=kb, parse_mode="HTML")
             return
-        except Exception as e:
-            logging.error(f"Не удалось отправить локальное фото {PHOTO_FILENAME}: {e}")
-
-    await message.answer(
-        text=welcome_caption,
-        reply_markup=kb,
-        parse_mode="HTML"
-    )
+        except TelegramBadRequest as e:
+            logging.error(f"Приветствие: Telegram не принял текст ({e})")
+    await message.answer("Выберите нужный раздел на клавиатуре ниже.", reply_markup=kb)
 
 @router.message(F.text.in_(btn_texts(BTN_REFRESH)), F.chat.type == "private")
 async def refresh_menu_handler(message: Message, state: FSMContext):
@@ -11384,26 +11512,21 @@ async def user_private_message(message: Message, state: FSMContext):
     if active_ticket and active_ticket[2] == 'active':
         await touch_ticket(active_ticket[0], actor='user')
         await tlog(active_ticket[0], "user", message.from_user.id, message.text or message.caption or "",
-                   media=("photo" if message.photo else ("media" if not message.text else "")))
+                   media=("" if message.text else _ctype(message)))
         user_mention = get_user_mention(message.from_user)
-        text_to_group = f"📩 <b>Сообщение по заявке №{active_ticket[0]} от {user_mention} | ID: <code>{message.from_user.id}</code>:</b>\n\n{html.escape(message.text or message.caption or '')}"
-        
-        if message.photo:
-            sent = await bot.send_photo(
-                ADMIN_CHAT_ID, 
-                photo=message.photo[-1].file_id, 
-                caption=text_to_group, 
-                message_thread_id=TOPIC_SUPPORT_ID,
-                parse_mode="HTML"
-            )
-        else:
-            sent = await bot.send_message(
-                ADMIN_CHAT_ID, 
-                text_to_group, 
-                message_thread_id=TOPIC_SUPPORT_ID,
-                parse_mode="HTML"
-            )
-        await map_message(sent.message_id, message.from_user.id, active_ticket[0])
+        header = f"📩 <b>Сообщение по заявке №{active_ticket[0]} от {user_mention} | ID: <code>{message.from_user.id}</code>:</b>"
+        try:
+            ids = await relay_message(message, ADMIN_CHAT_ID, header, message.text or message.caption or "", thread_id=TOPIC_SUPPORT_ID)
+        except Exception as e:
+            logging.error(f"Заявка №{active_ticket[0]}: не удалось переслать сообщение игрока ({_ctype(message)}): {e}")
+            try:
+                await bot.send_message(ADMIN_CHAT_ID, header + f"\n\n⚠️ Вложение ({_ctype(message)}) переслать не удалось. Игрок его отправил, напишите ему в личку, если нужно.\n"
+                                       + html.escape(message.text or message.caption or ""), parse_mode="HTML", message_thread_id=TOPIC_SUPPORT_ID)
+            except Exception:
+                pass
+            return
+        for mid in ids:
+            await map_message(mid, message.from_user.id, active_ticket[0])
         return
 
     kb = await main_keyboard(message.from_user.id)
@@ -12330,15 +12453,12 @@ async def handle_admin_group_messages(message: Message):
                 await touch_ticket(ticket_id, actor='admin')
                 agent_no = await get_or_create_agent_number(message.from_user.id)
 
-                client_text = f"👨‍💻 <b>Ответ поддержки (Агент #{agent_no}):</b>\n\n{html.escape(text)}"
+                client_head = f"👨‍💻 <b>Ответ поддержки (Агент #{agent_no}):</b>"
                 try:
-                    if message.photo:
-                        await bot.send_photo(user_id, photo=message.photo[-1].file_id, caption=client_text, parse_mode="HTML", reply_markup=solved_kb(ticket_id))
-                    else:
-                        await bot.send_message(user_id, client_text, parse_mode="HTML", reply_markup=solved_kb(ticket_id))
+                    await relay_message(message, user_id, client_head, text, reply_markup=solved_kb(ticket_id))
                     await message.react([{"type": "emoji", "emoji": "👍"}])
                     await map_message(message.message_id, user_id, ticket_id)
-                    await tlog(ticket_id, "admin", message.from_user.id, text or "", media=("photo" if message.photo else ""))
+                    await tlog(ticket_id, "admin", message.from_user.id, text or "", media=("" if message.text else _ctype(message)))
                 except Exception as e:
                     await message.answer(f"❌ Ошибка отправки: {e}")
 

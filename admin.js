@@ -156,7 +156,7 @@
   function bubble(m){
     var b=el('div','msg '+m.kind);
     if(m.kind==='system'){b.textContent=m.text+(m.who?' · '+m.who:'')+' · '+dt(m.at); return b}
-    var h=el('div','mh',(m.kind==='admin'?(m.who||'Хелпер'):'Игрок')+' · '+dt(m.at)+(m.via==='site'?' · с сайта':'')+(m.media?' · '+(m.media==='photo'?'📷 фото':'📎 вложение'):''));
+    var h=el('div','mh',(m.kind==='admin'?(m.who||'Хелпер'):'Игрок')+' · '+dt(m.at)+(m.via==='site'?' · с сайта':'')+(m.media?' · '+({photo:'📷 фото',video:'🎬 видео',document:'📎 файл',voice:'🎤 голосовое',audio:'🎵 аудио',animation:'🎞 GIF',sticker:'🙂 стикер',video_note:'⚪ кружок'}[m.media]||'📎 вложение'):''));
     b.appendChild(h); b.appendChild(el('div','mt',m.text||'(без текста)')); return b;
   }
   function openTicket(id){
