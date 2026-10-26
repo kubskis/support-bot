@@ -10529,10 +10529,9 @@ def _time_prompt() -> str:
         f"<i>Сейчас по МСК: {_fmt_pt(now)}</i>"
     )
 
-def _time_confirm_kb(prefix: str, parsed: bool):
-    yes = "✅ Да, это время по МСК" if parsed else "📨 Отправить как есть"
+def _time_confirm_kb(prefix: str, parsed: bool = True):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [IB(text=yes, callback_data=f"{prefix}time_ok")],
+        [IB(text="✅ Да, это время по МСК", callback_data=f"{prefix}time_ok")],
         [IB(text="✏️ Ввести заново", callback_data=f"{prefix}time_re")],
     ])
 
@@ -10547,6 +10546,32 @@ def _channel_post_link(channel_id, message_id) -> str:
     if cid.startswith("-100"):
         return f"https://t.me/c/{cid[4:]}/{message_id}"
     return ""
+
+_KIND_PLACE = {"secret": "Сервер с секреткой", "saboteur": "Поиск саботера", "farm": "Фарм сервер",
+               "researcher": "Бейдж исследователь", "mutator": "Бейдж мутатор"}
+_KIND_BTN = {"secret": "Секретка", "saboteur": "Поиск саботёра", "farm": "Фарм сервер", "researcher": "Бейдж исследователя", "mutator": "Бейдж мутатора"}
+_KIND_DESC = {
+    "secret": "<b>Секретка</b>: секретки, где падают лапки и прочее, а также фарм-секретка, где башня наклонена или имеет Т/Г-форму.",
+    "farm": "<b>Фарм сервер</b>: отдельный сервер, где уровни по 12–18 штук без лазеров.",
+    "saboteur": "<b>Поиск саботёра</b>: сервер, где ищут саботёра (метод поиска вида 4/20).",
+    "researcher": "<b>Бейдж исследователь</b>: сервер для получения бейджа исследователя.",
+    "mutator": "<b>Бейдж мутатор</b>: сервер для получения бейджа мутатора.",
+}
+
+async def find_posts_other_kinds(dt: datetime, with_sec: bool, exclude: str) -> dict:
+    """Посты ДРУГИХ типов в том же окне: {тип: [посты]}. Нужны, когда игрок перепутал тип (в одну минуту два поста не выходят)."""
+    out = {}
+    for k in _KIND_PLACE:
+        if k == exclude:
+            continue
+        try:
+            r = await find_posts_near(k, dt, with_sec)
+        except Exception as e:
+            logging.warning(f"Поиск поста другого типа ({k}): {e}")
+            continue
+        if r:
+            out[k] = r
+    return out
 
 async def find_posts_near(kind: str, dt: datetime, with_sec: bool) -> list:
     """Посты выбранного типа в окне ±POST_TOL_MIN минут. Возвращает до 4 штук, ближайшие первыми."""
@@ -10591,10 +10616,11 @@ async def plog(kind: str, user_id, group_msg_id):
     except Exception as e:
         logging.warning(f"Журнал публикаций: не записано: {e}")
 
-async def _build_time_result(raw: str, parsed: dict, kind: str) -> tuple:
-    """Возвращает (html для карточки заявки, post_info для dispatch_ticket_to_admin)."""
+async def _build_time_result(raw: str, parsed: dict, kind: str, note: str = "", others: dict = None) -> tuple:
+    """Возвращает (html для карточки заявки, post_info для dispatch_ticket_to_admin).
+    note: пометка о выборе игрока по типу; others: посты других типов в том же окне (если игрок настоял на своём типе)."""
     if not parsed:
-        return (f"<b>{html.escape(raw)}</b>\n⚠️ <i>Время не распознано, игрок подтвердил «как есть». Проверьте вручную.</i>", {"nopost": False})
+        return (f"<b>{html.escape(raw)}</b>\n⚠️ <i>Время не распознано. Проверьте вручную.</i>", {"nopost": False})
     dt = parsed["dt"]
     line = f"<b>{_fmt_pt_short(dt, parsed['has_sec'])} (МСК)</b>"
     if parsed["assumed"]:
@@ -10607,9 +10633,18 @@ async def _build_time_result(raw: str, parsed: dict, kind: str) -> tuple:
         logging.warning(f"Поиск поста по времени: {e}")
         return (line + "\n⚠️ <i>Автопоиск поста не сработал, проверьте вручную.</i>", {"nopost": False})
     title = _POST_KIND_TITLES.get(kind, kind)
+    if note:
+        line += f"\n{note}"
     if not found:
         line += (f"\n⚠️ <b>Пост типа «{html.escape(title)}» в это время (±{POST_TOL_MIN} мин) не найден.</b> "
                  "Возможно, игрок ошибся со временем или поясом. Поищите сами; если поста нет, нажмите «🚫 Нет такого поста» — игроку уйдёт готовый отказ.")
+        for ok_, lst in (others or {}).items():
+            c = lst[0]
+            who = await _mention_html(c["user_id"]) if c["user_id"] else "неизвестно"
+            lk = c["group"] or c["channel"]
+            line += (f"\n↪️ <b>Но в это время вышел пост другого типа: «{html.escape(_POST_KIND_TITLES.get(ok_, ok_))}»</b> "
+                     f"({c['ts'].strftime('%H:%M:%S')}, 👤 {who})" + (f' · <a href="{lk}">ссылка</a>' if lk else "")
+                     + ". Игрок подтвердил свой тип, проверьте, не перепутал ли он.")
         return (line, {"nopost": True})
     line += f"\n🔎 <b>Найдено постов: {len(found)}</b> (±{POST_TOL_MIN} мин):"
     for c in found[:3]:
@@ -10632,42 +10667,101 @@ async def _time_received(message: Message, state: FSMContext, prefix: str):
                                f"{prefix}_time_sec": bool(parsed and parsed["has_sec"])})
     now = datetime.now(MSK_TZ)
     if not parsed:
-        text = (f"🤔 Не получилось точно разобрать «{html.escape(raw[:80])}».\n\n"
-                "Лучше написать так: <code>чч:мм дд.мм</code>, например <code>18:45 28.10</code>. Можно ввести заново или отправить как есть: тогда хелпер проверит время вручную.")
+        await message.answer(
+            f"🤔 Не получилось понять «{html.escape(raw[:80])}».\n\n"
+            "Напишите, пожалуйста, <b>точное время</b> в формате <code>чч:мм дд.мм</code>, например <code>18:45 28.10</code>. "
+            "Нужны часы, минуты и дата. Слова вроде «вечером» или «недавно» не подходят: по минуте мы ищем пост.\n"
+            f"<i>Сейчас по МСК: {_fmt_pt(now)}</i>", parse_mode="HTML")
+        return
+    if parsed["future"]:
+        await message.answer(
+            f"⏳ Время <b>{_fmt_pt(parsed['dt'], parsed['has_sec'])}</b> ещё не наступило, пост с таким временем выйти не мог.\n\n"
+            "Проверьте число, месяц и часы и напишите заново: <code>чч:мм дд.мм</code>.\n"
+            f"<i>Сейчас по МСК: {_fmt_pt(now)}</i>", parse_mode="HTML")
+        return
     else:
         extra = ""
         if parsed["assumed"] == "yesterday":
             extra = "\n📅 Дату вы не указали, а это время сегодня ещё не наступило, поэтому беру <b>вчера</b>. Если пост был в другой день, введите заново с датой."
         elif parsed["assumed"] == "today":
             extra = "\n📅 Дату вы не указали, беру <b>сегодня</b>. Если пост был в другой день, введите заново с датой."
-        if parsed["future"]:
-            extra += "\n⚠️ Это время ещё не наступило. Проверьте число и месяц."
         text = (f"🕒 Вы указали: <b>{_fmt_pt(parsed['dt'], parsed['has_sec'])}</b>{extra}\n\n"
                 "❓ <b>Вы уверены, что это время по МСК (Москва, UTC+3)?</b>\n"
                 "Время на посте в Telegram показывается по вашему часовому поясу. От точной минуты зависит, найдём ли мы пост.\n"
                 f"<i>Сейчас по МСК: {_fmt_pt(now)}</i>")
     await message.answer(text, reply_markup=_time_confirm_kb(prefix, bool(parsed)), parse_mode="HTML")
 
-async def _time_ok(call: CallbackQuery, state: FSMContext, prefix: str):
-    data = await state.get_data()
+async def _parsed_from_state(data: dict, prefix: str):
     raw = data.get(f"{prefix}_time", "")
     iso = data.get(f"{prefix}_time_iso", "")
-    kind = data.get(f"{prefix}_kind", "")
-    parsed = None
-    if iso:
+    if not iso:
+        return raw, None
+    try:
+        parsed = parse_post_time(raw, datetime.now(MSK_TZ))
+        if parsed:
+            parsed["dt"] = datetime.fromisoformat(iso)
+            parsed["has_sec"] = bool(data.get(f"{prefix}_time_sec"))
+        return raw, parsed
+    except Exception:
+        return raw, None
+
+async def _time_ok(call: CallbackQuery, state: FSMContext, prefix: str, kind_decision: str = "") -> bool:
+    """True: время принято, можно идти дальше. False: нужен ещё ответ игрока (непонятное время или уточнение типа поста)."""
+    data = await state.get_data()
+    raw, parsed = await _parsed_from_state(data, prefix)
+    if not parsed:
         try:
-            parsed = parse_post_time(raw, datetime.now(MSK_TZ))
-            if parsed:
-                parsed["dt"] = datetime.fromisoformat(iso)
-                parsed["has_sec"] = bool(data.get(f"{prefix}_time_sec"))
+            await call.message.edit_text(
+                f"🤔 Время «{html.escape(raw[:80])}» не распознано. Напишите его точно в формате <code>чч:мм дд.мм</code>, например <code>18:45 28.10</code>.",
+                parse_mode="HTML")
         except Exception:
-            parsed = None
-    txt, info = await _build_time_result(raw, parsed, kind)
+            pass
+        return False
+    kind = data.get(f"{prefix}_kind", "")
+    note, others = "", None
+    try:
+        found = await find_posts_near(kind, parsed["dt"], parsed["has_sec"]) if kind in _KIND_PLACE else [1]
+    except Exception as e:
+        logging.warning(f"Проверка типа поста: {e}")
+        found = [1]
+    if not found and not kind_decision and kind in _KIND_PLACE:
+        others = await find_posts_other_kinds(parsed["dt"], parsed["has_sec"], kind)
+        if others:
+            # пост в это время есть, но другого типа: в одну минуту два поста не выходят, значит игрок мог перепутать тип
+            lines = [f"❓ Вы выбрали тип «<b>{html.escape(_KIND_BTN[kind])}</b>», но в это время (±{POST_TOL_MIN} мин по МСК) такого поста нет. "
+                     "Зато вышел пост другого типа: " + ", ".join(f"«<b>{html.escape(_KIND_BTN[k])}</b>»" for k in others) + ".", "",
+                     "Чем отличаются типы:", "• " + _KIND_DESC[kind]]
+            lines += ["• " + _KIND_DESC[k] for k in others]
+            lines += ["", f"Вы уверены, что это именно «{html.escape(_KIND_BTN[kind])}»?"]
+            rows = [[IB(text=f"✅ Да, это «{_KIND_BTN[kind]}»", callback_data=f"{prefix}kind_keep")]]
+            for k in list(others)[:3]:
+                rows.append([IB(text=f"🔁 Нет, это «{_KIND_BTN[k]}»", callback_data=f"{prefix}kind_to_{k}")])
+            rows.append([IB(text="✏️ Изменить время", callback_data=f"{prefix}time_re")])
+            try:
+                await call.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
+            except Exception as e:
+                logging.warning(f"Не удалось показать уточнение типа: {e}")
+                await call.message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
+            return False
+    if kind_decision == "keep":
+        others = await find_posts_other_kinds(parsed["dt"], parsed["has_sec"], kind)
+        if others:
+            note = "🗣 <i>Игрок подтвердил выбранный тип после подсказки.</i>"
+    elif kind_decision.startswith("to_"):
+        new_kind = kind_decision[3:]
+        if new_kind in _KIND_PLACE and new_kind != kind:
+            old_kind = kind
+            kind = new_kind
+            await state.update_data(**{f"{prefix}_kind": kind, f"{prefix}_place": _KIND_PLACE[kind]})
+            note = f"🔁 <i>Игрок сначала выбрал «{html.escape(_KIND_BTN.get(old_kind, old_kind))}», но после подсказки сменил тип на «{html.escape(_KIND_BTN[kind])}».</i>"
+    txt, info = await _build_time_result(raw, parsed, kind, note=note, others=others)
     await state.update_data(**{f"{prefix}_time_txt": txt, f"{prefix}_post_info": info})
     try:
-        await call.message.edit_text(f"{ICON_CHECK} Время принято: <b>{html.escape(raw[:80])}</b> (по МСК).", parse_mode="HTML")
+        await call.message.edit_text(f"{ICON_CHECK} Время принято: <b>{html.escape(raw[:80])}</b> (по МСК)."
+                                     + (f"\nТип: <b>{html.escape(_KIND_PLACE[kind])}</b>." if kind_decision.startswith("to_") else ""), parse_mode="HTML")
     except Exception:
         pass
+    return True
 
 async def _time_again(call: CallbackQuery):
     try:
@@ -10675,14 +10769,31 @@ async def _time_again(call: CallbackQuery):
     except Exception:
         await call.message.answer(_time_prompt(), parse_mode="HTML")
 
-@router.callback_query(F.data == "ctime_ok", Form.complaint_time)
-async def ctime_ok(call: CallbackQuery, state: FSMContext):
-    await _time_ok(call, state, "c")
+async def _c_next(call: CallbackQuery, state: FSMContext):
     await state.set_state(Form.complaint_photos)
     await call.message.answer(
         f"{NUM_5} {ICON_PHOTO} <b>Прикрепите доказательства (до 5 фото или видео):</b>\n\n"
         "⚠️ <b>Важно:</b> фото строго запрещено обрезать! Плашка уровней и чат сервера должны быть отчётливо видны.",
         reply_markup=skip_photo_kb("complaint"), parse_mode="HTML")
+
+async def _a_next(call: CallbackQuery, state: FSMContext):
+    await state.set_state(Form.appeal_reason)
+    await call.message.answer(
+        f"{NUM_4} <b>Почему мы должны снять с вас бан?</b>\n"
+        "<i>(Подробно опишите вашу ситуацию и почему вы считаете блокировку ошибочной)</i>",
+        parse_mode="HTML")
+
+@router.callback_query(F.data == "ctime_ok", Form.complaint_time)
+async def ctime_ok(call: CallbackQuery, state: FSMContext):
+    if await _time_ok(call, state, "c"):
+        await _c_next(call, state)
+    await call.answer()
+
+@router.callback_query(F.data.regexp(r"^ckind_(keep|to_[a-z]+)$"), Form.complaint_time)
+async def ckind_choice(call: CallbackQuery, state: FSMContext):
+    decision = call.data[len("ckind_"):]
+    if await _time_ok(call, state, "c", kind_decision=decision):
+        await _c_next(call, state)
     await call.answer()
 
 @router.callback_query(F.data == "ctime_re", Form.complaint_time)
@@ -10692,12 +10803,15 @@ async def ctime_re(call: CallbackQuery):
 
 @router.callback_query(F.data == "atime_ok", Form.appeal_time)
 async def atime_ok(call: CallbackQuery, state: FSMContext):
-    await _time_ok(call, state, "a")
-    await state.set_state(Form.appeal_reason)
-    await call.message.answer(
-        f"{NUM_4} <b>Почему мы должны снять с вас бан?</b>\n"
-        "<i>(Подробно опишите вашу ситуацию и почему вы считаете блокировку ошибочной)</i>",
-        parse_mode="HTML")
+    if await _time_ok(call, state, "a"):
+        await _a_next(call, state)
+    await call.answer()
+
+@router.callback_query(F.data.regexp(r"^akind_(keep|to_[a-z]+)$"), Form.appeal_time)
+async def akind_choice(call: CallbackQuery, state: FSMContext):
+    decision = call.data[len("akind_"):]
+    if await _time_ok(call, state, "a", kind_decision=decision):
+        await _a_next(call, state)
     await call.answer()
 
 @router.callback_query(F.data == "atime_re", Form.appeal_time)
