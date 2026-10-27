@@ -4598,13 +4598,17 @@ async def sec_stats(call: CallbackQuery):
             msk_time = c_time.astimezone(MSK_TZ)
             time_str = msk_time.strftime("%H:%M:%S %d.%m.%Y")
             
-            clean_ch = ch_id.replace("@", "")
-            if clean_ch.startswith("https://t.me/"):
-                post_url = f"{clean_ch}/{mid}"
+            post_url = _channel_post_link(ch_id, mid)
+            if not post_url:
+                clean_ch = str(ch_id or "").replace("@", "")
+                if clean_ch.startswith("https://t.me/"):
+                    post_url = f"{clean_ch}/{mid}"
+                elif clean_ch.lstrip("-").isdigit() and mid:
+                    post_url = f"https://t.me/c/{clean_ch.lstrip('-')}/{mid}"
+            if post_url:
+                text += f"   {post_idx}. {time_str} ({html.escape(stype)}) — <a href='{post_url}'>ссылка</a>\n"
             else:
-                post_url = f"https://t.me/{clean_ch}/{mid}"
-                
-            text += f"   {post_idx}. {time_str} ({html.escape(stype)}) — <a href='{post_url}'>ссылка</a>\n"
+                text += f"   {post_idx}. {time_str} ({html.escape(stype)}) — <i>ссылки нет</i>\n"
             
         text += "\n"
         pub_index += 1
