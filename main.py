@@ -13041,23 +13041,66 @@ async def _send_rich_raw(chat_id, rich_message: dict) -> str:
     except Exception as ex:
         return f"сбой запроса: {ex!r}"
 
+async def _ub_rich_send(peer, kind: str, text: str):
+    """Отправка «богатого» сообщения юзерботом (Telethon 1.44+). kind: 'html' или 'markdown'."""
+    import inspect
+    import random as _rnd
+    from telethon.tl import types as tt, functions as tf
+    cls = getattr(tt, "InputRichMessageHTML" if kind == "html" else "InputRichMessageMarkdown", None)
+    if cls is None:
+        raise RuntimeError("в установленном Telethon нет типов богатых сообщений (нужна 1.44+)")
+    params = [pn for pn in inspect.signature(tf.messages.SendMessageRequest.__init__).parameters if "rich" in pn.lower()]
+    if not params:
+        raise RuntimeError("у SendMessageRequest нет параметра для богатых сообщений")
+    first = next((pn for pn, pp in inspect.signature(cls.__init__).parameters.items()
+                  if pn != "self" and pp.default is inspect._empty), kind)
+    req = tf.messages.SendMessageRequest(peer=peer, message="", random_id=_rnd.getrandbits(63),
+                                         **{params[0]: cls(**{first: text})})
+    return await asyncio.wait_for(userbot(req), 30)
+
 @router.message(Command("richtest"), F.chat.type == "private")
 async def cmd_richtest(message: Message):
-    """/richtest [chat_id] — пробные «богатые» сообщения (Bot API 10.1+). Только владелец. Без аргумента — в личку."""
+    """/richtest [chat_id|@канал] — проба «богатых» сообщений через юзербот (Telethon). Только владелец.
+    Без аргумента: тест-канал, а если не задан — «Избранное» юзербота. /richtest bot [chat_id] — то же через обычного бота."""
     if message.from_user.id != OWNER_ID:
         return
     parts = (message.text or "").split()[1:]
-    target = message.chat.id
-    if parts:
+    via_bot = bool(parts) and parts[0].lower() == "bot"
+    if via_bot:
+        parts = parts[1:]
+    if via_bot:
+        target = message.chat.id
+    else:
+        target = parts[0] if parts else (TEST_CHANNEL_ID or "me")
+    if parts and via_bot:
+        target = parts[0]
+    if isinstance(target, str) and target.lstrip("-").isdigit():
+        target = int(target)
+    report = [f"Способ: {'обычный бот' if via_bot else 'юзербот (Telethon)'}", f"Цель: <code>{html.escape(str(target))}</code>\n"]
+    peer = None
+    if not via_bot:
+        if not userbot:
+            await message.answer("Юзербот не подключён.")
+            return
         try:
-            target = int(parts[0]) if parts[0].lstrip("-").isdigit() else parts[0]
-        except Exception:
-            pass
-    report = [f"Цель: <code>{html.escape(str(target))}</code>\n"]
+            if not userbot.is_connected():
+                await asyncio.wait_for(userbot.connect(), 20)
+            peer = await asyncio.wait_for(userbot.get_input_entity(target), 20)
+        except Exception as ex:
+            await message.answer(f"Не удалось найти чат <code>{html.escape(str(target))}</code>: <code>{html.escape(repr(ex)[:300])}</code>", parse_mode="HTML")
+            return
     for title, payload in _RICH_TESTS:
-        res = await _send_rich_raw(target, payload)
+        if via_bot:
+            res = await _send_rich_raw(target, payload)
+        else:
+            kind, text = next(iter(payload.items()))
+            try:
+                await _ub_rich_send(peer, kind, text)
+                res = "ok"
+            except Exception as ex:
+                res = f"ОШИБКА {repr(ex)[:300]}"
         report.append(f"• {html.escape(title)}: <code>{html.escape(res)}</code>")
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.7)
     await message.answer("\n".join(report), parse_mode="HTML")
 
 _RICH_USER_HTML = ('<h2>Проба юзербота</h2><p>Эмодзи: <tg-emoji emoji-id="5346300789558101141">✅</tg-emoji> '
