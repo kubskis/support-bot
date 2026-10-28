@@ -3230,10 +3230,10 @@ def _rich_req_params() -> dict:
                              "cls": cls, "arg": first, "media_param": media_param, "photo_cls": pcls, "photo_params": pparams})
     return _RICH_PARAMS
 
-async def _rich_enabled() -> bool:
+async def _rich_enabled(force: bool = False) -> bool:
     if not userbot:
         return False
-    if (await _get_setting_raw("rich_posts", "0")) != "1":
+    if not force and (await _get_setting_raw("rich_posts", "0")) != "1":
         return False
     P = _rich_req_params()
     return bool(P["send"] and P["cls"])
@@ -3358,7 +3358,7 @@ async def _ub_send_rich_text(label: str, target_peer, rich_html: str, slot=None)
             mid = found.id if found else None
         if not mid:
             raise RuntimeError("Telegram принял сообщение, но не вернул его номер")
-        return SimpleNamespace(id=mid)
+        return SimpleNamespace(id=mid, rich=True)
     return await _ub_request(label, _go, on_retry=_find)
 
 async def _ub_edit_rich_text(label: str, target_peer, message_id: int, rich_html: str, slot=None):
@@ -3373,11 +3373,11 @@ async def _ub_edit_rich_text(label: str, target_peer, message_id: int, rich_html
         lambda: userbot(tf.messages.EditMessageRequest(peer=peer, id=message_id, **{P["edit"]: obj}))
     )
 
-async def _ub_send_text(label: str, target_peer, parsed_text: str, entities, rich_src=None):
-    """rich_src: исходный HTML шаблона. Если включён /rich on, пост уходит богатым сообщением, при ошибке обычным."""
-    if rich_src is not None and await _rich_enabled():
+async def _ub_send_text(label: str, target_peer, parsed_text: str, entities, rich_src=None, force_rich: bool = False, slot=None):
+    """rich_src: исходный HTML шаблона. Если включён /rich on (или force_rich), пост уходит богатым сообщением, при ошибке обычным."""
+    if rich_src is not None and await _rich_enabled(force_rich):
         try:
-            return await _ub_send_rich_text(label, target_peer, html_to_rich(rich_src, await _rich_join_br()))
+            return await _ub_send_rich_text(label, target_peer, html_to_rich(rich_src, await _rich_join_br()), slot)
         except FloodWaitError:
             raise
         except Exception as e:
@@ -3434,9 +3434,9 @@ async def _is_classic_photo_post(target_peer, message_id: int) -> bool:
         return False
 
 async def _ub_edit_text(label: str, target_peer, message_id: int, parsed_text: str, entities, rich_src=None,
-                        slot=None, natural: bool = False):
+                        slot=None, natural: bool = False, force_rich: bool = False):
     """natural=True: у поста «родное» фото (секретка, мутатор, исследователь): фото из шаблона заменяется им (slot)."""
-    if rich_src is not None and await _rich_enabled() and _rich_req_params()["edit"] \
+    if rich_src is not None and await _rich_enabled(force_rich) and _rich_req_params()["edit"] \
             and not await _is_classic_photo_post(target_peer, message_id):
         try:
             src = _slotify(rich_src) if natural else rich_src
@@ -3701,6 +3701,8 @@ class SecretAdminStates(StatesGroup):
     call_command = State()
     test_channel = State()
     prelink_duration = State()
+    test_tmpl_active = State()
+    test_tmpl_expired = State()
 
 # ----------------------------------------------------------------------
 # КЛАВИАТУРЫ
@@ -3751,6 +3753,7 @@ async def admin_panel_kb():
         [IB(text="📈 Аналитика канала", callback_data="adm_chan_stats")],
         [IB(text="💎 Платные услуги (Stars)", callback_data="shopa_menu")],
         [IB(text="👥 Рефералка", callback_data="refa_menu")],
+        [IB(text="🧪 Тест", callback_data="adm_test")],
         [IB(text="⚙️ Система и доступ", callback_data="adm_system")],
     ])
 
@@ -3778,8 +3781,6 @@ async def system_kb():
         [IB(text=f"{maint_icon} Тех. перерыв: {maint_word}", callback_data="toggle_maintenance")],
         [IB(text=f"{'🟢' if ds_on else '🔴'} Ежедневная сводка: {'Вкл' if ds_on else 'Выкл'}", callback_data="toggle_daily_summary"),
          IB(text="📨 Сводка сейчас", callback_data="daily_summary_now")],
-        [IB(text=f"🧪 Тест режим: {test_word}", callback_data="toggle_testmode"),
-         IB(text="📡 Канал тест-режима", callback_data="set_test_channel")],
         [IB(text="👥 Публикаторы секреток", callback_data="sec_manage_pubs")],
         [IB(text="👋 Приветствие бота", callback_data="adm_welcome")],
         [IB(text="👑 Главные админы поддержки", callback_data="manage_main_admins")],
@@ -4927,7 +4928,8 @@ async def set_test_channel_proc(message: Message, state: FSMContext):
     TEST_CHANNEL_ID = new_id
     await set_setting("test_channel_id", new_id)
     await state.clear()
-    await message.answer(f"{ICON_CHECK} Канал тест-режима сохранён: <b>{html.escape(chat.title or raw)}</b> (<code>{new_id}</code>)", parse_mode="HTML")
+    await message.answer(f"{ICON_CHECK} Канал тест-режима сохранён: <b>{html.escape(chat.title or raw)}</b> (<code>{new_id}</code>)", parse_mode="HTML",
+                         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[IB(text="🧪 К тесту", callback_data="adm_test")]]))
 
 @router.callback_query(F.data == "toggle_testmode")
 async def toggle_testmode_callback(call: CallbackQuery):
@@ -4959,7 +4961,10 @@ async def toggle_testmode_callback(call: CallbackQuery):
     logging.warning(f"Тест режим {'ВКЛЮЧЁН' if TEST_MODE_ON else 'выключен'} пользователем {call.from_user.id}")
     await call.answer(msg[:200], show_alert=True)
     try:
-        await call.message.edit_reply_markup(reply_markup=await system_kb())
+        if (call.message.text or "").startswith("🧪 Тест"):
+            await _test_show(call)
+        else:
+            await call.message.edit_reply_markup(reply_markup=await system_kb())
     except Exception:
         pass
     if summary_text:
@@ -5665,7 +5670,7 @@ async def sec_tmpl_res_act(call: CallbackQuery, state: FSMContext):
     )
     await call.answer()
 
-@router.message(SecretAdminStates.template_researcher_active, F.text)
+@router.message(SecretAdminStates.template_researcher_active)
 async def sec_tmpl_res_act_proc(message: Message, state: FSMContext):
     if not await is_main_admin(message.from_user.id): return
     saved_text = extract_text_with_custom_emojis(message)
@@ -5689,7 +5694,7 @@ async def sec_tmpl_res_exp(call: CallbackQuery, state: FSMContext):
     )
     await call.answer()
 
-@router.message(SecretAdminStates.template_researcher_expired, F.text)
+@router.message(SecretAdminStates.template_researcher_expired)
 async def sec_tmpl_res_exp_proc(message: Message, state: FSMContext):
     if not await is_main_admin(message.from_user.id): return
     saved_text = extract_text_with_custom_emojis(message)
@@ -5757,8 +5762,6 @@ async def sec_prelink_add_proc(message: Message, state: FSMContext):
          IB(text="🗓 Месяц", callback_data="sec_prelink_dur_month"),
          IB(text="♾ Навсегда", callback_data="sec_prelink_dur_forever")],
     ]
-    if message.from_user.id == OWNER_ID:
-        dur_rows.append([IB(text="🧪 Тест на 1 минуту", callback_data="sec_prelink_dur_test")])
     dur_rows.append([IB(text="❌ Отменить", callback_data="sec_prelinks")])
     kb = InlineKeyboardMarkup(inline_keyboard=dur_rows)
     labels = [f"{u} - {await get_user_label(u)}" for u in ids]
@@ -9368,6 +9371,16 @@ async def _process_shop_payment(message: Message, sp, is_test: bool):
             f"Сумма: <b>{sp.total_amount} ⭐</b>{addon_note}{promo_note}\n⚠️ Услуга не привязана к боту: нужно выдать вручную.\nПлатёж: <code>{html.escape(charge_id)}</code>"
         )
 
+async def _testpay_list_text() -> str:
+    rows = await _db_all(
+        "SELECT t.id, s.title, t.label, t.stars, s.kind FROM shop_tariffs t JOIN shop_services s ON s.id = t.service_id ORDER BY s.sort, s.id, t.sort, t.id"
+    )
+    lines = [f"<code>/testpay {r[0]}</code> — {html.escape(r[1])}: {html.escape(r[2])}, {r[3]} ⭐" + (" (Предссылки, выдадутся вам)" if r[4] == "prelinks" else "") for r in rows]
+    lines.append("\nС допуслугой: <code>/testpay НОМЕР 1</code> (если у услуги она включена).")
+    lines.append("С вашим промокодом: добавьте слово <code>promo</code>, например <code>/testpay НОМЕР promo</code>.")
+    return ("🧪 <b>Тест оплаты без звёзд</b>\nИмитирует успешную оплату выбранного тарифа: запись в историю, выдача (для Предссылок), уведомления вам и админам.\n\n"
+            + ("\n".join(lines) if rows else "Тарифов пока нет."))
+
 @router.message(Command("testpay"), F.chat.type == "private")
 async def cmd_testpay(message: Message, command: CommandObject):
     """Только для владельца: имитация успешной оплаты без звёзд (вся цепочка выдачи и уведомлений)."""
@@ -9378,17 +9391,7 @@ async def cmd_testpay(message: Message, command: CommandObject):
     want_addon = "1" in args[1:]
     want_promo = "promo" in [a.lower() for a in args[1:]]
     if not arg.isdigit():
-        rows = await _db_all(
-            "SELECT t.id, s.title, t.label, t.stars, s.kind FROM shop_tariffs t JOIN shop_services s ON s.id = t.service_id ORDER BY s.sort, s.id, t.sort, t.id"
-        )
-        lines = [f"<code>/testpay {r[0]}</code> — {html.escape(r[1])}: {html.escape(r[2])}, {r[3]} ⭐" + (" (Предссылки, выдадутся вам)" if r[4] == "prelinks" else "") for r in rows]
-        lines.append("\nС допуслугой: <code>/testpay НОМЕР 1</code> (если у услуги она включена).")
-        lines.append("С вашим промокодом: добавьте слово <code>promo</code>, например <code>/testpay НОМЕР promo</code>.")
-        await message.answer(
-            "🧪 <b>Тест оплаты без звёзд</b>\nИмитирует успешную оплату выбранного тарифа: запись в историю, выдача (для Предссылок), уведомления вам и админам.\n\n"
-            + ("\n".join(lines) if lines else "Тарифов пока нет."),
-            parse_mode="HTML"
-        )
+        await message.answer(await _testpay_list_text(), parse_mode="HTML")
         return
     t = await shop_get_tariff(int(arg))
     if not t:
@@ -13811,6 +13814,345 @@ _RICH_HELP = (
 )
 
 _PHOTO_NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+# ----------------------------------------------------------------------
+# РАЗДЕЛ АДМИН-ПАНЕЛИ «🧪 ТЕСТ»: тест-пост со своими шаблонами и все тест-функции бота в одном месте
+# ----------------------------------------------------------------------
+TEST_POST_TTL = 120   # через столько секунд тест-пост меняется на «истекший» шаблон
+DEFAULT_TEST_ACTIVE = (
+    "🧪 <b>Тестовый пост</b>\n\n"
+    "Время: [Время] МСК\n"
+    "Формат: [Режим]\n\n"
+    "Через [Таймер] сек. пост сменится на «истекший» шаблон."
+)
+DEFAULT_TEST_EXPIRED = "🧪 <b>Тестовый пост</b>\n\nВремя вышло!"
+_TEST_FMT_LABEL = {"rich": "Богатый", "classic": "Обычный", "flag": "Как на боевых постах"}
+
+async def _test_fmt() -> str:
+    v = await _get_setting_raw("test_post_fmt", "rich")
+    return v if v in _TEST_FMT_LABEL else "rich"
+
+async def _test_rich_wanted() -> bool:
+    fmt = await _test_fmt()
+    return fmt == "rich" or (fmt == "flag" and (await _get_setting_raw("rich_posts", "0")) == "1")
+
+def _test_fill(tmpl: str, rich: bool) -> str:
+    return (tmpl.replace("[Время]", datetime.now(MSK_TZ).strftime("%H:%M:%S"))
+                .replace("[Режим]", "богатый" if rich else "обычный")
+                .replace("[Таймер]", str(TEST_POST_TTL)))
+
+async def _test_last() -> dict:
+    try:
+        return json.loads(await _get_setting_raw("test_post_last", "") or "{}") or {}
+    except Exception:
+        return {}
+
+async def publish_test_post():
+    """Публикует тест-пост в тест-канал (всегда, независимо от тест-режима). Возвращает (успех, текст для админа)."""
+    ch = TEST_CHANNEL_ID
+    if not ch:
+        return False, "Сначала задайте канал тест-режима (кнопка «📡 Канал тест-режима», только владелец)."
+    rich_wanted = await _test_rich_wanted()
+    tmpl = (await _get_setting_raw("test_tmpl_active", DEFAULT_TEST_ACTIVE)) or DEFAULT_TEST_ACTIVE
+    text = _test_fill(tmpl, rich_wanted)
+    try:
+        if userbot:
+            if not userbot.is_connected():
+                await asyncio.wait_for(userbot.connect(), 20)
+            parsed, ents = await parse_telethon_custom_emojis(userbot, text)
+            sent = await _ub_send_text("[Тест]", _channel_peer(ch), parsed, ents,
+                                       rich_src=text if rich_wanted else None, force_rich=rich_wanted, slot=MUTATOR_PHOTO)
+            mid, used_rich = sent.id, bool(getattr(sent, "rich", False))
+        else:
+            sent = await bot.send_message(chat_id=ch, text=strip_nt(text), parse_mode="HTML",
+                                          link_preview_options=LinkPreviewOptions(is_disabled=True))
+            mid, used_rich = sent.message_id, False
+    except Exception as ex:
+        logging.error(f"Тест-пост не опубликован: {ex!r}")
+        return False, f"Не вышло: {type(ex).__name__}: {str(ex)[:300]}"
+    await set_setting("test_post_last", json.dumps({"ch": str(ch), "id": mid, "rich": used_rich, "expired": False, "t": time.time()}))
+    spawn(_test_expire_timer(mid))
+    link = _channel_post_link(ch, mid)
+    how = "богатым сообщением" if used_rich else ("обычным (богатый не сработал, см. уведомление)" if rich_wanted else "обычным")
+    return True, f"Опубликован {how}, №{mid}. Через {TEST_POST_TTL} сек. он сменится на «истекший» шаблон." + (f"\n{link}" if link else "")
+
+async def _test_expire_timer(mid: int):
+    await asyncio.sleep(TEST_POST_TTL)
+    last = await _test_last()
+    if last.get("id") == mid and not last.get("expired"):
+        ok, msg = await expire_test_post()
+        if not ok:
+            await _notify_owner(f"⚠️ Тест-пост №{mid} не удалось сменить на «истекший»: {html.escape(msg)}")
+
+async def expire_test_post():
+    """Меняет последний тест-пост на «истекший» шаблон. Возвращает (успех, текст)."""
+    d = await _test_last()
+    if not d or d.get("expired") or not d.get("id"):
+        return False, "Нет активного тест-поста."
+    d["expired"] = True
+    await set_setting("test_post_last", json.dumps(d))
+    tmpl = (await _get_setting_raw("test_tmpl_expired", DEFAULT_TEST_EXPIRED)) or DEFAULT_TEST_EXPIRED
+    use_rich = bool(d.get("rich"))
+    text = _test_fill(tmpl, use_rich)
+    try:
+        if userbot:
+            if not userbot.is_connected():
+                await asyncio.wait_for(userbot.connect(), 20)
+            parsed, ents = await parse_telethon_custom_emojis(userbot, text)
+            await _ub_edit_text("[Тест, истёк]", _channel_peer(d["ch"]), d["id"], parsed, ents,
+                                rich_src=text if use_rich else None, force_rich=use_rich, slot=MUTATOR_PHOTO)
+        else:
+            await bot.edit_message_text(chat_id=d["ch"], message_id=d["id"], text=strip_nt(text), parse_mode="HTML",
+                                        link_preview_options=LinkPreviewOptions(is_disabled=True))
+    except MessageNotModifiedError:
+        pass
+    except Exception as ex:
+        return False, f"{type(ex).__name__}: {str(ex)[:300]}"
+    return True, "Тест-пост сменён на «истекший» шаблон."
+
+def _as_cmd(call: CallbackQuery, text: str) -> Message:
+    """Копия сообщения от имени нажавшего: чтобы кнопки раздела вызывали те же обработчики, что и команды."""
+    return call.message.model_copy(update={"text": text, "from_user": call.from_user})
+
+async def _test_menu():
+    fmt = await _test_fmt()
+    rich_prod = (await _get_setting_raw("rich_posts", "0")) == "1"
+    last = await _test_last()
+    link = _channel_post_link(TEST_CHANNEL_ID, last.get("id")) if last.get("id") and str(last.get("ch")) == str(TEST_CHANNEL_ID) else ""
+    last_s = ""
+    if last.get("id"):
+        last_s = f"\nПоследний тест-пост: №{last['id']}" + (" (истёк)" if last.get("expired") else " (идёт)") + (f"\n{link}" if link else "")
+    text = (
+        "🧪 <b>Тест</b>\n\n"
+        f"Канал: <code>{html.escape(TEST_CHANNEL_ID or 'не задан')}</code>\n"
+        f"Тест-режим: <b>{'ВКЛЮЧЁН' if TEST_MODE_ON else 'выключен'}</b>\n"
+        f"Формат тест-поста: <b>{_TEST_FMT_LABEL[fmt]}</b>\n"
+        f"Богатый формат боевых постов: <b>{'включён' if rich_prod else 'выключен'}</b>"
+        + last_s +
+        "\n\nТест-пост всегда уходит в тест-канал. В шаблонах работают теги <code>[Время]</code>, <code>[Режим]</code>, <code>[Таймер]</code> "
+        "и строки <code># заголовок</code>, <code>- список</code>, <code>| таблица |</code>, <code>---</code>, <code>[фото:имя]</code>, <code>[фото]</code> "
+        "(на место [фото] встаёт картинка мутатора). Справка по форматированию: /rich"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [IB(text="🚀 Опубликовать тест-пост", callback_data="test_post_pub"),
+         IB(text="⏭ Сменить на истекший", callback_data="test_post_exp")],
+        [IB(text="📝 Тест-шаблон", callback_data="test_tmpl_act"),
+         IB(text="⌛ Истекший тест-шаблон", callback_data="test_tmpl_exp")],
+        [IB(text="👁 Показать шаблоны", callback_data="test_tmpl_view"),
+         IB(text=f"🔀 Формат: {_TEST_FMT_LABEL[fmt]}", callback_data="test_fmt_cycle")],
+        [IB(text=f"{'🟢' if rich_prod else '🔴'} Богатый формат боевых постов", callback_data="test_rich_toggle")],
+        [IB(text=f"🧪 Тест-режим: {'ВКЛЮЧЁН' if TEST_MODE_ON else 'Выкл'}", callback_data="toggle_testmode"),
+         IB(text="📡 Канал тест-режима", callback_data="set_test_channel")],
+        [IB(text="🩺 Самопроверка", callback_data="test_selfcheck"),
+         IB(text="📊 Сводка теста", callback_data="test_summary")],
+        [IB(text="🔔 Тест предссылок (1 мин)", callback_data="test_prelink"),
+         IB(text="💳 Тест оплаты", callback_data="test_pay")],
+        [IB(text="🧪 Пробы форматирования", callback_data="test_richtest"),
+         IB(text="📚 Все шаблоны в богатом виде", callback_data="test_richtpl")],
+        [IB(text="🧾 Диагностика Telethon", callback_data="test_richuser"),
+         IB(text="🖼 Сохранённые фото", callback_data="test_photos")],
+        [IB(text="🔙 Назад", callback_data="back_to_adm")],
+    ])
+    return text, kb
+
+async def _test_show(call: CallbackQuery):
+    text, kb = await _test_menu()
+    try:
+        await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
+    except Exception:
+        await call.message.answer(text, reply_markup=kb, parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
+
+TEST_TMPL_CANCEL_KB = InlineKeyboardMarkup(inline_keyboard=[[IB(text="❌ Отменить", callback_data="test_tmpl_cancel")]])
+
+@router.callback_query(F.data == "adm_test")
+async def adm_test_screen(call: CallbackQuery):
+    if not await is_main_admin(call.from_user.id): return
+    await _test_show(call)
+    await call.answer()
+
+@router.callback_query(F.data == "test_tmpl_cancel")
+async def test_tmpl_cancel(call: CallbackQuery, state: FSMContext):
+    if not await is_main_admin(call.from_user.id): return
+    await state.clear()
+    await call.answer("Отменено")
+    await _test_show(call)
+
+@router.callback_query(F.data == "test_post_pub")
+async def test_post_pub_cb(call: CallbackQuery):
+    if not await is_main_admin(call.from_user.id): return
+    await call.answer("Публикую…")
+    ok, msg = await publish_test_post()
+    await alog(call.from_user.id, "testpost", "", "ok" if ok else "ошибка")
+    await call.message.answer(("🚀 " if ok else f"{ICON_CROSS} ") + html.escape(msg), parse_mode="HTML",
+                              link_preview_options=LinkPreviewOptions(is_disabled=True))
+    await _test_show(call)
+
+@router.callback_query(F.data == "test_post_exp")
+async def test_post_exp_cb(call: CallbackQuery):
+    if not await is_main_admin(call.from_user.id): return
+    ok, msg = await expire_test_post()
+    await call.answer(("✅ " if ok else "❌ ") + msg[:180], show_alert=True)
+    await _test_show(call)
+
+@router.callback_query(F.data == "test_fmt_cycle")
+async def test_fmt_cycle_cb(call: CallbackQuery):
+    if not await is_main_admin(call.from_user.id): return
+    order = ["rich", "classic", "flag"]
+    cur = await _test_fmt()
+    new = order[(order.index(cur) + 1) % 3]
+    await set_setting("test_post_fmt", new)
+    await call.answer(f"Формат тест-поста: {_TEST_FMT_LABEL[new]}")
+    await _test_show(call)
+
+@router.callback_query(F.data == "test_rich_toggle")
+async def test_rich_toggle_cb(call: CallbackQuery):
+    if not _is_owner(call.from_user.id):
+        await call.answer("❌ Богатый формат боевых постов включает только создатель бота.", show_alert=True)
+        return
+    on = (await _get_setting_raw("rich_posts", "0")) == "1"
+    if not on and not (_rich_req_params()["send"] and _rich_req_params()["cls"]):
+        await call.answer("❌ Установленный Telethon не умеет богатые сообщения (нужна 1.44+).", show_alert=True)
+        return
+    await set_setting("rich_posts", "0" if on else "1")
+    await alog(call.from_user.id, "rich", "off" if on else "on")
+    await call.answer("Богатый формат боевых постов " + ("выключен" if on else "включён"), show_alert=True)
+    await _test_show(call)
+
+@router.callback_query(F.data.in_({"test_tmpl_act", "test_tmpl_exp"}))
+async def test_tmpl_edit_prompt(call: CallbackQuery, state: FSMContext):
+    if not await is_main_admin(call.from_user.id): return
+    active = call.data == "test_tmpl_act"
+    key, dflt = ("test_tmpl_active", DEFAULT_TEST_ACTIVE) if active else ("test_tmpl_expired", DEFAULT_TEST_EXPIRED)
+    cur = (await _get_setting_raw(key, dflt)) or dflt
+    await state.set_state(SecretAdminStates.test_tmpl_active if active else SecretAdminStates.test_tmpl_expired)
+    await call.message.answer(
+        f"{ICON_PENCIL} <b>Текущий {'тест-шаблон' if active else 'истекший тест-шаблон'}:</b>\n\n{cur}\n\n"
+        "Отправьте новый текст: обычное сообщение или сообщение с расширенным форматированием. "
+        "Теги: <code>[Время]</code>, <code>[Режим]</code>, <code>[Таймер]</code>. "
+        "Фото: добавьте картинку в сообщение (на её место встанет картинка мутатора) или пишите <code>[фото:имя]</code>.",
+        parse_mode="HTML", reply_markup=TEST_TMPL_CANCEL_KB
+    )
+    await call.answer()
+
+@router.message(SecretAdminStates.test_tmpl_active)
+async def test_tmpl_active_proc(message: Message, state: FSMContext):
+    if not await is_main_admin(message.from_user.id): return
+    saved = extract_text_with_custom_emojis(message)
+    if not saved.strip():
+        await message.answer(f"{ICON_CROSS} Не нашёл текста. Отправьте шаблон ещё раз или нажмите «Отменить».", parse_mode="HTML", reply_markup=TEST_TMPL_CANCEL_KB)
+        return
+    await set_setting("test_tmpl_active", saved)
+    await state.clear()
+    await alog(message.from_user.id, "testtmpl", "active")
+    await message.answer(f"{ICON_CHECK} Тест-шаблон сохранён! Опубликуйте тест-пост в разделе «🧪 Тест».", parse_mode="HTML",
+                         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[IB(text="🧪 К тесту", callback_data="adm_test")]]))
+
+@router.message(SecretAdminStates.test_tmpl_expired)
+async def test_tmpl_expired_proc(message: Message, state: FSMContext):
+    if not await is_main_admin(message.from_user.id): return
+    saved = extract_text_with_custom_emojis(message)
+    if not saved.strip():
+        await message.answer(f"{ICON_CROSS} Не нашёл текста. Отправьте шаблон ещё раз или нажмите «Отменить».", parse_mode="HTML", reply_markup=TEST_TMPL_CANCEL_KB)
+        return
+    await set_setting("test_tmpl_expired", saved)
+    await state.clear()
+    await alog(message.from_user.id, "testtmpl", "expired")
+    await message.answer(f"{ICON_CHECK} Истекший тест-шаблон сохранён!", parse_mode="HTML",
+                         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[IB(text="🧪 К тесту", callback_data="adm_test")]]))
+
+@router.callback_query(F.data == "test_tmpl_view")
+async def test_tmpl_view_cb(call: CallbackQuery):
+    if not await is_main_admin(call.from_user.id): return
+    a = (await _get_setting_raw("test_tmpl_active", DEFAULT_TEST_ACTIVE)) or DEFAULT_TEST_ACTIVE
+    e = (await _get_setting_raw("test_tmpl_expired", DEFAULT_TEST_EXPIRED)) or DEFAULT_TEST_EXPIRED
+    for title, body in (("Тест-шаблон", a), ("Истекший тест-шаблон", e)):
+        try:
+            await call.message.answer(f"<b>{title}</b> (как хранится):\n\n{strip_nt(body)}", parse_mode="HTML")
+        except Exception:
+            await call.message.answer(f"{title} (как хранится, без разметки):\n\n{strip_nt(body)}")
+    await call.answer()
+
+@router.callback_query(F.data == "test_selfcheck")
+async def test_selfcheck_cb(call: CallbackQuery):
+    if not await is_main_admin(call.from_user.id): return
+    await call.answer("Проверяю…")
+    try:
+        report = await run_selfcheck()
+    except Exception as e:
+        report = f"🧪 Самопроверка не удалась: {html.escape(str(e))[:300]}"
+    await call.message.answer(report, parse_mode="HTML")
+
+@router.callback_query(F.data == "test_summary")
+async def test_summary_cb(call: CallbackQuery):
+    if not await is_main_admin(call.from_user.id): return
+    if not TEST_CHANNEL_ID:
+        await call.answer("❌ Канал тест-режима не задан.", show_alert=True)
+        return
+    started = TEST_STARTED_AT or (datetime.now(timezone.utc) - timedelta(hours=1))
+    await call.answer()
+    await call.message.answer(await build_test_summary(started), parse_mode="HTML")
+
+@router.callback_query(F.data == "test_prelink")
+async def test_prelink_cb(call: CallbackQuery):
+    if not _is_owner(call.from_user.id):
+        await call.answer("❌ Тест предссылок доступен только создателю бота.", show_alert=True)
+        return
+    expires = datetime.now(timezone.utc) + timedelta(minutes=1)
+    def _add():
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO prelink_users (user_id, expires_at, is_test) VALUES (%s, %s, TRUE) "
+                    "ON CONFLICT (user_id) DO UPDATE SET expires_at = EXCLUDED.expires_at, is_test = TRUE",
+                    (call.from_user.id, expires))
+    await asyncio.to_thread(_add)
+    await alog(call.from_user.id, "testprelink", "", "1 мин")
+    await call.answer("Вам выданы предссылки на 1 минуту, потом придёт уведомление об окончании.", show_alert=True)
+    try:
+        await bot.send_message(call.from_user.id,
+            "🔔 <b>Тест предссылок.</b> Доступ действует 1 минуту, потом придёт уведомление об окончании.", parse_mode="HTML")
+    except Exception:
+        pass
+
+@router.callback_query(F.data == "test_pay")
+async def test_pay_cb(call: CallbackQuery):
+    if not _is_owner(call.from_user.id):
+        await call.answer("❌ Тест оплаты доступен только создателю бота.", show_alert=True)
+        return
+    await call.answer()
+    await call.message.answer(await _testpay_list_text(), parse_mode="HTML")
+
+@router.callback_query(F.data == "test_richtest")
+async def test_richtest_cb(call: CallbackQuery):
+    if not _is_owner(call.from_user.id):
+        await call.answer("❌ Только для создателя бота.", show_alert=True)
+        return
+    await call.answer("Отправляю пробы…")
+    await cmd_richtest(_as_cmd(call, "/richtest"))
+
+@router.callback_query(F.data == "test_richtpl")
+async def test_richtpl_cb(call: CallbackQuery):
+    if not _is_owner(call.from_user.id):
+        await call.answer("❌ Только для создателя бота.", show_alert=True)
+        return
+    await call.answer("Отправляю шаблоны…")
+    await _richtest_templates(_as_cmd(call, "/richtest tpl"), [])
+
+@router.callback_query(F.data == "test_richuser")
+async def test_richuser_cb(call: CallbackQuery):
+    if not _is_owner(call.from_user.id):
+        await call.answer("❌ Только для создателя бота.", show_alert=True)
+        return
+    await call.answer("Проверяю…")
+    await cmd_richuser(_as_cmd(call, "/richuser"))
+
+@router.callback_query(F.data == "test_photos")
+async def test_photos_cb(call: CallbackQuery):
+    if not _is_owner(call.from_user.id):
+        await call.answer("❌ Только для создателя бота.", show_alert=True)
+        return
+    await call.answer()
+    await cmd_photos(_as_cmd(call, "/photos"))
 
 @router.message(F.photo, F.caption.regexp(r"^/photo(?:@\w+)?\s+\S+"), F.chat.type == "private")
 async def photo_save_by_caption(message: Message):
