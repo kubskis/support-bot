@@ -13060,6 +13060,73 @@ async def cmd_richtest(message: Message):
         await asyncio.sleep(0.5)
     await message.answer("\n".join(report), parse_mode="HTML")
 
+_RICH_USER_HTML = ('<h2>Проба юзербота</h2><p>Эмодзи: <tg-emoji emoji-id="5346300789558101141">✅</tg-emoji> '
+                   'и <b>жирный</b>, <i>курсив</i></p><ul><li>пункт один</li><li>пункт два</li></ul>')
+
+@router.message(Command("richuser"), F.chat.type == "private")
+async def cmd_richuser(message: Message):
+    """/richuser [chat_id|@канал] — проба «богатых» сообщений через юзербот (Telethon, MTProto). Только владелец.
+    Без аргумента: в тест-канал, а если он не задан — в «Избранное» юзербота. Сначала выводит, что умеет установленный Telethon."""
+    if message.from_user.id != OWNER_ID:
+        return
+    if not userbot:
+        await message.answer("Юзербот не подключён.")
+        return
+    import inspect
+    import telethon
+    from telethon.tl import types as tt, functions as tf
+    try:
+        from telethon.tl.alltlobjects import LAYER
+    except Exception:
+        LAYER = "?"
+    info = [f"Telethon <code>{html.escape(str(getattr(telethon, '__version__', '?')))}</code>, слой <code>{LAYER}</code>"]
+    rich_types = sorted(n for n in dir(tt) if "rich" in n.lower())
+    info.append("Типы: " + (", ".join(f"<code>{html.escape(n)}</code>" for n in rich_types[:12]) or "<b>нет</b>"))
+    rich_param = None
+    msgs_mod = tf.messages
+    for rn in ("SendMessageRequest", "SendMediaRequest", "EditMessageRequest"):
+        cls = getattr(msgs_mod, rn, None)
+        params = []
+        if cls is not None:
+            try:
+                params = [pn for pn in inspect.signature(cls.__init__).parameters if "rich" in pn.lower()]
+            except Exception:
+                pass
+        info.append(f"{rn}: " + (", ".join(f"<code>{pn}</code>" for pn in params) or "параметра нет"))
+        if rn == "SendMessageRequest" and params:
+            rich_param = params[0]
+    extra = sorted(n for n in dir(msgs_mod) if "rich" in n.lower())
+    if extra:
+        info.append("Запросы: " + ", ".join(f"<code>{html.escape(n)}</code>" for n in extra))
+    html_cls = getattr(tt, "InputRichMessageHTML", None)
+    if not (rich_param and html_cls):
+        info.append("\nОтправить пробу нельзя: установленный Telethon не умеет богатые сообщения (нужна версия 1.44+).")
+        await message.answer("\n".join(info), parse_mode="HTML")
+        return
+    parts = (message.text or "").split()[1:]
+    target = parts[0] if parts else (TEST_CHANNEL_ID or "me")
+    try:
+        target = int(target) if str(target).lstrip("-").isdigit() else target
+    except Exception:
+        pass
+    try:
+        if not userbot.is_connected():
+            await asyncio.wait_for(userbot.connect(), 20)
+        peer = await asyncio.wait_for(userbot.get_input_entity(target), 20)
+        try:
+            sig = inspect.signature(html_cls.__init__)
+            first = next(pn for pn, pp in sig.parameters.items() if pn != "self" and pp.default is inspect._empty)
+        except Exception:
+            first = "html"
+        rich_obj = html_cls(**{first: _RICH_USER_HTML})
+        import random as _rnd
+        req = tf.messages.SendMessageRequest(peer=peer, message="", random_id=_rnd.getrandbits(63), **{rich_param: rich_obj})
+        res = await asyncio.wait_for(userbot(req), 30)
+        info.append(f"\nОтправка в <code>{html.escape(str(target))}</code>: <b>ok</b> ({html.escape(type(res).__name__)})")
+    except Exception as ex:
+        info.append(f"\nОтправка в <code>{html.escape(str(target))}</code>: <b>ОШИБКА</b> <code>{html.escape(repr(ex)[:500])}</code>")
+    await message.answer("\n".join(info), parse_mode="HTML")
+
 @router.message(Command("event"), F.chat.type == "private")
 async def cmd_event(message: Message):
     """/event — статус; /event halloween [дней] | newyear [дней] — включить (по умолчанию на 7 дней); /event off — выключить."""
