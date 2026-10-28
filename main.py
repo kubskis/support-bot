@@ -13017,6 +13017,49 @@ async def _event_line() -> str:
     ev = await current_event()
     return ("\n\n" + EVENTS[ev]["line"]) if ev else ""
 
+_RICH_TESTS = [
+    ("markdown: заголовки, список, цитата",
+     {"markdown": "# Заголовок 1\n\n## Заголовок 2\n\nОбычный текст, **жирный**, *курсив*, ~~зачёркнутый~~.\n\n- пункт один\n- пункт два\n\n1. первый\n2. второй\n\n> Цитата"}),
+    ("markdown: таблица",
+     {"markdown": "| Тип | Награда |\n|---|---|\n| Тропы | нимб |\n| Сейф | монеты |"}),
+    ("html: сворачиваемый блок и разделитель",
+     {"html": "<h2>Блок HTML</h2><p>Текст перед разделителем</p><hr><details><summary>Нажми, чтобы раскрыть</summary><p>Скрытый текст</p></details>"}),
+    ("html: кастомный эмодзи (как в наших шаблонах)",
+     {"html": "<p>Проверка эмодзи: <tg-emoji emoji-id=\"5346300789558101141\">✅</tg-emoji> и обычный ✅</p>"}),
+]
+
+async def _send_rich_raw(chat_id, rich_message: dict) -> str:
+    """Сырой вызов Bot API sendRichMessage (не зависит от версии aiogram). Возвращает 'ok …' или текст ошибки."""
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendRichMessage"
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as sess:
+            async with sess.post(url, json={"chat_id": chat_id, "rich_message": rich_message}) as r:
+                data = await r.json(content_type=None)
+        if data.get("ok"):
+            return f"ok, message_id={data.get('result', {}).get('message_id')}"
+        return f"ОШИБКА {data.get('error_code')}: {data.get('description')}"
+    except Exception as ex:
+        return f"сбой запроса: {ex!r}"
+
+@router.message(Command("richtest"), F.chat.type == "private")
+async def cmd_richtest(message: Message):
+    """/richtest [chat_id] — пробные «богатые» сообщения (Bot API 10.1+). Только владелец. Без аргумента — в личку."""
+    if message.from_user.id != OWNER_ID:
+        return
+    parts = (message.text or "").split()[1:]
+    target = message.chat.id
+    if parts:
+        try:
+            target = int(parts[0]) if parts[0].lstrip("-").isdigit() else parts[0]
+        except Exception:
+            pass
+    report = [f"Цель: <code>{html.escape(str(target))}</code>\n"]
+    for title, payload in _RICH_TESTS:
+        res = await _send_rich_raw(target, payload)
+        report.append(f"• {html.escape(title)}: <code>{html.escape(res)}</code>")
+        await asyncio.sleep(0.5)
+    await message.answer("\n".join(report), parse_mode="HTML")
+
 @router.message(Command("event"), F.chat.type == "private")
 async def cmd_event(message: Message):
     """/event — статус; /event halloween [дней] | newyear [дней] — включить (по умолчанию на 7 дней); /event off — выключить."""
