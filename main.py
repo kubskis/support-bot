@@ -928,12 +928,228 @@ def html_cut(src: str, limit: int) -> str:
         out.append(f"</{stack.pop()}>")
     return "".join(out)
 
+# ----------------------------------------------------------------------
+# ПРИЁМ «БОГАТОГО» СООБЩЕНИЯ КАК ШАБЛОНА: блоки Telegram -> текст шаблона (HTML + строки-префиксы)
+# ----------------------------------------------------------------------
+_PHOTO_LINE_RE = re.compile(r"^\[фото(?::([A-Za-z0-9_-]{1,64}))?(?:\|(.*))?\]$")
+
+def _has_photo_line(text: str) -> bool:
+    return any(_PHOTO_LINE_RE.match(ln.strip()) for ln in strip_nt(text or "").split("\n"))
+
+def _slotify(text: str) -> str:
+    """Для постов с «родным» фото (секретки, мутатор, исследователь): любое фото в шаблоне становится местом [фото],
+    куда подставится настоящее (фото публикатора или картинка из репозитория)."""
+    out = []
+    for ln in strip_nt(text or "").split("\n"):
+        m = _PHOTO_LINE_RE.match(ln.strip())
+        out.append((f"[фото|{m.group(2)}]" if m.group(2) else "[фото]") if m else ln)
+    return "\n".join(out)
+
+def _msg_rich(message):
+    """Богатое сообщение из входящего Message (как словарь) или None."""
+    try:
+        rm = getattr(message, "rich_message", None)
+        if rm is None:
+            rm = (getattr(message, "model_extra", None) or {}).get("rich_message")
+        if rm is None:
+            return None
+        if hasattr(rm, "model_dump"):
+            rm = rm.model_dump(mode="json", exclude_none=True)
+        return rm if isinstance(rm, dict) else None
+    except Exception:
+        return None
+
+def _rich_store_photo(sizes) -> str:
+    """Запоминает фото из блока (по file_id бота) под именем rp_<уникальный id>. Возвращает имя или ''."""
+    try:
+        ph = (sizes or [])[-1]
+        if not isinstance(ph, dict):
+            return ""
+        fid, uid = ph.get("file_id"), ph.get("file_unique_id") or ph.get("file_id", "")[-20:]
+        name = "rp_" + re.sub(r"[^A-Za-z0-9_-]", "", uid)[:40]
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO rich_photos (name, file_id) VALUES (%s, %s) "
+                            "ON CONFLICT (name) DO UPDATE SET file_id = EXCLUDED.file_id", (name, fid))
+        return name
+    except Exception as ex:
+        logging.warning(f"Не удалось запомнить фото из богатого сообщения: {ex}")
+        return ""
+
+def _rt_html(n) -> str:
+    """Inline-текст богатого сообщения (RichText) -> обычный Telegram HTML."""
+    if n is None:
+        return ""
+    if isinstance(n, str):
+        return html.escape(n, quote=False)
+    if isinstance(n, list):
+        return "".join(_rt_html(x) for x in n)
+    if not isinstance(n, dict):
+        return ""
+    t = n.get("type")
+    inner = _rt_html(n.get("text"))
+    if t == "bold": return f"<b>{inner}</b>"
+    if t == "italic": return f"<i>{inner}</i>"
+    if t == "underline": return f"<u>{inner}</u>"
+    if t == "strikethrough": return f"<s>{inner}</s>"
+    if t == "spoiler": return f"<tg-spoiler>{inner}</tg-spoiler>"
+    if t == "code": return f"<code>{inner}</code>"
+    if t == "url" and n.get("url"): return f'<a href="{html.escape(str(n["url"]), quote=True)}">{inner}</a>'
+    if t == "text_mention" and (n.get("user") or {}).get("id"): return f'<a href="tg://user?id={int(n["user"]["id"])}">{inner}</a>'
+    if t == "custom_emoji" and n.get("custom_emoji_id"):
+        return f"<tg-emoji emoji-id='{int(n['custom_emoji_id'])}'>{html.escape(n.get('alternative_text') or '⭐', quote=False)}</tg-emoji>"
+    if t == "mathematical_expression": return f"<code>{html.escape(str(n.get('expression') or ''), quote=False)}</code>"
+    return inner
+
+def _rb_lines(b, notes: list, depth: int = 0) -> list:
+    """Блок богатого сообщения -> строки шаблона (в формате с префиксами # - | --- > +++)."""
+    if not isinstance(b, dict) or depth > 8:
+        return []
+    t = b.get("type")
+    if t in ("paragraph", "footer"):
+        s = _rt_html(b.get("text"))
+        return s.split("\n") if s.strip() else [""]
+    if t == "heading":
+        lv = max(1, min(6, int(b.get("size") or 1)))
+        return ["#" * lv + " " + _rt_html(b.get("text")).replace("\n", " ")]
+    if t == "divider":
+        return ["---"]
+    if t == "pre":
+        lang = b.get("language")
+        code = html.escape(_rt_plain(b.get("text")), quote=False)
+        return [f'<pre><code class="language-{html.escape(str(lang), quote=True)}">{code}</code></pre>' if lang else f"<pre>{code}</pre>"]
+    if t in ("blockquote", "pullquote"):
+        inner = []
+        if t == "pullquote":
+            inner = (_rt_html(b.get("text")) or "").split("\n")
+        for sub in b.get("blocks") or []:
+            inner += _rb_lines(sub, notes, depth + 1)
+        cr = _rt_html(b.get("credit"))
+        if cr.strip():
+            inner.append("— " + cr)
+        return ["> " + ln for ln in inner if ln.strip()] or []
+    if t == "list":
+        out = []
+        for idx, it in enumerate(b.get("items") or [], 1):
+            label = str(it.get("label") or "").strip()
+            ordered = bool(re.fullmatch(r"\d{1,3}[.)]?", label))
+            cb = ("☑ " if it.get("is_checked") else "☐ ") if it.get("has_checkbox") else ""
+            sub = []
+            for blk in it.get("blocks") or []:
+                sub += _rb_lines(blk, notes, depth + 1)
+            sub = [x for x in sub if x.strip()] or [""]
+            out.append((f"{idx}. " if ordered else "- ") + cb + sub[0])
+            out += sub[1:]
+        return out
+    if t == "table":
+        rows, header = [], False
+        for ri, row in enumerate(b.get("cells") or []):
+            cells = []
+            for c in row:
+                txt = _rt_html(c.get("text") if isinstance(c, dict) else c).replace("\n", " ").replace("|", "¦").strip()
+                cells.append(txt or " ")
+            if ri == 0:
+                header = bool(row) and all(isinstance(c, dict) and c.get("is_header") for c in row)
+            rows.append("| " + " | ".join(cells) + " |")
+            if ri == 0 and header:
+                rows.append("|" + "|".join("---" for _ in cells) + "|")
+        return rows
+    if t == "details":
+        out = ["+++ " + (_rt_html(b.get("summary")).replace("\n", " ").strip() or "Подробнее")]
+        for sub in b.get("blocks") or []:
+            out += _rb_lines(sub, notes, depth + 1)
+        out.append("+++")
+        return out
+    if t == "photo":
+        name = _rich_store_photo(b.get("photo"))
+        if not name:
+            notes.append("photo")
+            return []
+        cap = ""
+        c = b.get("caption")
+        if isinstance(c, dict):
+            cap = _rt_plain(c.get("text")).replace("\n", " ").replace("]", ")").strip()
+        return [f"[фото:{name}|{cap}]" if cap else f"[фото:{name}]"]
+    if t == "mathematical_expression":
+        return [f"<code>{html.escape(str(b.get('expression') or ''), quote=False)}</code>"]
+    notes.append(str(t))
+    return []
+
+def _rt_plain(n) -> str:
+    if n is None: return ""
+    if isinstance(n, str): return n
+    if isinstance(n, list): return "".join(_rt_plain(x) for x in n)
+    if isinstance(n, dict): return _rt_plain(n.get("text")) or str(n.get("alternative_text") or "")
+    return ""
+
+def rich_message_to_template(rm: dict):
+    """Богатое сообщение (из Bot API) -> (текст шаблона, список пропущенных типов блоков)."""
+    notes: list = []
+    lines: list = []
+    for b in rm.get("blocks") or []:
+        lines += _rb_lines(b, notes)
+        lines.append("")
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return "\n".join(lines), notes
+
+_CD_HEAD = re.compile(r"^(\s*)#{1,6} (.+)$")
+
+def classic_downgrade(text: str, drop_syntax: bool = True) -> str:
+    """Для обычной (не богатой) публикации: убирает строки фото и заменяет префиксы шаблона на обычное оформление."""
+    out = []
+    for ln in (text or "").split("\n"):
+        s = ln.strip()
+        if _PHOTO_LINE_RE.match(s):
+            continue
+        if drop_syntax:
+            m = _CD_HEAD.match(ln)
+            if m:
+                out.append(f"{m.group(1)}<b>{m.group(2).strip()}</b>")
+                continue
+            if s in ("---", "***", "___"):
+                out.append("———————")
+                continue
+            if s.startswith("+++"):
+                rest = s[3:].strip()
+                if rest:
+                    out.append(f"<b>{rest}</b>")
+                continue
+            if ln.lstrip().startswith(("- ", "* ")):
+                out.append("• " + ln.lstrip()[2:])
+                continue
+            q = next((pf for pf in ("&gt; ", "> ") if ln.lstrip().startswith(pf)), None)
+            if q:
+                out.append("\x00Q" + ln.lstrip()[len(q):])
+                continue
+        out.append(ln)
+    res, i = [], 0
+    while i < len(out):
+        if out[i].startswith("\x00Q"):
+            grp = []
+            while i < len(out) and out[i].startswith("\x00Q"):
+                grp.append(out[i][2:])
+                i += 1
+            res.append("<blockquote>" + "\n".join(grp) + "</blockquote>")
+        else:
+            res.append(out[i])
+            i += 1
+    return "\n".join(res)
+
 def extract_text_with_custom_emojis(message: Message) -> str:
     """
     Использует нативный HTML-генератор aiogram.
     Корректно сохраняет все цитаты (<blockquote>), жирный, курсив,
     ссылки и Premium-эмодзи (<tg-emoji>) без поломки разметки.
     """
+    rm = _msg_rich(message)
+    if rm:
+        try:
+            tmpl, _notes = rich_message_to_template(rm)
+            if tmpl.strip():
+                return tmpl
+        except Exception as ex:
+            logging.warning(f"Не удалось разобрать богатое сообщение как шаблон: {ex!r}")
     return message.html_text or message.text or message.caption or ""
 
 async def parse_telethon_custom_emojis(client: UserClient, text: str):
@@ -944,6 +1160,7 @@ async def parse_telethon_custom_emojis(client: UserClient, text: str):
     уникальным маркером той же длины (в UTF-16), затем маркер возвращается обратно.
     """
     text = strip_nt(text)
+    text = classic_downgrade(text, drop_syntax=((await _get_setting_raw("rich_posts", "0")) == "1"))
     pattern = re.compile(r"<tg-emoji emoji-id=['\"](\d+)['\"]>(.*?)</tg-emoji>", re.DOTALL)
 
     clean_html = ""
@@ -1253,6 +1470,11 @@ def _init_db_sync():
                     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
                 );
                 CREATE INDEX IF NOT EXISTS post_log_kind_ts_idx ON post_log (kind, created_at);
+                CREATE TABLE IF NOT EXISTS rich_photos (
+                    name TEXT PRIMARY KEY,
+                    file_id TEXT NOT NULL,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                );
                 CREATE TABLE IF NOT EXISTS channel_stats (
                     day DATE PRIMARY KEY,
                     subs INTEGER NOT NULL
@@ -2475,6 +2697,13 @@ async def check_channel_rights(bot: Bot, user_id: int) -> str | None:
     except Exception:
         return None
 
+async def _secret_photo_bytes(post_id: int):
+    """Фото публикатора для секретки (для богатой правки поста). None, если его нет."""
+    row = await _db_one("SELECT photo_id FROM secret_posts WHERE id = %s", (post_id,))
+    if not row or not row[0]:
+        return None
+    return await _photo_bytes_by_file_id(row[0])
+
 async def expire_secret_post(bot: Bot, post_id: int, channel_id: str, message_id: int, s_type: str):
     def _mark():
         with get_db() as conn:
@@ -2496,7 +2725,8 @@ async def expire_secret_post(bot: Bot, post_id: int, channel_id: str, message_id
                 target_peer = int(target_peer)
 
             parsed_text, entities = await parse_telethon_custom_emojis(userbot, final_text)
-            await _ub_edit_text(f"[Секретка #{post_id}, истекла]", target_peer, message_id, parsed_text, entities)
+            await _ub_edit_text(f"[Секретка #{post_id}, истекла]", target_peer, message_id, parsed_text, entities,
+                                rich_src=final_text, slot=lambda: _secret_photo_bytes(post_id), natural=True)
         else:
             await bot.edit_message_caption(
                 chat_id=channel_id,
@@ -2582,7 +2812,7 @@ async def _publish_to_channel_delayed_inner(channel_id: str, photo_id: str, capt
 
             logging.info(f"[Секретка #{post_id}] Отправка через Telethon в {target_peer}...")
             t_send = time.monotonic()
-            sent_msg = await _ub_send_photo(f"[Секретка #{post_id}]", target_peer, photo_bytes, parsed_text, entities)
+            sent_msg = await _ub_send_photo(f"[Секретка #{post_id}]", target_peer, photo_bytes, parsed_text, entities, rich_src=caption)
             logging.info(f"[Секретка #{post_id}] запрос юзербота занял {time.monotonic() - t_send:.1f} с")
             channel_msg_id = sent_msg.id
             logging.info(f"Секретка #{post_id} успешно опубликована Premium-аккаунтом в канале {channel_id} (msg_id={channel_msg_id})!")
@@ -2853,6 +3083,13 @@ def _rich_render(lines: list, join_br: bool) -> str:
             i += 1
             continue
         plain = L["plain"].lstrip()
+        pm = _PHOTO_LINE_RE.match(plain.strip())
+        if pm:
+            img = f'<img src="tg://photo?id={pm.group(1) or "slot"}"/>'
+            cap = (pm.group(2) or "").strip()
+            out.append(f"<figure>{img}<figcaption>{html.escape(cap, quote=False)}</figcaption></figure>" if cap else img)
+            i += 1
+            continue
         # сворачиваемый блок: «+++ Заголовок» ... «+++»
         if plain.startswith("+++") and len(plain.strip()) > 3:
             title = _rich_cut(L, "+++")
@@ -2939,7 +3176,7 @@ def _rich_render(lines: list, join_br: bool) -> str:
 def _rich_is_special(L: dict) -> bool:
     p = L["plain"].lstrip()
     return bool(_RICH_HEAD_RE.match(p) or p.strip() in ("---", "***", "___") or p.startswith(("- ", "* ", "|", "> ", "+++"))
-                or _RICH_OL_RE.match(p))
+                or _RICH_OL_RE.match(p) or _PHOTO_LINE_RE.match(p.strip()))
 
 def html_to_rich(src: str, join_br: bool = False) -> str:
     """Telegram-HTML шаблона -> HTML «богатого» сообщения.
@@ -2977,8 +3214,20 @@ def _rich_req_params() -> dict:
                              if pn != "self" and pp.default is inspect._empty)
             except Exception:
                 first = "html"
+        media_param = None
+        if cls is not None:
+            try:
+                media_param = next((pn for pn in inspect.signature(cls.__init__).parameters
+                                    if pn != "self" and ("media" in pn.lower() or "file" in pn.lower())), None)
+            except Exception:
+                pass
+        pcls = getattr(tt, "InputRichFilePhoto", None)
+        try:
+            pparams = [pn for pn in inspect.signature(pcls.__init__).parameters if pn != "self"] if pcls else []
+        except Exception:
+            pparams = []
         _RICH_PARAMS.update({"send": _find(tf.messages.SendMessageRequest), "edit": _find(tf.messages.EditMessageRequest),
-                             "cls": cls, "arg": first})
+                             "cls": cls, "arg": first, "media_param": media_param, "photo_cls": pcls, "photo_params": pparams})
     return _RICH_PARAMS
 
 async def _rich_enabled() -> bool:
@@ -3004,7 +3253,74 @@ async def _rich_failed(label: str, err: Exception):
             "Выключить богатый формат: <code>/rich off</code>"
         )
 
-async def _ub_send_rich_text(label: str, target_peer, rich_html: str):
+async def _slot_bytes(slot):
+    """slot: bytes | путь к файлу | функция (обычная или async), возвращающая bytes/путь. None, если фото нет."""
+    if slot is None:
+        return None
+    if callable(slot):
+        slot = slot()
+        if asyncio.iscoroutine(slot):
+            slot = await slot
+    if isinstance(slot, (bytes, bytearray)):
+        return bytes(slot)
+    if isinstance(slot, str) and os.path.exists(slot):
+        def _rd():
+            with open(slot, "rb") as f:
+                return f.read()
+        return await asyncio.to_thread(_rd)
+    return None
+
+async def _photo_bytes_by_file_id(file_id: str) -> bytes:
+    fi = await bot.get_file(file_id)
+    buf = io.BytesIO()
+    await bot.download_file(fi.file_path, destination=buf)
+    return buf.getvalue()
+
+async def _rich_build_media(rich_html: str, peer, slot=None) -> list:
+    """Фото из шаблона -> загрузка юзерботом и объекты для богатого сообщения.
+    id «slot» = фото поста (slot), остальные имена берутся из базы (/photo)."""
+    names = list(dict.fromkeys(re.findall(r"tg://photo\?id=([A-Za-z0-9_-]{1,64})", rich_html)))
+    if not names:
+        return []
+    from telethon.tl import functions as tf, types as tt
+    P = _rich_req_params()
+    if not (P.get("media_param") and P.get("photo_cls") and P.get("photo_params")):
+        raise RuntimeError("фото в богатых сообщениях недоступны в установленном Telethon (см. /richuser)")
+    out = []
+    for nm in names:
+        if nm == "slot":
+            data = await _slot_bytes(slot)
+            if not data:
+                raise RuntimeError("для места [фото] нет фотографии поста")
+        else:
+            row = await _db_one("SELECT file_id FROM rich_photos WHERE name = %s", (nm,))
+            if not row:
+                raise RuntimeError(f"фото «{nm}» не найдено, добавьте его командой /photo")
+            data = await _photo_bytes_by_file_id(row[0])
+        buf = io.BytesIO(data)
+        buf.name = f"{nm}.jpg"
+        up = await asyncio.wait_for(userbot.upload_file(buf), 60)
+        res = await asyncio.wait_for(userbot(tf.messages.UploadMediaRequest(peer=peer, media=tt.InputMediaUploadedPhoto(file=up))), 60)
+        ph = res.photo
+        iph = tt.InputPhoto(id=ph.id, access_hash=ph.access_hash, file_reference=ph.file_reference)
+        kw = {}
+        for pn in P["photo_params"]:
+            if pn == "id":
+                kw[pn] = nm
+            elif "photo" in pn.lower():
+                kw[pn] = iph
+        out.append(P["photo_cls"](**kw))
+    return out
+
+def _rich_obj(P: dict, rich_html: str, media: list):
+    kw = {P["arg"]: rich_html}
+    if media:
+        if not P.get("media_param"):
+            raise RuntimeError("у богатого сообщения нет поля для фото в установленном Telethon")
+        kw[P["media_param"]] = media
+    return P["cls"](**kw)
+
+async def _ub_send_rich_text(label: str, target_peer, rich_html: str, slot=None):
     """Отправляет богатое сообщение юзерботом. Возвращает объект с .id. Защита от дублей при обрыве связи."""
     import random as _rnd
     from telethon.tl import functions as tf, types as tt
@@ -3012,6 +3328,7 @@ async def _ub_send_rich_text(label: str, target_peer, rich_html: str):
     if not (P["send"] and P["cls"]):
         raise RuntimeError("установленный Telethon не умеет богатые сообщения (нужна 1.44+)")
     peer = await asyncio.wait_for(userbot.get_input_entity(target_peer), 20)
+    obj = _rich_obj(P, rich_html, await _rich_build_media(rich_html, peer, slot))
     try:
         before = await asyncio.wait_for(userbot.get_messages(peer, limit=1), 20)
         last_id = before[0].id if before else 0
@@ -3025,8 +3342,7 @@ async def _ub_send_rich_text(label: str, target_peer, rich_html: str):
         return None
     async def _go():
         rnd = _rnd.getrandbits(63)
-        res = await userbot(tf.messages.SendMessageRequest(
-            peer=peer, message="", random_id=rnd, **{P["send"]: P["cls"](**{P["arg"]: rich_html})}))
+        res = await userbot(tf.messages.SendMessageRequest(peer=peer, message="", random_id=rnd, **{P["send"]: obj}))
         mid = getattr(res, "id", None)
         for u in getattr(res, "updates", None) or []:
             if isinstance(u, tt.UpdateMessageID) and u.random_id == rnd:
@@ -3045,15 +3361,16 @@ async def _ub_send_rich_text(label: str, target_peer, rich_html: str):
         return SimpleNamespace(id=mid)
     return await _ub_request(label, _go, on_retry=_find)
 
-async def _ub_edit_rich_text(label: str, target_peer, message_id: int, rich_html: str):
+async def _ub_edit_rich_text(label: str, target_peer, message_id: int, rich_html: str, slot=None):
     from telethon.tl import functions as tf
     P = _rich_req_params()
     if not (P["edit"] and P["cls"]):
         raise RuntimeError("правка богатых сообщений недоступна в установленном Telethon")
     peer = await asyncio.wait_for(userbot.get_input_entity(target_peer), 20)
+    obj = _rich_obj(P, rich_html, await _rich_build_media(rich_html, peer, slot))
     return await _ub_request(
         label,
-        lambda: userbot(tf.messages.EditMessageRequest(peer=peer, id=message_id, **{P["edit"]: P["cls"](**{P["arg"]: rich_html})}))
+        lambda: userbot(tf.messages.EditMessageRequest(peer=peer, id=message_id, **{P["edit"]: obj}))
     )
 
 async def _ub_send_text(label: str, target_peer, parsed_text: str, entities, rich_src=None):
@@ -3078,8 +3395,17 @@ async def _ub_send_text(label: str, target_peer, parsed_text: str, entities, ric
         on_retry=_find
     )
 
-async def _ub_send_photo(label: str, target_peer, photo, parsed_text: str, entities):
-    """photo: bytes или путь к файлу. При повторе после обрыва сначала проверяет, не ушло ли фото уже."""
+async def _ub_send_photo(label: str, target_peer, photo, parsed_text: str, entities, rich_src=None):
+    """photo: bytes или путь к файлу. При повторе после обрыва сначала проверяет, не ушло ли фото уже.
+    rich_src: HTML шаблона. Если в нём есть фото (место [фото]) и включён /rich on, пост уходит богатым сообщением,
+    а настоящее фото ставится на место фото шаблона."""
+    if rich_src is not None and _has_photo_line(rich_src) and await _rich_enabled():
+        try:
+            return await _ub_send_rich_text(label, target_peer, html_to_rich(_slotify(rich_src), await _rich_join_br()), photo)
+        except FloodWaitError:
+            raise
+        except Exception as e:
+            await _rich_failed(label, e)
     def _mk():
         if isinstance(photo, (bytes, bytearray)):
             b = io.BytesIO(bytes(photo))
@@ -3099,10 +3425,22 @@ async def _ub_send_photo(label: str, target_peer, photo, parsed_text: str, entit
         on_retry=_find
     )
 
-async def _ub_edit_text(label: str, target_peer, message_id: int, parsed_text: str, entities, rich_src=None):
-    if rich_src is not None and await _rich_enabled() and _rich_req_params()["edit"]:
+async def _is_classic_photo_post(target_peer, message_id: int) -> bool:
+    """True, если пост в канале сейчас обычное фото с подписью (такой пост богатым не правится)."""
+    try:
+        m = await asyncio.wait_for(userbot.get_messages(target_peer, ids=message_id), 20)
+        return bool(m is not None and getattr(m, "photo", None))
+    except Exception:
+        return False
+
+async def _ub_edit_text(label: str, target_peer, message_id: int, parsed_text: str, entities, rich_src=None,
+                        slot=None, natural: bool = False):
+    """natural=True: у поста «родное» фото (секретка, мутатор, исследователь): фото из шаблона заменяется им (slot)."""
+    if rich_src is not None and await _rich_enabled() and _rich_req_params()["edit"] \
+            and not await _is_classic_photo_post(target_peer, message_id):
         try:
-            return await _ub_edit_rich_text(label, target_peer, message_id, html_to_rich(rich_src, await _rich_join_br()))
+            src = _slotify(rich_src) if natural else rich_src
+            return await _ub_edit_rich_text(label, target_peer, message_id, html_to_rich(src, await _rich_join_br()), slot)
         except (MessageNotModifiedError, MessageIdInvalidError, MessageAuthorRequiredError, FloodWaitError):
             raise
         except Exception as e:
@@ -6434,7 +6772,7 @@ async def _res_core(user, data, ch_id) -> tuple:
             target_peer = _channel_peer(ch_id)
             parsed_text, entities = await parse_telethon_custom_emojis(userbot, text)
             if has_photo:
-                sent = await _ub_send_photo("[Исследователь]", target_peer, RESEARCHER_PHOTO, parsed_text, entities)
+                sent = await _ub_send_photo("[Исследователь]", target_peer, RESEARCHER_PHOTO, parsed_text, entities, rich_src=text)
             else:
                 sent = await _ub_send_text("[Исследователь]", target_peer, parsed_text, entities, rich_src=text)
             msg_id = sent.id
@@ -6983,7 +7321,7 @@ async def expire_mutator_badge(badge_id: int, channel_id: str, message_id: int) 
                 target_peer = int(target_peer)
             parsed_text, entities = await parse_telethon_custom_emojis(userbot, text)
             await _ub_edit_text("[Мутатор, истёк]", target_peer, message_id, parsed_text, entities,
-                                rich_src=(None if os.path.exists(MUTATOR_PHOTO) else text))
+                                rich_src=text, slot=MUTATOR_PHOTO, natural=True)
         else:
             try:
                 await bot.edit_message_caption(
@@ -7116,7 +7454,7 @@ async def mutator_confirm_proc(call: CallbackQuery, state: FSMContext):
                 target_peer = int(target_peer)
             parsed_text, entities = await parse_telethon_custom_emojis(userbot, text)
             if os.path.exists(MUTATOR_PHOTO):
-                sent = await _ub_send_photo("[Мутатор]", target_peer, MUTATOR_PHOTO, parsed_text, entities)
+                sent = await _ub_send_photo("[Мутатор]", target_peer, MUTATOR_PHOTO, parsed_text, entities, rich_src=text)
             else:
                 logging.warning(f"Файл {MUTATOR_PHOTO} не найден, мутатор публикуется без фото.")
                 sent = await _ub_send_text("[Мутатор]", target_peer, parsed_text, entities, rich_src=text)
@@ -7315,7 +7653,7 @@ async def close_researcher_post(badge_id: int, channel_id: str, message_id: int)
                 await userbot.connect()
             parsed_text, entities = await parse_telethon_custom_emojis(userbot, text)
             await _ub_edit_text("[Исследователь, истёк]", _channel_peer(channel_id), message_id, parsed_text, entities,
-                                rich_src=(None if os.path.exists(RESEARCHER_PHOTO) else text))
+                                rich_src=text, slot=RESEARCHER_PHOTO, natural=True)
         else:
             try:
                 await bot.edit_message_caption(chat_id=channel_id, message_id=message_id, caption=text, parse_mode="HTML")
@@ -13389,6 +13727,26 @@ async def _ub_rich_send(peer, kind: str, text: str):
                                          **{params[0]: cls(**{first: text})})
     return await asyncio.wait_for(userbot(req), 30)
 
+async def _richtest_photo(message: Message, args: list):
+    """/richtest photo имя [chat] — богатое сообщение с фото из базы (/photo имя). Показывает точную ошибку, если не вышло."""
+    if not userbot:
+        await message.answer("Юзербот не подключён.")
+        return
+    if not args:
+        await message.answer("Формат: <code>/richtest photo имя [chat_id]</code>. Имена: <code>/photos</code>.", parse_mode="HTML")
+        return
+    name = args[0]
+    target = args[1] if len(args) > 1 else (TEST_CHANNEL_ID or "me")
+    if isinstance(target, str) and target.lstrip("-").isdigit():
+        target = int(target)
+    try:
+        if not userbot.is_connected():
+            await asyncio.wait_for(userbot.connect(), 20)
+        res = await _ub_send_rich_text("[Проба фото]", target, html_to_rich(f"# Проба фото\nТекст до картинки\n[фото:{name}|Подпись]\nТекст после"))
+        await message.answer(f"{ICON_CHECK} Отправлено, сообщение №{res.id}. Проверьте, что фото на месте.")
+    except Exception as ex:
+        await message.answer(f"{ICON_CROSS} Не вышло: <code>{html.escape(repr(ex)[:700])}</code>\nПришлите этот текст и ответ <code>/richuser</code>.", parse_mode="HTML")
+
 _SAB_ITEM_DEFAULT = "🔹 <b>Сервер #[Номер_Сервера]:</b>\n• Искатель: [Искатель]\n• Ник в Roblox: [Ник_Роблокс]\n• Метод: [Метод]\n• В друзья: [Друзья]\n• Ссылка: [Ссылка]\n"
 
 async def _richtest_templates(message: Message, args: list):
@@ -13444,9 +13802,79 @@ _RICH_HELP = (
     "<code>---</code> разделитель\n"
     "<code>&gt; текст</code> цитата (обычная цитата Telegram тоже работает)\n"
     "<code>+++ Название</code> … <code>+++</code> сворачиваемый блок\n"
+    "<code>[фото:имя]</code> сохранённая картинка (<code>/photo</code>), <code>[фото]</code> место для фото поста\n"
+    "Можно просто отправить боту сообщение, набранное в редакторе с расширенным форматированием: он сам превратит блоки в такой шаблон, "
+    "а фото из него поставит на место. У мутатора и исследователя на место любого фото встанет их картинка из репозитория, "
+    "у секреток фото публикатора.\n"
     "Жирный, курсив, ссылки, кастомные эмодзи пишите как обычно.\n"
     "Пока богатый формат выключен (или при сбое), такие строки в посте будут видны как есть, с символами # и -."
 )
+
+_PHOTO_NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+@router.message(F.photo, F.caption.regexp(r"^/photo(?:@\w+)?\s+\S+"), F.chat.type == "private")
+async def photo_save_by_caption(message: Message):
+    """Фото с подписью «/photo имя» запоминает картинку под этим именем."""
+    if message.from_user.id != OWNER_ID:
+        return
+    name = (message.caption or "").split()[1]
+    if not _PHOTO_NAME_RE.fullmatch(name):
+        await message.answer(f"{ICON_CROSS} Имя: латиница, цифры, _ и -, до 64 символов.")
+        return
+    await _db_exec("INSERT INTO rich_photos (name, file_id) VALUES (%s, %s) "
+                   "ON CONFLICT (name) DO UPDATE SET file_id = EXCLUDED.file_id", (name, message.photo[-1].file_id))
+    await alog(message.from_user.id, "rich", f"photo {name}")
+    await message.answer(f"{ICON_CHECK} Фото сохранено как <code>{html.escape(name)}</code>. В шаблоне: строка <code>[фото:{html.escape(name)}]</code>.", parse_mode="HTML")
+
+@router.message(Command("photo"), F.chat.type == "private")
+async def cmd_photo(message: Message):
+    """/photo имя — ответом на фото запоминает его; без ответа показывает сохранённое. Фото с подписью «/photo имя» тоже сохраняется."""
+    if message.from_user.id != OWNER_ID:
+        return
+    parts = (message.text or "").split()
+    name = parts[1] if len(parts) > 1 else ""
+    if not name or not _PHOTO_NAME_RE.fullmatch(name):
+        await message.answer("Формат: отправьте фото с подписью <code>/photo имя</code> или ответьте так на фото. "
+                             "Имя: латиница, цифры, _ и -. Показать сохранённое: <code>/photo имя</code>. Список: <code>/photos</code>.", parse_mode="HTML")
+        return
+    rp = message.reply_to_message
+    if rp and rp.photo:
+        await _db_exec("INSERT INTO rich_photos (name, file_id) VALUES (%s, %s) "
+                       "ON CONFLICT (name) DO UPDATE SET file_id = EXCLUDED.file_id", (name, rp.photo[-1].file_id))
+        await alog(message.from_user.id, "rich", f"photo {name}")
+        await message.answer(f"{ICON_CHECK} Фото сохранено как <code>{html.escape(name)}</code>. В шаблоне: строка <code>[фото:{html.escape(name)}]</code>.", parse_mode="HTML")
+        return
+    row = await _db_one("SELECT file_id FROM rich_photos WHERE name = %s", (name,))
+    if not row:
+        await message.answer(f"{ICON_CROSS} Фото <code>{html.escape(name)}</code> не найдено.", parse_mode="HTML")
+        return
+    try:
+        await message.answer_photo(row[0], caption=f"<code>[фото:{html.escape(name)}]</code>", parse_mode="HTML")
+    except Exception as ex:
+        await message.answer(f"{ICON_CROSS} Не удалось показать: <code>{html.escape(repr(ex)[:200])}</code>", parse_mode="HTML")
+
+@router.message(Command("photos"), F.chat.type == "private")
+async def cmd_photos(message: Message):
+    if message.from_user.id != OWNER_ID:
+        return
+    rows = await _db_all("SELECT name FROM rich_photos ORDER BY created_at DESC LIMIT 60")
+    if not rows:
+        await message.answer("Сохранённых фото нет. Отправьте фото с подписью <code>/photo имя</code>.", parse_mode="HTML")
+        return
+    await message.answer("Сохранённые фото (в шаблоне пишутся как <code>[фото:имя]</code>):\n" + "\n".join(f"• <code>{html.escape(r[0])}</code>" for r in rows)
+                         + "\n\nУдалить: <code>/photodel имя</code>", parse_mode="HTML")
+
+@router.message(Command("photodel"), F.chat.type == "private")
+async def cmd_photodel(message: Message):
+    if message.from_user.id != OWNER_ID:
+        return
+    parts = (message.text or "").split()
+    if len(parts) < 2:
+        await message.answer("Формат: <code>/photodel имя</code>", parse_mode="HTML")
+        return
+    await _db_exec("DELETE FROM rich_photos WHERE name = %s", (parts[1],))
+    await alog(message.from_user.id, "rich", f"photodel {parts[1]}")
+    await message.answer(f"{ICON_CHECK} Удалено: <code>{html.escape(parts[1])}</code>", parse_mode="HTML")
 
 @router.message(Command("rich"), F.chat.type == "private")
 async def cmd_rich(message: Message):
@@ -13496,6 +13924,9 @@ async def cmd_richtest(message: Message):
     parts = (message.text or "").split()[1:]
     if parts and parts[0].lower() == "tpl":
         await _richtest_templates(message, parts[1:])
+        return
+    if parts and parts[0].lower() == "photo":
+        await _richtest_photo(message, parts[1:])
         return
     via_bot = bool(parts) and parts[0].lower() == "bot"
     if via_bot:
@@ -13573,6 +14004,16 @@ async def cmd_richuser(message: Message):
     extra = sorted(n for n in dir(msgs_mod) if "rich" in n.lower())
     if extra:
         info.append("Запросы: " + ", ".join(f"<code>{html.escape(n)}</code>" for n in extra))
+    dump = []
+    for n in sorted(dir(tt)):
+        if n.startswith(("InputRich", "RichMessage", "MessageMediaRich")):
+            try:
+                ps = [pn for pn in inspect.signature(getattr(tt, n).__init__).parameters if pn != "self"]
+            except Exception:
+                ps = ["?"]
+            dump.append(f"{n}({', '.join(ps)})")
+    if dump:
+        info.append("\nКонструкторы:\n" + "\n".join(f"<code>{html.escape(d)}</code>" for d in dump[:25]))
     html_cls = getattr(tt, "InputRichMessageHTML", None)
     if not (rich_param and html_cls):
         info.append("\nОтправить пробу нельзя: установленный Telethon не умеет богатые сообщения (нужна версия 1.44+).")
