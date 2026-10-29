@@ -37,7 +37,7 @@ from aiogram.types import (
 # Модуль юзербота для отправки с Telegram Premium (Telethon)
 from telethon import TelegramClient as UserClient
 from telethon.sessions import StringSession
-from telethon.tl.types import MessageEntityCustomEmoji, User as TlUser
+from telethon.tl.types import MessageEntityCustomEmoji, MessageEntitySpoiler, User as TlUser
 from telethon.tl.functions.channels import GetFullChannelRequest
 from telethon.errors import FloodWaitError, MessageNotModifiedError, MessageIdInvalidError, MessageAuthorRequiredError
 
@@ -1264,6 +1264,42 @@ def extract_text_with_custom_emojis(message: Message) -> str:
             logging.warning(f"Не удалось разобрать богатое сообщение как шаблон: {ex!r}")
     return message.html_text or message.text or message.caption or ""
 
+_SP_OPEN, _SP_CLOSE = "\uF8F0", "\uF8F1"
+
+
+def _apply_spoilers(text: str, entities: list):
+    """Убирает маркеры спойлера из текста, сдвигает остальные сущности и добавляет MessageEntitySpoiler."""
+    marks, stack, spans, pos16 = [], [], [], 0
+    keep = []
+    for ch in text:
+        if ch == _SP_OPEN:
+            marks.append(pos16)
+            stack.append(pos16)
+        elif ch == _SP_CLOSE:
+            marks.append(pos16)
+            if stack:
+                spans.append((stack.pop(), pos16))
+        else:
+            keep.append(ch)
+        pos16 += 1 if ord(ch) < 0x10000 else 2
+
+    def shift(o):
+        return o - sum(1 for m in marks if m < o)
+
+    for e in entities:
+        try:
+            o = shift(e.offset)
+            e.length = shift(e.offset + e.length) - o
+            e.offset = o
+        except Exception:
+            pass
+    for a, b in spans:
+        o, end = shift(a), shift(b)
+        if end > o:
+            entities.append(MessageEntitySpoiler(offset=o, length=end - o))
+    return "".join(keep), entities
+
+
 async def parse_telethon_custom_emojis(client: UserClient, text: str):
     """
     Преобразует теги <tg-emoji> в MessageEntityCustomEmoji Telethon
@@ -1292,6 +1328,9 @@ async def parse_telethon_custom_emojis(client: UserClient, text: str):
             clean_html += inner_char
         last_idx = match.end()
     clean_html += text[last_idx:]
+    # Скрытый текст (спойлер): парсер Telethon может его терять, поэтому ставим свои маркеры и собираем сущности сами
+    clean_html = re.sub(r"<tg-spoiler>", _SP_OPEN, clean_html, flags=re.I)
+    clean_html = re.sub(r"</tg-spoiler>", _SP_CLOSE, clean_html, flags=re.I)
 
     try:
         parsed_text, entities = await client._parse_message_text(clean_html, "html")
@@ -1302,6 +1341,9 @@ async def parse_telethon_custom_emojis(client: UserClient, text: str):
 
     if entities is None:
         entities = []
+
+    if _SP_OPEN in parsed_text or _SP_CLOSE in parsed_text:
+        parsed_text, entities = _apply_spoilers(parsed_text, entities)
 
     for ph, inner_char, e_id in emoji_data:
         pos = parsed_text.find(ph)
@@ -14551,7 +14593,7 @@ _CMD_REGISTRY = [
         ("/rich [on|off|br|p]", "расширенное форматирование постов"),
         ("/richtest [bot|tpl|photo] [чат]", "тест расширенного форматирования"),
         ("/richuser [чат]", "тест через юзербота"),
-        ("/emojipack [sync|on|off|name]", "пак тгп-эмодзи из папки emoji_pack на GitHub"),
+        ("/emojipack [sync|on|off]", "пак тгп-эмодзи из папки emoji_pack на GitHub"),
     ]),
 ]
 
@@ -14675,36 +14717,36 @@ async def _http_get(url: str, as_json: bool = False):
             return await (r.json(content_type=None) if as_json else r.read())
 
 
-async def _pack_name() -> str:
+async def _pack_name(prefix: str = "tohs") -> str:
     uname = await _bot_username()
     if not uname:
         raise RuntimeError("не удалось узнать username бота")
-    name = (await _get_setting_raw("emoji_pack_name", "")) or f"tgp_{uname}_by_{uname}"
-    if not name.lower().endswith(f"_by_{uname.lower()}"):
-        raise RuntimeError(f"имя набора должно заканчиваться на _by_{uname}")
-    return name
+    if not re.fullmatch(r"[a-z][a-z0-9_]{1,20}", prefix or ""):
+        raise RuntimeError("некорректный name_prefix в manifest.json")
+    return f"{prefix}_{uname}_by_{uname}"
 
 
-async def sync_emoji_pack(force: bool = False) -> str:
-    """Создаёт или обновляет набор по папке emoji_pack на GitHub. Возвращает отчёт."""
+async def _sync_one(folder: str, force: bool):
+    """Синхронизирует один набор (папка emoji_pack/<folder>). Возвращает (отчёт, {эмодзи: id}, число_изменений, число_ошибок)."""
     import hashlib
-    man = await _http_get(f"{EMOJI_PACK_RAW}/manifest.json", True)
+    base = f"{EMOJI_PACK_RAW}/{folder}"
+    man = await _http_get(f"{base}/manifest.json", True)
     icons = man.get("icons") or {}
     if not icons or not all(isinstance(v, list) and v for v in icons.values()):
-        raise RuntimeError("manifest.json пуст или повреждён")
+        raise RuntimeError(f"{folder}: manifest.json пуст или повреждён")
     firsts = [_norm_emoji(v[0]) for v in icons.values()]
     if len(set(firsts)) != len(firsts):
-        raise RuntimeError("в manifest.json у двух иконок одинаковое основное эмодзи")
+        raise RuntimeError(f"{folder}: у двух иконок одинаковое основное эмодзи")
     if len(icons) > 200:
-        raise RuntimeError("в паке не может быть больше 200 эмодзи")
+        raise RuntimeError(f"{folder}: в паке не может быть больше 200 эмодзи")
     title = str(man.get("title") or "Emoji")[:64]
-    pack = await _pack_name()
-    files = {}
-    for n in icons:
-        files[n] = await _http_get(f"{EMOJI_PACK_RAW}/{n}.png")
+    repaint = bool(man.get("repaint"))
+    pack = await _pack_name(man.get("name_prefix") or "tohs")
+    files = {n: await _http_get(f"{base}/{n}.png") for n in icons}
     sha = {n: hashlib.sha1(b).hexdigest() for n, b in files.items()}
+    skey = f"emoji_pack_state_{folder}"
     try:
-        state = json.loads(await _get_setting_raw("emoji_pack_state", "{}") or "{}")
+        state = json.loads(await _get_setting_raw(skey, "{}") or "{}")
     except Exception:
         state = {}
 
@@ -14725,16 +14767,17 @@ async def sync_emoji_pack(force: bool = False) -> str:
             logging.warning(f"Название пака не изменено: {e}")
     added = replaced = deleted = 0
     errors = []
+    todo_rep, stale, have = [], [], {}
     if cur is None:
         names = list(icons)
         first = names[:50]
-        await _tg_call("createNewStickerSet", {
-            "user_id": str(owner), "name": pack, "title": title, "sticker_type": "custom_emoji",
-            "stickers": [ist(n) for n in first]}, {f"f_{n}": (f"{n}.png", files[n]) for n in first})
+        fields = {"user_id": str(owner), "name": pack, "title": title, "sticker_type": "custom_emoji",
+                  "stickers": [ist(n) for n in first]}
+        if repaint:
+            fields["needs_repainting"] = "true"
+        await _tg_call("createNewStickerSet", fields, {f"f_{n}": (f"{n}.png", files[n]) for n in first})
         added += len(first)
         todo_add = names[50:]
-        todo_rep = []
-        stale = []
     else:
         have = {_norm_emoji(s.get("emoji", "")): s for s in cur.get("stickers", [])}
         todo_add = [n for n in icons if _norm_emoji(icons[n][0]) not in have]
@@ -14771,19 +14814,38 @@ async def sync_emoji_pack(force: bool = False) -> str:
         if cid:
             for g in gl:
                 glyph_ids[g] = cid
-    ok_names = {n for n in icons if icons[n][0] in glyph_ids}
-    new_state = {n: sha[n] for n in ok_names if not any(e.startswith(n + ":") for e in errors)}
-    await set_setting("emoji_pack_state", json.dumps(new_state))
-    await set_setting("emoji_pack_ids", json.dumps(glyph_ids, ensure_ascii=False))
-    if await _get_setting_raw("emoji_pack_on", "0") == "1":
-        _apply_pack_ids(glyph_ids)
-    global _pack_last
-    _pack_last = (added + replaced + deleted + (1 if title_changed else 0), len(errors))
-    rep = (f"{ICON_CHECK} Пак <a href=\"https://t.me/addemoji/{pack}\">{html.escape(pack)}</a>: "
-           f"добавлено {added}, обновлено {replaced}, удалено {deleted}, всего в паке {len(fin.get('stickers', []))}.")
+    failed = {e.split(":")[0] for e in errors}
+    await set_setting(skey, json.dumps({n: sha[n] for n in icons if icons[n][0] in glyph_ids and n not in failed}))
+    rep = (f"{ICON_CHECK} <a href=\"https://t.me/addemoji/{pack}\">{html.escape(title)}</a>: "
+           f"добавлено {added}, обновлено {replaced}, удалено {deleted}, всего {len(fin.get('stickers', []))}.")
     if errors:
-        rep += "\n\n" + f"{ICON_WARN} Ошибки ({len(errors)}):\n" + "\n".join(f"• {html.escape(e)[:200]}" for e in errors[:8])
-    return rep
+        rep += "\n" + f"{ICON_WARN} Ошибки ({len(errors)}):\n" + "\n".join(f"• {html.escape(e)[:200]}" for e in errors[:6])
+    return rep, glyph_ids, added + replaced + deleted + (1 if title_changed else 0), len(errors)
+
+
+async def sync_emoji_pack(force: bool = False) -> str:
+    """Создаёт или обновляет все наборы из emoji_pack/packs.json на GitHub. Возвращает отчёт."""
+    global _pack_last
+    folders = await _http_get(f"{EMOJI_PACK_RAW}/packs.json", True)
+    if not isinstance(folders, list) or not folders:
+        raise RuntimeError("packs.json пуст или повреждён")
+    reports, merged, changes, errs = [], {}, 0, 0
+    for fo in folders:
+        try:
+            rep, ids, ch, er = await _sync_one(str(fo), force)
+            merged.update(ids)      # следующий пак перекрывает предыдущий
+            changes += ch
+            errs += er
+            reports.append(rep)
+        except Exception as e:
+            errs += 1
+            reports.append(f"{ICON_CROSS} {html.escape(str(fo))}: {html.escape(str(e))[:300]}")
+    if merged:
+        await set_setting("emoji_pack_ids", json.dumps(merged, ensure_ascii=False))
+        if await _get_setting_raw("emoji_pack_on", "0") == "1":
+            _apply_pack_ids(merged)
+    _pack_last = (changes, errs)
+    return "\n\n".join(reports)
 
 
 async def emoji_pack_autosync():
@@ -14846,25 +14908,17 @@ async def cmd_emojipack(message: Message):
             _clear_pack_ids()
             await message.answer(f"{ICON_CHECK} Возвращены прежние тгп-эмодзи.", parse_mode="HTML")
         return
-    if arg == "name" and len(parts) > 2:
-        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{2,60}", parts[2]):
-            await message.answer("Имя: латиница, цифры, _; в конце <code>_by_username_бота</code>.", parse_mode="HTML")
-            return
-        await set_setting("emoji_pack_name", parts[2])
-        await message.answer(f"{ICON_CHECK} Имя набора: <code>{parts[2]}</code>", parse_mode="HTML")
-        return
     try:
-        nm = await _pack_name()
+        nm = ", ".join([await _pack_name(p) for p in ("tohs", "tohsc")])
     except Exception as e:
         nm = f"— ({e})"
     on = await _get_setting_raw("emoji_pack_on", "0") == "1"
-    cnt = len(json.loads(await _get_setting_raw("emoji_pack_state", "{}") or "{}"))
+    cnt = len(json.loads(await _get_setting_raw("emoji_pack_ids", "{}") or "{}"))
     await message.answer(
-        f"<b>Пак тгп-эмодзи</b>\nНабор: <code>{html.escape(nm)}</code>\nЗалито иконок: {cnt}\nИспользуется ботом: {'да' if on else 'нет'}\n\n"
+        f"<b>Пак тгп-эмодзи</b>\nНабор: <code>{html.escape(nm)}</code>\nЭмодзи в паках: {cnt}\nИспользуется ботом: {'да' if on else 'нет'}\n\n"
         "<code>/emojipack sync</code> — создать/обновить пак из папки emoji_pack на GitHub\n"
         "<code>/emojipack sync force</code> — перезалить все иконки\n"
-        "<code>/emojipack on</code> / <code>off</code> — подставлять эмодзи из пака в тексты бота\n"
-        "<code>/emojipack name имя_by_бот</code> — сменить имя набора",
+        "<code>/emojipack on</code> / <code>off</code> — подставлять эмодзи из паков в тексты бота",
         parse_mode="HTML")
 
 

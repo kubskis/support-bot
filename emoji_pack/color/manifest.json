@@ -1,0 +1,46 @@
+{
+ "title": "@ToHSecretss emoji pack · цвет",
+ "name_prefix": "tohsc",
+ "repaint": false,
+ "icons": {
+  "bronze": [
+   "🥉"
+  ],
+  "check": [
+   "✅"
+  ],
+  "cross": [
+   "❌"
+  ],
+  "gem": [
+   "💎"
+  ],
+  "glow": [
+   "🌟"
+  ],
+  "gold": [
+   "🥇"
+  ],
+  "green": [
+   "🟢"
+  ],
+  "red": [
+   "🔴"
+  ],
+  "silver": [
+   "🥈"
+  ],
+  "siren": [
+   "🚨"
+  ],
+  "star": [
+   "⭐"
+  ],
+  "trophy": [
+   "🏆"
+  ],
+  "warn": [
+   "⚠"
+  ]
+ }
+}
