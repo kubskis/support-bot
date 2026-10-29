@@ -429,11 +429,11 @@ def _conv_str(value, mode: str):
     if not TEXT_EMOJI_ON or mode == "skip":
         return strip_nt(value), False, False
     if mode == "html":
-        new = emojify_marked(value)
+        new = _remap_emoji_ids(emojify_marked(value))
         return new, new != strip_nt(value), False
     if _NT_OPEN in value or not _EMOJI_RE.search(value):
         return strip_nt(value), False, False
-    return emojify(html.escape(value, quote=False)), True, True
+    return _remap_emoji_ids(emojify(html.escape(value, quote=False))), True, True
 
 
 def _conv_media(m, plain: bool = False):
@@ -14551,6 +14551,7 @@ _CMD_REGISTRY = [
         ("/rich [on|off|br|p]", "расширенное форматирование постов"),
         ("/richtest [bot|tpl|photo] [чат]", "тест расширенного форматирования"),
         ("/richuser [чат]", "тест через юзербота"),
+        ("/emojipack [sync|on|off|name]", "пак тгп-эмодзи из папки emoji_pack на GitHub"),
     ]),
 ]
 
@@ -14593,6 +14594,243 @@ async def cmd_commands_list(message: Message):
     is_owner = bool(OWNER_ID and message.from_user.id == OWNER_ID)
     for p in _cmds_pages(is_owner):
         await message.answer(p.strip(), parse_mode="HTML")
+
+
+# ───────── Пак тгп-эмодзи из папки emoji_pack на GitHub (/emojipack) ─────────
+EMOJI_PACK_RAW = os.getenv("EMOJI_PACK_RAW", "https://raw.githubusercontent.com/kubskis/support-bot/main/emoji_pack")
+EMOJI_IDS_ORIG = dict(EMOJI_IDS)
+EMOJI_REMAP = {}          # старый emoji-id -> новый (из нашего пака)
+_EMOJI_ID_ATTR_RE = re.compile(r"""emoji-id=(['"])(\d+)\1""")
+_pack_busy = False
+
+
+def _norm_emoji(e: str) -> str:
+    return (e or "").replace("️", "")
+
+
+def _remap_emoji_ids(text: str) -> str:
+    if not EMOJI_REMAP or not isinstance(text, str) or "emoji-id" not in text:
+        return text
+    return _EMOJI_ID_ATTR_RE.sub(lambda m: f"emoji-id={m.group(1)}{EMOJI_REMAP.get(m.group(2), m.group(2))}{m.group(1)}", text)
+
+
+def _apply_pack_ids(glyph_ids: dict):
+    """glyph_ids: {эмодзи: custom_emoji_id нашего пака}. Подменяет ID в реестре и в готовых тегах."""
+    EMOJI_REMAP.clear()
+    for k in list(EMOJI_IDS):
+        EMOJI_IDS[k] = EMOJI_IDS_ORIG[k]
+    by_norm = {_norm_emoji(g): i for g, i in glyph_ids.items()}
+    for k, old in EMOJI_IDS_ORIG.items():
+        new = by_norm.get(_norm_emoji(k))
+        if new:
+            EMOJI_IDS[k] = new
+            EMOJI_REMAP.setdefault(old, new)
+
+
+def _clear_pack_ids():
+    EMOJI_REMAP.clear()
+    for k in list(EMOJI_IDS):
+        EMOJI_IDS[k] = EMOJI_IDS_ORIG[k]
+
+
+async def load_emoji_pack_setting():
+    try:
+        if await _get_setting_raw("emoji_pack_on", "0") == "1":
+            ids = json.loads(await _get_setting_raw("emoji_pack_ids", "{}") or "{}")
+            if ids:
+                _apply_pack_ids(ids)
+                logging.info(f"Пак тгп-эмодзи подключён: {len(ids)} эмодзи.")
+    except Exception as e:
+        logging.warning(f"Пак тгп-эмодзи не загружен: {e}")
+
+
+async def _tg_call(method: str, fields: dict, files: dict = None):
+    """Вызов Bot API напрямую (multipart). Ждёт при 429."""
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+    for _ in range(6):
+        fd = aiohttp.FormData()
+        for k, v in fields.items():
+            fd.add_field(k, v if isinstance(v, str) else json.dumps(v, ensure_ascii=False))
+        for k, (fn, data) in (files or {}).items():
+            fd.add_field(k, data, filename=fn, content_type="image/png")
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as s:
+            async with s.post(url, data=fd) as r:
+                js = await r.json(content_type=None)
+        if js.get("ok"):
+            return js["result"]
+        if js.get("error_code") == 429:
+            await asyncio.sleep(int((js.get("parameters") or {}).get("retry_after", 5)) + 1)
+            continue
+        raise RuntimeError(f"{method}: {js.get('description')}")
+    raise RuntimeError(f"{method}: слишком много запросов")
+
+
+async def _http_get(url: str, as_json: bool = False):
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as s:
+        async with s.get(url, headers={"Cache-Control": "no-cache"}) as r:
+            if r.status != 200:
+                raise RuntimeError(f"{url} → HTTP {r.status}")
+            return await (r.json(content_type=None) if as_json else r.read())
+
+
+async def _pack_name() -> str:
+    uname = await _bot_username()
+    if not uname:
+        raise RuntimeError("не удалось узнать username бота")
+    name = (await _get_setting_raw("emoji_pack_name", "")) or f"tgp_{uname}_by_{uname}"
+    if not name.lower().endswith(f"_by_{uname.lower()}"):
+        raise RuntimeError(f"имя набора должно заканчиваться на _by_{uname}")
+    return name
+
+
+async def sync_emoji_pack(force: bool = False) -> str:
+    """Создаёт или обновляет набор по папке emoji_pack на GitHub. Возвращает отчёт."""
+    import hashlib
+    man = await _http_get(f"{EMOJI_PACK_RAW}/manifest.json", True)
+    icons = man.get("icons") or {}
+    if not icons or not all(isinstance(v, list) and v for v in icons.values()):
+        raise RuntimeError("manifest.json пуст или повреждён")
+    firsts = [_norm_emoji(v[0]) for v in icons.values()]
+    if len(set(firsts)) != len(firsts):
+        raise RuntimeError("в manifest.json у двух иконок одинаковое основное эмодзи")
+    if len(icons) > 200:
+        raise RuntimeError("в паке не может быть больше 200 эмодзи")
+    title = str(man.get("title") or "Emoji")[:64]
+    pack = await _pack_name()
+    files = {}
+    for n in icons:
+        files[n] = await _http_get(f"{EMOJI_PACK_RAW}/{n}.png")
+    sha = {n: hashlib.sha1(b).hexdigest() for n, b in files.items()}
+    try:
+        state = json.loads(await _get_setting_raw("emoji_pack_state", "{}") or "{}")
+    except Exception:
+        state = {}
+
+    def ist(n):
+        return {"sticker": f"attach://f_{n}", "format": "static", "emoji_list": icons[n][:20]}
+
+    try:
+        cur = await _tg_call("getStickerSet", {"name": pack})
+    except RuntimeError:
+        cur = None
+    owner = OWNER_ID
+    added = replaced = deleted = 0
+    errors = []
+    if cur is None:
+        names = list(icons)
+        first = names[:50]
+        await _tg_call("createNewStickerSet", {
+            "user_id": str(owner), "name": pack, "title": title, "sticker_type": "custom_emoji",
+            "stickers": [ist(n) for n in first]}, {f"f_{n}": (f"{n}.png", files[n]) for n in first})
+        added += len(first)
+        todo_add = names[50:]
+        todo_rep = []
+        stale = []
+    else:
+        have = {_norm_emoji(s.get("emoji", "")): s for s in cur.get("stickers", [])}
+        todo_add = [n for n in icons if _norm_emoji(icons[n][0]) not in have]
+        todo_rep = [n for n in icons if _norm_emoji(icons[n][0]) in have and (force or state.get(n) != sha[n])]
+        want = {_norm_emoji(v[0]) for v in icons.values()}
+        stale = [s for e, s in have.items() if e not in want]
+    for n in todo_add:
+        try:
+            await _tg_call("addStickerToSet", {"user_id": str(owner), "name": pack, "sticker": ist(n)}, {f"f_{n}": (f"{n}.png", files[n])})
+            added += 1
+        except Exception as e:
+            errors.append(f"{n}: {e}")
+        await asyncio.sleep(0.5)
+    for n in todo_rep:
+        try:
+            old = have[_norm_emoji(icons[n][0])]["file_id"]
+            await _tg_call("replaceStickerInSet", {"user_id": str(owner), "name": pack, "old_sticker": old, "sticker": ist(n)}, {f"f_{n}": (f"{n}.png", files[n])})
+            replaced += 1
+        except Exception as e:
+            errors.append(f"{n}: {e}")
+        await asyncio.sleep(0.5)
+    for s in stale:
+        try:
+            await _tg_call("deleteStickerFromSet", {"sticker": s["file_id"]})
+            deleted += 1
+        except Exception as e:
+            errors.append(f"удаление {s.get('emoji')}: {e}")
+        await asyncio.sleep(0.5)
+    fin = await _tg_call("getStickerSet", {"name": pack})
+    by_first = {_norm_emoji(s.get("emoji", "")): s.get("custom_emoji_id") for s in fin.get("stickers", [])}
+    glyph_ids = {}
+    for n, gl in icons.items():
+        cid = by_first.get(_norm_emoji(gl[0]))
+        if cid:
+            for g in gl:
+                glyph_ids[g] = cid
+    ok_names = {n for n in icons if icons[n][0] in glyph_ids}
+    new_state = {n: sha[n] for n in ok_names if not any(e.startswith(n + ":") for e in errors)}
+    await set_setting("emoji_pack_state", json.dumps(new_state))
+    await set_setting("emoji_pack_ids", json.dumps(glyph_ids, ensure_ascii=False))
+    if await _get_setting_raw("emoji_pack_on", "0") == "1":
+        _apply_pack_ids(glyph_ids)
+    rep = (f"{ICON_CHECK} Пак <a href=\"https://t.me/addemoji/{pack}\">{html.escape(pack)}</a>: "
+           f"добавлено {added}, обновлено {replaced}, удалено {deleted}, всего в паке {len(fin.get('stickers', []))}.")
+    if errors:
+        rep += "\n\n" + f"{ICON_WARN} Ошибки ({len(errors)}):\n" + "\n".join(f"• {html.escape(e)[:200]}" for e in errors[:8])
+    return rep
+
+
+@router.message(Command("emojipack"), F.chat.type == "private")
+async def cmd_emojipack(message: Message):
+    """/emojipack — статус; sync [force] — залить/обновить пак с GitHub; on|off — использовать пак в боте; name <имя>."""
+    global _pack_busy
+    if not OWNER_ID or message.from_user.id != OWNER_ID:
+        return
+    parts = (message.text or "").split()
+    arg = parts[1].lower() if len(parts) > 1 else ""
+    if arg == "sync":
+        if _pack_busy:
+            await message.answer("⏳ Синхронизация уже идёт.")
+            return
+        _pack_busy = True
+        await message.answer("⏳ Синхронизирую пак с GitHub…")
+        try:
+            rep = await sync_emoji_pack(force=(len(parts) > 2 and parts[2].lower() == "force"))
+            await message.answer(rep, parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
+        except Exception as e:
+            await message.answer(f"{ICON_CROSS} Не удалось: {html.escape(str(e))[:700]}", parse_mode="HTML")
+        finally:
+            _pack_busy = False
+        return
+    if arg in ("on", "off"):
+        if arg == "on":
+            ids = json.loads(await _get_setting_raw("emoji_pack_ids", "{}") or "{}")
+            if not ids:
+                await message.answer("Сначала выполните <code>/emojipack sync</code>.", parse_mode="HTML")
+                return
+            await set_setting("emoji_pack_on", "1")
+            _apply_pack_ids(ids)
+            await message.answer(f"{ICON_CHECK} Бот использует эмодзи из вашего пака ({len(ids)} шт.).", parse_mode="HTML")
+        else:
+            await set_setting("emoji_pack_on", "0")
+            _clear_pack_ids()
+            await message.answer(f"{ICON_CHECK} Возвращены прежние тгп-эмодзи.", parse_mode="HTML")
+        return
+    if arg == "name" and len(parts) > 2:
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{2,60}", parts[2]):
+            await message.answer("Имя: латиница, цифры, _; в конце <code>_by_username_бота</code>.", parse_mode="HTML")
+            return
+        await set_setting("emoji_pack_name", parts[2])
+        await message.answer(f"{ICON_CHECK} Имя набора: <code>{parts[2]}</code>", parse_mode="HTML")
+        return
+    try:
+        nm = await _pack_name()
+    except Exception as e:
+        nm = f"— ({e})"
+    on = await _get_setting_raw("emoji_pack_on", "0") == "1"
+    cnt = len(json.loads(await _get_setting_raw("emoji_pack_state", "{}") or "{}"))
+    await message.answer(
+        f"<b>Пак тгп-эмодзи</b>\nНабор: <code>{html.escape(nm)}</code>\nЗалито иконок: {cnt}\nИспользуется ботом: {'да' if on else 'нет'}\n\n"
+        "<code>/emojipack sync</code> — создать/обновить пак из папки emoji_pack на GitHub\n"
+        "<code>/emojipack sync force</code> — перезалить все иконки\n"
+        "<code>/emojipack on</code> / <code>off</code> — подставлять эмодзи из пака в тексты бота\n"
+        "<code>/emojipack name имя_by_бот</code> — сменить имя набора",
+        parse_mode="HTML")
 
 
 @router.message(Command("event"), F.chat.type == "private")
@@ -16186,6 +16424,7 @@ async def main():
     await _ref_cfg_load()
     await web_server()
     await setup_bot_commands(bot)
+    await load_emoji_pack_setting()
     
     if userbot:
         try:
