@@ -14510,6 +14510,91 @@ async def cmd_richuser(message: Message):
         info.append(f"\nОтправка в <code>{html.escape(str(target))}</code>: <b>ОШИБКА</b> <code>{html.escape(repr(ex)[:500])}</code>")
     await message.answer("\n".join(info), parse_mode="HTML")
 
+# ───────── /commands — полный список команд бота (для главных админов) ─────────
+_CMD_REGISTRY = [
+    ("👤 Для всех (личка с ботом)", False, [
+        ("/start", "главное меню поддержки"),
+        ("/ref", "реферальная ссылка, приглашение друзей"),
+        ("/promocode", "ввести промокод"),
+        ("/donate", "поддержать проект"),
+        ("/paysupport", "помощь по оплатам и возвратам"),
+    ]),
+    ("🛠 Чат админов/поддержки (только в рабочей группе)", False, [
+        ("/topic_id", "узнать ID текущей темы (любой участник)"),
+        ("/mystats", "моя статистика агента (хелпер/гл. админ)"),
+        ("/secstats", "моя статистика публикатора (публикатор/гл. админ)"),
+        ("/givetik №", "передать тикет другому хелперу"),
+        ("/note текст", "заметка игроку (Reply на тикет/сообщение)"),
+        ("/ban [ID|@ник] [причина]", "бан игрока (или Reply на тикет)"),
+        ("/unban [ID|@ник]", "разбан игрока (или Reply)"),
+    ]),
+    ("👑 Главные админы — чат админов", True, [
+        ("/opentickets", "неразобранные тикеты"),
+        ("/worktickets", "тикеты в работе"),
+        ("/supptop", "топ агентов поддержки"),
+        ("/sectop", "топ искателей за всё время"),
+        ("/deletenote", "удалить заметку игрока (Reply)"),
+        ("/news текст", "рассылка всем пользователям (или Reply на пост/медиа)"),
+    ]),
+    ("👑 Главные админы — личка с ботом", True, [
+        ("/commands", "этот список"),
+        ("/tohwatch [on|off]", "слежение за Tower of Hell"),
+        ("/event [halloween|newyear [дней]|off]", "праздничное оформление"),
+        ("/monitor", "мониторинг/состояние бота"),
+    ]),
+    ("🔑 Только создатель", None, [
+        ("/testpay [id] [1] [promo]", "тестовая оплата"),
+        ("/refund ID_платежа", "возврат платежа"),
+        ("/photo имя", "сохранить фото для шаблонов (фото с подписью «/photo имя»)"),
+        ("/photos", "список сохранённых фото"),
+        ("/photodel имя", "удалить сохранённое фото"),
+        ("/rich [on|off|br|p]", "расширенное форматирование постов"),
+        ("/richtest [bot|tpl|photo] [чат]", "тест расширенного форматирования"),
+        ("/richuser [чат]", "тест через юзербота"),
+    ]),
+]
+
+
+def _cmds_pages(is_owner: bool) -> list:
+    pages, cur = [], ""
+    for title, level, items in _CMD_REGISTRY:
+        if level is None and not is_owner:
+            continue
+        block = f"<b>{title}</b>\n" + "\n".join(
+            f"<code>{html.escape(c)}</code> — {html.escape(d)}" for c, d in items) + "\n\n"
+        if len(cur) + len(block) > 3800:
+            pages.append(cur)
+            cur = ""
+        cur += block
+    # команды, которых нет в реестре (на случай новых)
+    try:
+        known = {c.split()[0].lstrip("/") for _, _, its in _CMD_REGISTRY for c, _ in its}
+        known.add("start")
+        found = set()
+        for h in router.message.handlers:
+            for f in getattr(h, "filters", []) or []:
+                cmds = getattr(getattr(f, "callback", None), "commands", None)
+                for c in cmds or ():
+                    found.add(c if isinstance(c, str) else getattr(c, "pattern", ""))
+        extra = sorted(x for x in found if isinstance(x, str) and x and x not in known)
+        if extra:
+            cur += "<b>❓ Не описаны в списке</b>\n" + "\n".join(f"<code>/{html.escape(x)}</code>" for x in extra) + "\n\n"
+    except Exception:
+        pass
+    if cur.strip():
+        pages.append(cur)
+    return pages
+
+
+@router.message(Command("commands"), F.chat.type == "private")
+async def cmd_commands_list(message: Message):
+    if not await is_main_admin(message.from_user.id):
+        return
+    is_owner = bool(OWNER_ID and message.from_user.id == OWNER_ID)
+    for p in _cmds_pages(is_owner):
+        await message.answer(p.strip(), parse_mode="HTML")
+
+
 @router.message(Command("event"), F.chat.type == "private")
 async def cmd_event(message: Message):
     """/event — статус; /event halloween [дней] | newyear [дней] — включить (по умолчанию на 7 дней); /event off — выключить."""
