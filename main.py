@@ -934,7 +934,8 @@ def html_cut(src: str, limit: int) -> str:
 _PHOTO_LINE_RE = re.compile(r"^\[фото(?::([A-Za-z0-9_-]{1,64}))?(?:\|(.*))?\]$")
 
 def _has_photo_line(text: str) -> bool:
-    return any(_PHOTO_LINE_RE.match(ln.strip()) for ln in strip_nt(text or "").split("\n"))
+    return any(_PHOTO_LINE_RE.match(ln.strip()) or (ln.lstrip().startswith("@@") and "tg://photo?id=" in ln)
+               for ln in strip_nt(text or "").split("\n"))
 
 def _slotify(text: str) -> str:
     """Для постов с «родным» фото (секретки, мутатор, исследователь): любое фото в шаблоне становится местом [фото],
@@ -942,7 +943,12 @@ def _slotify(text: str) -> str:
     out = []
     for ln in strip_nt(text or "").split("\n"):
         m = _PHOTO_LINE_RE.match(ln.strip())
-        out.append((f"[фото|{m.group(2)}]" if m.group(2) else "[фото]") if m else ln)
+        if m:
+            out.append(f"[фото|{m.group(2)}]" if m.group(2) else "[фото]")
+        elif ln.lstrip().startswith("@@"):
+            out.append(re.sub(r"tg://photo\?id=[A-Za-z0-9_-]+", "tg://photo?id=slot", ln))
+        else:
+            out.append(ln)
     return "\n".join(out)
 
 def _msg_rich(message):
@@ -976,8 +982,11 @@ def _rich_store_photo(sizes) -> str:
         logging.warning(f"Не удалось запомнить фото из богатого сообщения: {ex}")
         return ""
 
+def _attr(v) -> str:
+    return html.escape(str(v), quote=True)
+
 def _rt_html(n) -> str:
-    """Inline-текст богатого сообщения (RichText) -> обычный Telegram HTML."""
+    """Inline-текст богатого сообщения (RichText) -> HTML с полным набором тегов богатого формата."""
     if n is None:
         return ""
     if isinstance(n, str):
@@ -988,92 +997,25 @@ def _rt_html(n) -> str:
         return ""
     t = n.get("type")
     inner = _rt_html(n.get("text"))
-    if t == "bold": return f"<b>{inner}</b>"
-    if t == "italic": return f"<i>{inner}</i>"
-    if t == "underline": return f"<u>{inner}</u>"
-    if t == "strikethrough": return f"<s>{inner}</s>"
-    if t == "spoiler": return f"<tg-spoiler>{inner}</tg-spoiler>"
-    if t == "code": return f"<code>{inner}</code>"
-    if t == "url" and n.get("url"): return f'<a href="{html.escape(str(n["url"]), quote=True)}">{inner}</a>'
+    simple = {"bold": "b", "italic": "i", "underline": "u", "strikethrough": "s", "spoiler": "tg-spoiler",
+              "code": "code", "marked": "mark", "subscript": "sub", "superscript": "sup"}
+    if t in simple:
+        return f"<{simple[t]}>{inner}</{simple[t]}>"
+    if t == "url" and n.get("url"): return f'<a href="{_attr(n["url"])}">{inner}</a>'
+    if t == "email_address" and n.get("email_address"): return f'<a href="mailto:{_attr(n["email_address"])}">{inner}</a>'
+    if t == "phone_number" and n.get("phone_number"): return f'<a href="tel:{_attr(n["phone_number"])}">{inner}</a>'
     if t == "text_mention" and (n.get("user") or {}).get("id"): return f'<a href="tg://user?id={int(n["user"]["id"])}">{inner}</a>'
     if t == "custom_emoji" and n.get("custom_emoji_id"):
         return f"<tg-emoji emoji-id='{int(n['custom_emoji_id'])}'>{html.escape(n.get('alternative_text') or '⭐', quote=False)}</tg-emoji>"
-    if t == "mathematical_expression": return f"<code>{html.escape(str(n.get('expression') or ''), quote=False)}</code>"
-    return inner
-
-def _rb_lines(b, notes: list, depth: int = 0) -> list:
-    """Блок богатого сообщения -> строки шаблона (в формате с префиксами # - | --- > +++)."""
-    if not isinstance(b, dict) or depth > 8:
-        return []
-    t = b.get("type")
-    if t in ("paragraph", "footer"):
-        s = _rt_html(b.get("text"))
-        return s.split("\n") if s.strip() else [""]
-    if t == "heading":
-        lv = max(1, min(6, int(b.get("size") or 1)))
-        return ["#" * lv + " " + _rt_html(b.get("text")).replace("\n", " ")]
-    if t == "divider":
-        return ["---"]
-    if t == "pre":
-        lang = b.get("language")
-        code = html.escape(_rt_plain(b.get("text")), quote=False)
-        return [f'<pre><code class="language-{html.escape(str(lang), quote=True)}">{code}</code></pre>' if lang else f"<pre>{code}</pre>"]
-    if t in ("blockquote", "pullquote"):
-        inner = []
-        if t == "pullquote":
-            inner = (_rt_html(b.get("text")) or "").split("\n")
-        for sub in b.get("blocks") or []:
-            inner += _rb_lines(sub, notes, depth + 1)
-        cr = _rt_html(b.get("credit"))
-        if cr.strip():
-            inner.append("— " + cr)
-        return ["> " + ln for ln in inner if ln.strip()] or []
-    if t == "list":
-        out = []
-        for idx, it in enumerate(b.get("items") or [], 1):
-            label = str(it.get("label") or "").strip()
-            ordered = bool(re.fullmatch(r"\d{1,3}[.)]?", label))
-            cb = ("☑ " if it.get("is_checked") else "☐ ") if it.get("has_checkbox") else ""
-            sub = []
-            for blk in it.get("blocks") or []:
-                sub += _rb_lines(blk, notes, depth + 1)
-            sub = [x for x in sub if x.strip()] or [""]
-            out.append((f"{idx}. " if ordered else "- ") + cb + sub[0])
-            out += sub[1:]
-        return out
-    if t == "table":
-        rows, header = [], False
-        for ri, row in enumerate(b.get("cells") or []):
-            cells = []
-            for c in row:
-                txt = _rt_html(c.get("text") if isinstance(c, dict) else c).replace("\n", " ").replace("|", "¦").strip()
-                cells.append(txt or " ")
-            if ri == 0:
-                header = bool(row) and all(isinstance(c, dict) and c.get("is_header") for c in row)
-            rows.append("| " + " | ".join(cells) + " |")
-            if ri == 0 and header:
-                rows.append("|" + "|".join("---" for _ in cells) + "|")
-        return rows
-    if t == "details":
-        out = ["+++ " + (_rt_html(b.get("summary")).replace("\n", " ").strip() or "Подробнее")]
-        for sub in b.get("blocks") or []:
-            out += _rb_lines(sub, notes, depth + 1)
-        out.append("+++")
-        return out
-    if t == "photo":
-        name = _rich_store_photo(b.get("photo"))
-        if not name:
-            notes.append("photo")
-            return []
-        cap = ""
-        c = b.get("caption")
-        if isinstance(c, dict):
-            cap = _rt_plain(c.get("text")).replace("\n", " ").replace("]", ")").strip()
-        return [f"[фото:{name}|{cap}]" if cap else f"[фото:{name}]"]
+    if t == "date_time" and n.get("unix_time"):
+        fmt = f' format="{_attr(n["date_time_format"])}"' if n.get("date_time_format") else ""
+        return f'<tg-time unix="{int(n["unix_time"])}"{fmt}>{inner}</tg-time>'
     if t == "mathematical_expression":
-        return [f"<code>{html.escape(str(b.get('expression') or ''), quote=False)}</code>"]
-    notes.append(str(t))
-    return []
+        return f"<tg-math>{html.escape(str(n.get('expression') or ''), quote=False)}</tg-math>"
+    if t == "anchor" and n.get("name"): return f'<a name="{_attr(n["name"])}"></a>'
+    if t == "anchor_link": return f'<a href="#{_attr(n.get("anchor_name") or "")}">{inner}</a>'
+    if t == "reference" and n.get("name"): return f'<tg-reference name="{_attr(n["name"])}">{inner}</tg-reference>'
+    return inner
 
 def _rt_plain(n) -> str:
     if n is None: return ""
@@ -1081,6 +1023,156 @@ def _rt_plain(n) -> str:
     if isinstance(n, list): return "".join(_rt_plain(x) for x in n)
     if isinstance(n, dict): return _rt_plain(n.get("text")) or str(n.get("alternative_text") or "")
     return ""
+
+def _one_line(s: str) -> str:
+    return re.sub(r"\s*\n\s*", " ", s)
+
+def _cite(credit) -> str:
+    c = _one_line(_rt_html(credit)).strip()
+    return f"<cite>{c}</cite>" if c else ""
+
+def _rb_html(b, notes: list, depth: int = 0) -> str:
+    """Любой блок богатого сообщения -> HTML богатого формата (одной строкой, без потерь). '' для неподдерживаемых."""
+    if not isinstance(b, dict) or depth > 12:
+        return ""
+    t = b.get("type")
+    if t == "paragraph":
+        return f"<p>{_one_line(_rt_html(b.get('text')))}</p>"
+    if t == "heading":
+        lv = max(1, min(6, int(b.get("size") or 1)))
+        return f"<h{lv}>{_one_line(_rt_html(b.get('text')))}</h{lv}>"
+    if t == "footer":
+        return f"<footer>{_one_line(_rt_html(b.get('text')))}</footer>"
+    if t == "divider":
+        return "<hr/>"
+    if t == "pre":
+        code = html.escape(_rt_plain(b.get("text")), quote=False).replace("\r", "").replace("\n", "&#10;")
+        lang = b.get("language")
+        return f'<pre><code class="language-{_attr(lang)}">{code}</code></pre>' if lang else f"<pre>{code}</pre>"
+    if t == "mathematical_expression":
+        return f"<tg-math-block>{html.escape(str(b.get('expression') or ''), quote=False)}</tg-math-block>"
+    if t == "blockquote":
+        inner = "".join(_rb_html(x, notes, depth + 1) for x in b.get("blocks") or [])
+        return f"<blockquote>{inner}{_cite(b.get('credit'))}</blockquote>"
+    if t == "pullquote":
+        return f"<aside><p>{_one_line(_rt_html(b.get('text')))}</p>{_cite(b.get('credit'))}</aside>"
+    if t == "details":
+        inner = "".join(_rb_html(x, notes, depth + 1) for x in b.get("blocks") or [])
+        op = " open" if b.get("is_open") else ""
+        return f"<details{op}><summary>{_one_line(_rt_html(b.get('summary')))}</summary>{inner}</details>"
+    if t == "list":
+        items = b.get("items") or []
+        labels = [str(it.get("label") or "").strip() for it in items]
+        ordered = bool(labels) and bool(re.fullmatch(r"\d{1,4}[.)]?", labels[0]))
+        tag, start = ("ol", "") if ordered else ("ul", "")
+        if ordered:
+            try:
+                n0 = int(re.match(r"\d+", labels[0]).group(0))
+                start = f' start="{n0}"' if n0 != 1 else ""
+            except Exception:
+                pass
+        lis = []
+        for it in items:
+            cb = ("☑ " if it.get("is_checked") else "☐ ") if it.get("has_checkbox") else ""
+            blocks = [x for x in (it.get("blocks") or []) if isinstance(x, dict)]
+            if len(blocks) == 1 and blocks[0].get("type") == "paragraph":
+                body = cb + _one_line(_rt_html(blocks[0].get("text")))
+            else:
+                body = (html.escape(cb) if cb else "") + "".join(_rb_html(x, notes, depth + 1) for x in blocks)
+            val = f' value="{int(it["value"])}"' if isinstance(it.get("value"), int) and ordered and it.get("value") else ""
+            lis.append(f"<li{val}>{body}</li>")
+        return f"<{tag}{start}>{''.join(lis)}</{tag}>"
+    if t == "table":
+        attrs = (" bordered" if b.get("is_bordered") else "") + (" striped" if b.get("is_striped") else "")
+        cap = b.get("caption")
+        caption = ""
+        if isinstance(cap, dict) and _rt_plain(cap.get("text")).strip():
+            caption = f"<caption>{_one_line(_rt_html(cap.get('text')))}</caption>"
+        rows = []
+        for row in b.get("cells") or []:
+            cells = []
+            for c in row:
+                c = c if isinstance(c, dict) else {"text": c}
+                tg = "th" if c.get("is_header") else "td"
+                at = ""
+                for k in ("colspan", "rowspan"):
+                    if isinstance(c.get(k), int) and c.get(k) > 1:
+                        at += f' {k}="{c[k]}"'
+                for k in ("align", "valign"):
+                    if c.get(k):
+                        at += f' {k}="{_attr(c[k])}"'
+                cells.append(f"<{tg}{at}>{_one_line(_rt_html(c.get('text')))}</{tg}>")
+            rows.append("<tr>" + "".join(cells) + "</tr>")
+        return f"<table{attrs}>{caption}{''.join(rows)}</table>"
+    if t == "photo":
+        name = _rich_store_photo(b.get("photo"))
+        if not name:
+            notes.append("photo")
+            return ""
+        spoil = " tg-spoiler" if b.get("has_spoiler") else ""
+        img = f'<img src="tg://photo?id={name}"{spoil}/>'
+        c = b.get("caption")
+        if isinstance(c, dict) and (_rt_plain(c.get("text")).strip() or _rt_plain(c.get("credit")).strip()):
+            cr = f"<cite>{_one_line(_rt_html(c.get('credit')))}</cite>" if _rt_plain(c.get("credit")).strip() else ""
+            return f"<figure>{img}<figcaption>{_one_line(_rt_html(c.get('text')))}{cr}</figcaption></figure>"
+        return img
+    notes.append(str(t))
+    return ""
+
+def _simple_list(b) -> bool:
+    """Список, который точно передаётся строками «- » / «1. »: без вложений, галочек и особых номеров."""
+    items = b.get("items") or []
+    if not items:
+        return False
+    labels = []
+    for it in items:
+        bl = [x for x in (it.get("blocks") or []) if isinstance(x, dict)]
+        if it.get("has_checkbox") or it.get("value") or len(bl) != 1 or bl[0].get("type") != "paragraph":
+            return False
+        if "\n" in _rt_plain(bl[0].get("text")):
+            return False
+        labels.append(str(it.get("label") or "").strip())
+    if all(re.fullmatch(r"\d{1,4}[.)]?", l) for l in labels):
+        return [int(re.match(r"\d+", l).group(0)) for l in labels] == list(range(1, len(labels) + 1))
+    return not any(re.fullmatch(r"\d{1,4}[.)]?", l) for l in labels)
+
+def _rb_lines(b, notes: list, depth: int = 0) -> list:
+    """Блок богатого сообщения -> строки шаблона. Простое: строки с префиксами (# - 1. ---). Остальное: строка «@@HTML» без потерь."""
+    if not isinstance(b, dict):
+        return []
+    t = b.get("type")
+    if t == "paragraph":
+        s = _rt_html(b.get("text"))
+        return s.split("\n") if s.strip() else [""]
+    if t == "heading":
+        lv = max(1, min(6, int(b.get("size") or 1)))
+        return ["#" * lv + " " + _rt_html(b.get("text")).replace("\n", " ")]
+    if t == "divider":
+        return ["---"]
+    if t == "photo" and not b.get("has_spoiler"):
+        name = _rich_store_photo(b.get("photo"))
+        if not name:
+            notes.append("photo")
+            return []
+        cap = ""
+        c = b.get("caption")
+        if isinstance(c, dict) and not _rt_plain(c.get("credit")).strip():
+            cap = _rt_plain(c.get("text")).replace("\n", " ").replace("]", ")").strip()
+        if not (isinstance(c, dict) and _rt_plain(c.get("credit")).strip()):
+            return [f"[фото:{name}|{cap}]" if cap else f"[фото:{name}]"]
+    if t == "list" and _simple_list(b):
+        items = b.get("items") or []
+        ordered = bool(re.fullmatch(r"\d{1,4}[.)]?", str(items[0].get("label") or "").strip()))
+        out = []
+        for idx, it in enumerate(items, 1):
+            out.append((f"{idx}. " if ordered else "- ") + _rt_html(it["blocks"][0].get("text")))
+        return out
+    raw = _rb_html(b, notes, depth)
+    return ["@@" + html.escape(raw, quote=False)] if raw else []
+
+_BLOCK_NAMES_RU = {"video": "видео", "audio": "аудио", "animation": "анимация", "voice_note": "голосовое",
+                   "collage": "коллаж", "slideshow": "слайд-шоу", "map": "карта", "thinking": "черновик ИИ",
+                   "photo": "фото (не удалось запомнить)"}
 
 def rich_message_to_template(rm: dict):
     """Богатое сообщение (из Bot API) -> (текст шаблона, список пропущенных типов блоков)."""
@@ -1095,12 +1187,26 @@ def rich_message_to_template(rm: dict):
 
 _CD_HEAD = re.compile(r"^(\s*)#{1,6} (.+)$")
 
+_BOT_BAD_TAGS = re.compile(r"</?(?:mark|sub|sup|tg-time|tg-math|tg-reference)\b[^>]*>")
+
+def _bot_tpl(text):
+    """Текст шаблона для запасных путей через обычного бота: без тегов богатого формата и строк с префиксами."""
+    return _BOT_BAD_TAGS.sub("", classic_downgrade(strip_nt(text or ""), drop_syntax=True))
+
 def classic_downgrade(text: str, drop_syntax: bool = True) -> str:
     """Для обычной (не богатой) публикации: убирает строки фото и заменяет префиксы шаблона на обычное оформление."""
     out = []
     for ln in (text or "").split("\n"):
         s = ln.strip()
         if _PHOTO_LINE_RE.match(s):
+            continue
+        if s.startswith("@@"):
+            raw = html.unescape(s[2:])
+            raw = re.sub(r"</(p|li|tr|h[1-6]|summary|blockquote|aside|footer|figure|figcaption|caption|cite)>", "\n", raw)
+            for piece in re.sub(r"<[^>]+>", " ", raw).split("\n"):
+                piece = re.sub(r"[ \t]+", " ", html.unescape(piece)).strip()
+                if piece:
+                    out.append(html.escape(piece, quote=False))
             continue
         if drop_syntax:
             m = _CD_HEAD.match(ln)
@@ -1146,6 +1252,12 @@ def extract_text_with_custom_emojis(message: Message) -> str:
     if rm:
         try:
             tmpl, _notes = rich_message_to_template(rm)
+            if _notes:
+                cnt = {}
+                for x in _notes:
+                    cnt[x] = cnt.get(x, 0) + 1
+                lost = ", ".join(f"{_BLOCK_NAMES_RU.get(k, k)} ×{v}" for k, v in cnt.items())
+                spawn(message.answer(f"⚠️ В шаблон не попало (такие блоки пока не поддерживаются): {html.escape(lost)}.", parse_mode="HTML"))
             if tmpl.strip():
                 return tmpl
         except Exception as ex:
@@ -2731,7 +2843,7 @@ async def expire_secret_post(bot: Bot, post_id: int, channel_id: str, message_id
             await bot.edit_message_caption(
                 chat_id=channel_id,
                 message_id=message_id,
-                caption=final_text,
+                caption=_bot_tpl(final_text),
                 parse_mode="HTML"
             )
     except MessageNotModifiedError:
@@ -2821,7 +2933,7 @@ async def _publish_to_channel_delayed_inner(channel_id: str, photo_id: str, capt
             sent_channel = await bot.send_photo(
                 chat_id=channel_id,
                 photo=photo_id,
-                caption=caption,
+                caption=_bot_tpl(caption),
                 parse_mode="HTML"
             )
             channel_msg_id = sent_channel.message_id
@@ -2840,7 +2952,7 @@ async def _publish_to_channel_delayed_inner(channel_id: str, photo_id: str, capt
         if userbot and not channel_msg_id:
             # запасной путь: обычный бот (без премиум-эмодзи), чтобы пост не пропал
             try:
-                sent_channel = await bot.send_photo(chat_id=channel_id, photo=photo_id, caption=caption, parse_mode="HTML")
+                sent_channel = await bot.send_photo(chat_id=channel_id, photo=photo_id, caption=_bot_tpl(caption), parse_mode="HTML")
                 channel_msg_id = sent_channel.message_id
                 def _upd_fb():
                     with get_db() as conn:
@@ -2987,7 +3099,9 @@ async def _ub_request(label: str, make_coro, attempts: int = 3, on_retry=None):
 from html.parser import HTMLParser as _HTMLParser
 
 _RICH_INLINE_TAGS = {"b": "b", "strong": "b", "i": "i", "em": "i", "u": "u", "ins": "u", "s": "s", "strike": "s",
-                     "del": "s", "code": "code", "a": "a", "tg-emoji": "tg-emoji", "tg-spoiler": "tg-spoiler"}
+                     "del": "s", "code": "code", "a": "a", "tg-emoji": "tg-emoji", "tg-spoiler": "tg-spoiler",
+                     "mark": "mark", "sub": "sub", "sup": "sup", "tg-time": "tg-time", "tg-math": "tg-math",
+                     "tg-reference": "tg-reference"}
 
 class _RichLineParser(_HTMLParser):
     """Режет Telegram-HTML на строки. Теги форматирования закрываются в конце строки и открываются заново в следующей."""
@@ -3001,9 +3115,16 @@ class _RichLineParser(_HTMLParser):
     def _open_str(self, name, attrs):
         d = dict(attrs)
         if name == "a":
+            if d.get("name") and not d.get("href"):
+                return f'<a name="{html.escape(d["name"], quote=True)}">'
             return f'<a href="{html.escape(d.get("href") or "", quote=True)}">'
         if name == "tg-emoji":
             return f'<tg-emoji emoji-id="{html.escape(d.get("emoji-id") or "", quote=True)}">'
+        if name == "tg-time":
+            fmt = f' format="{html.escape(d["format"], quote=True)}"' if d.get("format") else ""
+            return f'<tg-time unix="{html.escape(d.get("unix") or "", quote=True)}"{fmt}>'
+        if name == "tg-reference":
+            return f'<tg-reference name="{html.escape(d.get("name") or "", quote=True)}">'
         return f"<{name}>"
 
     def _flush(self, force=False):
@@ -3083,6 +3204,10 @@ def _rich_render(lines: list, join_br: bool) -> str:
             i += 1
             continue
         plain = L["plain"].lstrip()
+        if plain.startswith("@@"):
+            out.append(re.sub(r"&(?!#?\w+;)", "&amp;", plain[2:].strip()))
+            i += 1
+            continue
         pm = _PHOTO_LINE_RE.match(plain.strip())
         if pm:
             img = f'<img src="tg://photo?id={pm.group(1) or "slot"}"/>'
@@ -3175,7 +3300,7 @@ def _rich_render(lines: list, join_br: bool) -> str:
 
 def _rich_is_special(L: dict) -> bool:
     p = L["plain"].lstrip()
-    return bool(_RICH_HEAD_RE.match(p) or p.strip() in ("---", "***", "___") or p.startswith(("- ", "* ", "|", "> ", "+++"))
+    return bool(p.startswith("@@") or _RICH_HEAD_RE.match(p) or p.strip() in ("---", "***", "___") or p.startswith(("- ", "* ", "|", "> ", "+++"))
                 or _RICH_OL_RE.match(p) or _PHOTO_LINE_RE.match(p.strip()))
 
 def html_to_rich(src: str, join_br: bool = False) -> str:
@@ -3499,7 +3624,7 @@ async def publish_or_update_saboteur_channel(channel_id: str, post_id: int):
                 # запасной путь: обычный бот, чтобы пост не пропал (без премиум-эмодзи)
                 logging.error(f"[Саботёр #{post_id}] юзербот не смог опубликовать ({type(e).__name__}: {e}), публикую ботом.")
                 sent_b = await bot.send_message(
-                    chat_id=channel_id, text=final_text, parse_mode="HTML",
+                    chat_id=channel_id, text=_bot_tpl(final_text), parse_mode="HTML",
                     link_preview_options=LinkPreviewOptions(is_disabled=True)
                 )
                 await asyncio.to_thread(_save_mid, sent_b.message_id)
@@ -3520,7 +3645,7 @@ async def publish_or_update_saboteur_channel(channel_id: str, post_id: int):
             except MessageAuthorRequiredError:
                 # пост был отправлен ботом (запасной путь): редактируем тоже ботом
                 await bot.edit_message_text(
-                    chat_id=channel_id, message_id=current_post["message_id"], text=final_text,
+                    chat_id=channel_id, message_id=current_post["message_id"], text=_bot_tpl(final_text),
                     parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True)
                 )
         else:
@@ -6781,9 +6906,9 @@ async def _res_core(user, data, ch_id) -> tuple:
             msg_id = sent.id
         else:
             if has_photo:
-                sent = await bot.send_photo(chat_id=ch_id, photo=FSInputFile(RESEARCHER_PHOTO), caption=text, parse_mode="HTML")
+                sent = await bot.send_photo(chat_id=ch_id, photo=FSInputFile(RESEARCHER_PHOTO), caption=_bot_tpl(text), parse_mode="HTML")
             else:
-                sent = await bot.send_message(chat_id=ch_id, text=text, parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
+                sent = await bot.send_message(chat_id=ch_id, text=_bot_tpl(text), parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
             msg_id = sent.message_id
 
         def _save():
@@ -7328,7 +7453,7 @@ async def expire_mutator_badge(badge_id: int, channel_id: str, message_id: int) 
         else:
             try:
                 await bot.edit_message_caption(
-                    chat_id=channel_id, message_id=message_id, caption=text, parse_mode="HTML"
+                    chat_id=channel_id, message_id=message_id, caption=_bot_tpl(text), parse_mode="HTML"
                 )
             except TelegramBadRequest as tb:
                 if "no caption" in str(tb).lower() or "there is no text" in str(tb).lower() or "message can't be edited" in str(tb).lower():
@@ -7465,7 +7590,7 @@ async def mutator_confirm_proc(call: CallbackQuery, state: FSMContext):
         else:
             if os.path.exists(MUTATOR_PHOTO):
                 sent = await bot.send_photo(
-                    chat_id=ch_id, photo=FSInputFile(MUTATOR_PHOTO), caption=text, parse_mode="HTML"
+                    chat_id=ch_id, photo=FSInputFile(MUTATOR_PHOTO), caption=_bot_tpl(text), parse_mode="HTML"
                 )
             else:
                 logging.warning(f"Файл {MUTATOR_PHOTO} не найден, мутатор публикуется без фото.")
@@ -7659,7 +7784,7 @@ async def close_researcher_post(badge_id: int, channel_id: str, message_id: int)
                                 rich_src=text, slot=RESEARCHER_PHOTO, natural=True)
         else:
             try:
-                await bot.edit_message_caption(chat_id=channel_id, message_id=message_id, caption=text, parse_mode="HTML")
+                await bot.edit_message_caption(chat_id=channel_id, message_id=message_id, caption=_bot_tpl(text), parse_mode="HTML")
             except TelegramBadRequest as tb:
                 low = str(tb).lower()
                 if "no caption" in low or "there is no text" in low or "message can't be edited" in low:
