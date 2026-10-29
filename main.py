@@ -14595,7 +14595,7 @@ _CMD_REGISTRY = [
         ("/rich [on|off|br|p]", "расширенное форматирование постов"),
         ("/richtest [bot|tpl|photo] [чат]", "тест расширенного форматирования"),
         ("/richuser [чат]", "тест через юзербота"),
-        ("/emojipack [sync|on|off]", "пак тгп-эмодзи из папки emoji_pack на GitHub"),
+        ("/emojipack [sync|on|off|anim on|off]", "пак тгп-эмодзи из папки emoji_pack на GitHub"),
     ]),
 ]
 
@@ -14684,10 +14684,18 @@ def _clear_pack_ids():
         EMOJI_IDS[k] = EMOJI_IDS_ORIG[k]
 
 
+async def _pack_effective_ids() -> dict:
+    """Статичные эмодзи + (если включено) анимированные поверх них."""
+    ids = json.loads(await _get_setting_raw("emoji_pack_ids", "{}") or "{}")
+    if await _get_setting_raw("emoji_pack_anim", "1") == "1":
+        ids.update(json.loads(await _get_setting_raw("emoji_pack_ids_anim", "{}") or "{}"))
+    return ids
+
+
 async def load_emoji_pack_setting():
     try:
         if await _get_setting_raw("emoji_pack_on", "0") == "1":
-            ids = json.loads(await _get_setting_raw("emoji_pack_ids", "{}") or "{}")
+            ids = await _pack_effective_ids()
             if ids:
                 _apply_pack_ids(ids)
                 logging.info(f"Пак тгп-эмодзи подключён: {len(ids)} эмодзи.")
@@ -14695,7 +14703,7 @@ async def load_emoji_pack_setting():
         logging.warning(f"Пак тгп-эмодзи не загружен: {e}")
 
 
-async def _tg_call(method: str, fields: dict, files: dict = None):
+async def _tg_call(method: str, fields: dict, files: dict = None, ctype: str = "image/png"):
     """Вызов Bot API напрямую (multipart). Ждёт при 429."""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
     for _ in range(6):
@@ -14703,7 +14711,7 @@ async def _tg_call(method: str, fields: dict, files: dict = None):
         for k, v in fields.items():
             fd.add_field(k, v if isinstance(v, str) else json.dumps(v, ensure_ascii=False))
         for k, (fn, data) in (files or {}).items():
-            fd.add_field(k, data, filename=fn, content_type="image/png")
+            fd.add_field(k, data, filename=fn, content_type=ctype)
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as s:
             async with s.post(url, data=fd) as r:
                 js = await r.json(content_type=None)
@@ -14748,8 +14756,11 @@ async def _sync_one(folder: str, force: bool):
         raise RuntimeError(f"{folder}: в паке не может быть больше 200 эмодзи")
     title = str(man.get("title") or "Emoji")[:64]
     repaint = bool(man.get("repaint"))
+    ext = "webm" if man.get("format") == "video" else "png"
+    ctype = "video/webm" if ext == "webm" else "image/png"
+    fmt = "video" if ext == "webm" else "static"
     pack = await _pack_name(man.get("name_prefix") or "tohs")
-    files = {n: await _http_get(f"{base}/{n}.png") for n in icons}
+    files = {n: await _http_get(f"{base}/{n}.{ext}") for n in icons}
     sha = {n: hashlib.sha1(b).hexdigest() for n, b in files.items()}
     skey = f"emoji_pack_state_{folder}"
     try:
@@ -14758,7 +14769,7 @@ async def _sync_one(folder: str, force: bool):
         state = {}
 
     def ist(n):
-        return {"sticker": f"attach://f_{n}", "format": "static", "emoji_list": icons[n][:20]}
+        return {"sticker": f"attach://f_{n}", "format": fmt, "emoji_list": icons[n][:20]}
 
     try:
         cur = await _tg_call("getStickerSet", {"name": pack})
@@ -14782,7 +14793,7 @@ async def _sync_one(folder: str, force: bool):
                   "stickers": [ist(n) for n in first]}
         if repaint:
             fields["needs_repainting"] = "true"
-        await _tg_call("createNewStickerSet", fields, {f"f_{n}": (f"{n}.png", files[n]) for n in first})
+        await _tg_call("createNewStickerSet", fields, {f"f_{n}": (f"{n}.{ext}", files[n]) for n in first}, ctype)
         added += len(first)
         todo_add = names[50:]
     else:
@@ -14793,7 +14804,7 @@ async def _sync_one(folder: str, force: bool):
         stale = [s for e, s in have.items() if e not in want]
     for n in todo_add:
         try:
-            await _tg_call("addStickerToSet", {"user_id": str(owner), "name": pack, "sticker": ist(n)}, {f"f_{n}": (f"{n}.png", files[n])})
+            await _tg_call("addStickerToSet", {"user_id": str(owner), "name": pack, "sticker": ist(n)}, {f"f_{n}": (f"{n}.{ext}", files[n])}, ctype)
             added += 1
         except Exception as e:
             errors.append(f"{n}: {e}")
@@ -14801,7 +14812,7 @@ async def _sync_one(folder: str, force: bool):
     for n in todo_rep:
         try:
             old = have[_norm_emoji(icons[n][0])]["file_id"]
-            await _tg_call("replaceStickerInSet", {"user_id": str(owner), "name": pack, "old_sticker": old, "sticker": ist(n)}, {f"f_{n}": (f"{n}.png", files[n])})
+            await _tg_call("replaceStickerInSet", {"user_id": str(owner), "name": pack, "old_sticker": old, "sticker": ist(n)}, {f"f_{n}": (f"{n}.{ext}", files[n])}, ctype)
             replaced += 1
         except Exception as e:
             errors.append(f"{n}: {e}")
@@ -14827,7 +14838,7 @@ async def _sync_one(folder: str, force: bool):
            f"добавлено {added}, обновлено {replaced}, удалено {deleted}, всего {len(fin.get('stickers', []))}.")
     if errors:
         rep += "\n" + f"{ICON_WARN} Ошибки ({len(errors)}):\n" + "\n".join(f"• {html.escape(e)[:200]}" for e in errors[:6])
-    return rep, glyph_ids, added + replaced + deleted + (1 if title_changed else 0), len(errors)
+    return rep, glyph_ids, added + replaced + deleted + (1 if title_changed else 0), len(errors), ext == "webm"
 
 
 async def sync_emoji_pack(force: bool = False) -> str:
@@ -14836,21 +14847,22 @@ async def sync_emoji_pack(force: bool = False) -> str:
     folders = await _http_get(f"{EMOJI_PACK_RAW}/packs.json", True)
     if not isinstance(folders, list) or not folders:
         raise RuntimeError("packs.json пуст или повреждён")
-    reports, merged, changes, errs = [], {}, 0, 0
+    reports, merged, merged_anim, changes, errs = [], {}, {}, 0, 0
     for fo in folders:
         try:
-            rep, ids, ch, er = await _sync_one(str(fo), force)
-            merged.update(ids)      # следующий пак перекрывает предыдущий
+            rep, ids, ch, er, is_anim = await _sync_one(str(fo), force)
+            (merged_anim if is_anim else merged).update(ids)      # следующий пак перекрывает предыдущий
             changes += ch
             errs += er
             reports.append(rep)
         except Exception as e:
             errs += 1
             reports.append(f"{ICON_CROSS} {html.escape(str(fo))}: {html.escape(str(e))[:300]}")
-    if merged:
+    if merged or merged_anim:
         await set_setting("emoji_pack_ids", json.dumps(merged, ensure_ascii=False))
+        await set_setting("emoji_pack_ids_anim", json.dumps(merged_anim, ensure_ascii=False))
         if await _get_setting_raw("emoji_pack_on", "0") == "1":
-            _apply_pack_ids(merged)
+            _apply_pack_ids(await _pack_effective_ids())
     _pack_last = (changes, errs)
     return "\n\n".join(reports)
 
@@ -14901,9 +14913,15 @@ async def cmd_emojipack(message: Message):
         finally:
             _pack_busy = False
         return
+    if arg == "anim" and len(parts) > 2 and parts[2].lower() in ("on", "off"):
+        await set_setting("emoji_pack_anim", "1" if parts[2].lower() == "on" else "0")
+        if await _get_setting_raw("emoji_pack_on", "0") == "1":
+            _apply_pack_ids(await _pack_effective_ids())
+        await message.answer(f"{ICON_CHECK} Анимированные эмодзи: {'включены' if parts[2].lower() == 'on' else 'выключены (статичные)'}.", parse_mode="HTML")
+        return
     if arg in ("on", "off"):
         if arg == "on":
-            ids = json.loads(await _get_setting_raw("emoji_pack_ids", "{}") or "{}")
+            ids = await _pack_effective_ids()
             if not ids:
                 await message.answer("Сначала выполните <code>/emojipack sync</code>.", parse_mode="HTML")
                 return
@@ -14920,12 +14938,13 @@ async def cmd_emojipack(message: Message):
     except Exception as e:
         nm = f"— ({e})"
     on = await _get_setting_raw("emoji_pack_on", "0") == "1"
-    cnt = len(json.loads(await _get_setting_raw("emoji_pack_ids", "{}") or "{}"))
+    cnt = len(await _pack_effective_ids())
     await message.answer(
         f"<b>Пак тгп-эмодзи</b>\nНабор: <code>{html.escape(nm)}</code>\nЭмодзи в паках: {cnt}\nИспользуется ботом: {'да' if on else 'нет'}\n\n"
         "<code>/emojipack sync</code> — создать/обновить пак из папки emoji_pack на GitHub\n"
         "<code>/emojipack sync force</code> — перезалить все иконки\n"
-        "<code>/emojipack on</code> / <code>off</code> — подставлять эмодзи из паков в тексты бота",
+        "<code>/emojipack on</code> / <code>off</code> — подставлять эмодзи из паков в тексты бота\n"
+        "<code>/emojipack anim on</code> / <code>off</code> — анимированные или статичные",
         parse_mode="HTML")
 
 

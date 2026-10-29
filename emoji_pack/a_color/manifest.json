@@ -1,0 +1,33 @@
+{
+ "title": "@ToHSecretss emoji pack · анимация цвет",
+ "name_prefix": "tohsac",
+ "repaint": false,
+ "icons": {
+  "check": [
+   "✅"
+  ],
+  "cross": [
+   "❌"
+  ],
+  "green": [
+   "🟢"
+  ],
+  "red": [
+   "🔴"
+  ],
+  "siren": [
+   "🚨"
+  ],
+  "star": [
+   "⭐"
+  ],
+  "stars": [
+   "🌠"
+  ],
+  "warn": [
+   "⚠",
+   "🏃"
+  ]
+ },
+ "format": "video"
+}
