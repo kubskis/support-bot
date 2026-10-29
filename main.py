@@ -293,6 +293,8 @@ def _emojify_piece(piece: str, left: list) -> str:
         if left[0] <= 0:
             return x.group(0)
         left[0] -= 1
+        if STARS_CUR_ID and _norm_emoji(x.group(0)) == "⭐" and re.search(r"\d[ \u00a0]$", x.string[max(0, x.start() - 2):x.start()]):
+            return f'<tg-emoji emoji-id="{STARS_CUR_ID}">⭐</tg-emoji>'     # «100 ⭐» — звезда-валюта, а не оценка
         return tge(x.group(0))
     out, pos = [], 0
     for m in _PROTECTED_RE.finditer(piece):
@@ -14641,6 +14643,7 @@ async def cmd_commands_list(message: Message):
 # ───────── Пак тгп-эмодзи из папки emoji_pack на GitHub (/emojipack) ─────────
 EMOJI_PACK_RAW = os.getenv("EMOJI_PACK_RAW", "https://raw.githubusercontent.com/kubskis/support-bot/main/emoji_pack")
 EMOJI_IDS_ORIG = dict(EMOJI_IDS)
+STARS_CUR_ID = None       # звезда-валюта Telegram Stars из нашего пака (🌠 в manifest)
 EMOJI_REMAP = {}          # старый emoji-id -> новый (из нашего пака)
 _EMOJI_ID_ATTR_RE = re.compile(r"""emoji-id=(['"])(\d+)\1""")
 _pack_busy = False
@@ -14659,6 +14662,8 @@ def _remap_emoji_ids(text: str) -> str:
 
 def _apply_pack_ids(glyph_ids: dict):
     """glyph_ids: {эмодзи: custom_emoji_id нашего пака}. Подменяет ID в реестре и в готовых тегах."""
+    global STARS_CUR_ID
+    STARS_CUR_ID = glyph_ids.get("🌠")
     EMOJI_REMAP.clear()
     for k in list(EMOJI_IDS):
         EMOJI_IDS[k] = EMOJI_IDS_ORIG[k]
@@ -14672,6 +14677,8 @@ def _apply_pack_ids(glyph_ids: dict):
 
 
 def _clear_pack_ids():
+    global STARS_CUR_ID
+    STARS_CUR_ID = None
     EMOJI_REMAP.clear()
     for k in list(EMOJI_IDS):
         EMOJI_IDS[k] = EMOJI_IDS_ORIG[k]
