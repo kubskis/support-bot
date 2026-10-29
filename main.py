@@ -1271,7 +1271,7 @@ async def parse_telethon_custom_emojis(client: UserClient, text: str):
     Позиции эмодзи точные: каждое эмодзи на время разбора заменяется
     уникальным маркером той же длины (в UTF-16), затем маркер возвращается обратно.
     """
-    text = strip_nt(text)
+    text = _remap_emoji_ids(strip_nt(text))
     text = classic_downgrade(text, drop_syntax=((await _get_setting_raw("rich_posts", "0")) == "1"))
     pattern = re.compile(r"<tg-emoji emoji-id=['\"](\d+)['\"]>(.*?)</tg-emoji>", re.DOTALL)
 
@@ -3309,7 +3309,7 @@ def html_to_rich(src: str, join_br: bool = False) -> str:
     «| а | б |» таблица (вторая строка |---|---| делает первую заголовком), «---» разделитель,
     «> » цитата, «+++ Заголовок» ... «+++» сворачиваемый блок. Всё остальное: абзацы с тем же форматированием."""
     p = _RichLineParser()
-    p.feed(strip_nt(src or ""))
+    p.feed(_remap_emoji_ids(strip_nt(src or "")))
     p.close()
     p._flush()
     res = _rich_render(p.lines, join_br)
@@ -14625,6 +14625,7 @@ def _apply_pack_ids(glyph_ids: dict):
         new = by_norm.get(_norm_emoji(k))
         if new:
             EMOJI_IDS[k] = new
+            _ID_GLYPH.setdefault(new, k)
             EMOJI_REMAP.setdefault(old, new)
 
 
