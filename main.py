@@ -14602,6 +14602,7 @@ EMOJI_IDS_ORIG = dict(EMOJI_IDS)
 EMOJI_REMAP = {}          # старый emoji-id -> новый (из нашего пака)
 _EMOJI_ID_ATTR_RE = re.compile(r"""emoji-id=(['"])(\d+)\1""")
 _pack_busy = False
+_pack_last = (0, 0)
 
 
 def _norm_emoji(e: str) -> str:
@@ -14714,6 +14715,13 @@ async def sync_emoji_pack(force: bool = False) -> str:
     except RuntimeError:
         cur = None
     owner = OWNER_ID
+    title_changed = False
+    if cur is not None and cur.get("title") != title:
+        try:
+            await _tg_call("setStickerSetTitle", {"name": pack, "title": title})
+            title_changed = True
+        except Exception as e:
+            logging.warning(f"Название пака не изменено: {e}")
     added = replaced = deleted = 0
     errors = []
     if cur is None:
@@ -14768,11 +14776,37 @@ async def sync_emoji_pack(force: bool = False) -> str:
     await set_setting("emoji_pack_ids", json.dumps(glyph_ids, ensure_ascii=False))
     if await _get_setting_raw("emoji_pack_on", "0") == "1":
         _apply_pack_ids(glyph_ids)
+    global _pack_last
+    _pack_last = (added + replaced + deleted + (1 if title_changed else 0), len(errors))
     rep = (f"{ICON_CHECK} Пак <a href=\"https://t.me/addemoji/{pack}\">{html.escape(pack)}</a>: "
            f"добавлено {added}, обновлено {replaced}, удалено {deleted}, всего в паке {len(fin.get('stickers', []))}.")
     if errors:
         rep += "\n\n" + f"{ICON_WARN} Ошибки ({len(errors)}):\n" + "\n".join(f"• {html.escape(e)[:200]}" for e in errors[:8])
     return rep
+
+
+async def emoji_pack_autosync():
+    """Каждый запуск бота: сверяет пак с папкой emoji_pack на GitHub. Владельцу пишет, только если что-то изменилось или была ошибка."""
+    global _pack_busy
+    await asyncio.sleep(20)
+    if _pack_busy or not OWNER_ID:
+        return
+    _pack_busy = True
+    try:
+        rep = await sync_emoji_pack()
+        if _pack_last[0] or _pack_last[1]:
+            await bot.send_message(OWNER_ID, "🔄 Автообновление пака при запуске.\n" + rep, parse_mode="HTML",
+                                   link_preview_options=LinkPreviewOptions(is_disabled=True))
+        else:
+            logging.info("Пак тгп-эмодзи актуален.")
+    except Exception as e:
+        logging.warning(f"Автообновление пака не удалось: {e}")
+        try:
+            await bot.send_message(OWNER_ID, f"{ICON_WARN} Автообновление пака эмодзи не удалось: {html.escape(str(e))[:500]}", parse_mode="HTML")
+        except Exception:
+            pass
+    finally:
+        _pack_busy = False
 
 
 @router.message(Command("emojipack"), F.chat.type == "private")
@@ -16425,6 +16459,7 @@ async def main():
     await web_server()
     await setup_bot_commands(bot)
     await load_emoji_pack_setting()
+    asyncio.create_task(emoji_pack_autosync())
     
     if userbot:
         try:
