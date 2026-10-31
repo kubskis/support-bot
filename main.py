@@ -16537,6 +16537,13 @@ async def main():
     if MAINTENANCE_ON:
         logging.warning("Бот запущен в режиме ТЕХНИЧЕСКОГО ПЕРЕРЫВА (включён ранее).")
     await _ref_cfg_load()
+    try:
+        import iris_mod
+        await iris_mod.init_tables()
+        iris_mod.setup(dp, bot, get_db, is_main_admin, skip_chat_ids=[ADMIN_CHAT_ID])
+        logging.info("Модуль «Надзор» подключён.")
+    except Exception as e:
+        logging.error(f"Модуль «Надзор» не подключён: {e}")
     await web_server()
     await setup_bot_commands(bot)
     await load_emoji_pack_setting()
