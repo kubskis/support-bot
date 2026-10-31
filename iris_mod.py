@@ -70,7 +70,7 @@ async def q(sql, args=(), one=False, many=False):
 
 async def init_tables():
     await asyncio.to_thread(_q, _DDL)
-    for modname in ("iris_eco", "iris_fun", "iris_grid"):
+    for modname in ("iris_eco", "iris_fun", "iris_grid", "iris_import"):
         try:
             mod = __import__(modname)
             await mod.init_tables()
@@ -1418,7 +1418,7 @@ def setup(dp, bot, get_db, is_main_admin, skip_chat_ids=()):
     global _bot, _get_db, _is_main_admin, _skip
     _bot, _get_db, _is_main_admin = bot, get_db, is_main_admin
     _skip = set(skip_chat_ids)
-    for modname in ("iris_eco", "iris_fun", "iris_grid", "iris_card", "iris_alias"):
+    for modname in ("iris_eco", "iris_fun", "iris_grid", "iris_card", "iris_alias", "iris_import"):
         try:
             __import__(modname)   # регистрируют свои команды в CMDS
         except Exception:
@@ -1429,4 +1429,9 @@ def setup(dp, bot, get_db, is_main_admin, skip_chat_ids=()):
     except Exception:
         log.exception("iris_fun worker")
     dp.message.outer_middleware(IrisMiddleware())
+    try:
+        import iris_import
+        iris_import.install(dp)
+    except Exception:
+        log.exception("iris_import install")
     dp.include_router(router)
