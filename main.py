@@ -2044,7 +2044,11 @@ async def setup_bot_commands(bot: Bot):
             BotCommand(command="unban", description="🔓 Разблокировать игрока"),
             BotCommand(command="news", description="📢 Рассылка новости всем (Гл. Админ)"),
         ]
-        await bot.set_my_commands(admin_commands, scope=BotCommandScopeAllGroupChats())
+        # в обычных группах подсказок команд быть не должно: только в чате поддержки
+        try:
+            await bot.delete_my_commands(scope=BotCommandScopeAllGroupChats())
+        except Exception as _e:
+            logging.warning(f"Не удалось убрать подсказки в группах: {_e}")
         await bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=ADMIN_CHAT_ID))
         logging.info("Подсказки команд Telegram успешно зарегистрированы.")
     except Exception as e:
