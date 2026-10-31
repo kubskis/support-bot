@@ -1033,40 +1033,9 @@ async def cb_vote(cb: CallbackQuery):
 _MSK = timezone(timedelta(hours=3))
 
 # ---------------------------------------------------------------- графики активности (Pillow)
-def make_chart(values, days, title_num=None):
-    """Столбчатый график активности (тёмная карточка). Только цифры — шрифт по умолчанию без кириллицы."""
-    from io import BytesIO
-    from PIL import Image, ImageDraw, ImageFont
-    W, H, pad = 900, 420, 40
-    img = Image.new("RGB", (W, H), (24, 28, 38))
-    d = ImageDraw.Draw(img)
-    try:
-        f = ImageFont.load_default(size=18)
-        fb = ImageFont.load_default(size=44)
-    except TypeError:
-        f = fb = ImageFont.load_default()
-    mx = max(values) if values and max(values) > 0 else 1
-    total = sum(values)
-    d.text((pad, 22), str(title_num if title_num is not None else total), fill=(255, 255, 255), font=fb)
-    top, bot = 100, H - 52
-    n = len(values)
-    gap = 4
-    L = 80
-    bw = (W - L - pad - gap * (n - 1)) / n
-    for g in range(1, 4):
-        y = bot - (bot - top) * g / 3
-        d.line([(L, y), (W - pad, y)], fill=(44, 50, 64), width=1)
-        d.text((10, y - 11), str(int(mx * g / 3)), fill=(110, 120, 140), font=f)
-    for i, v in enumerate(values):
-        x0 = L + i * (bw + gap)
-        h = (bot - top) * v / mx
-        col = (82, 156, 255) if v else (44, 50, 64)
-        d.rounded_rectangle([x0, bot - max(h, 3), x0 + bw, bot], radius=3, fill=col)
-        if i % 5 == 0 or i == n - 1:
-            d.text((x0 - 2, bot + 10), days[i], fill=(140, 150, 170), font=f)
-    buf = BytesIO()
-    img.save(buf, "PNG")
-    return buf.getvalue()
+def make_chart(values, dates, title_num=None):
+    import iris_card
+    return iris_card.render_chart(values, dates, "Активность чата за 30 дней", f"Сообщений за период: {title_num if title_num is not None else sum(values)}")
 
 
 async def _series(chat_id, uid=None, days=30):
@@ -1077,7 +1046,7 @@ async def _series(chat_id, uid=None, days=30):
     m = {r[0]: int(r[1]) for r in rows}
     today = datetime.now(_MSK).date()
     ds = [today - timedelta(days=days - 1 - i) for i in range(days)]
-    return [m.get(x, 0) for x in ds], [x.strftime("%d") for x in ds]
+    return [m.get(x, 0) for x in ds], ds
 
 
 async def reply_chart(msg, text, vals, days, num=None):
@@ -1096,31 +1065,6 @@ async def reply_chart(msg, text, vals, days, num=None):
 def _ago(ts):
     s = int((datetime.now(timezone.utc) - ts).total_seconds())
     return "только что" if s < 60 else f"{s // 60} мин назад" if s < 3600 else f"{s // 3600} ч назад" if s < 86400 else f"{s // 86400} д назад"
-
-
-@cmd(["кто я", "кто ты", "профиль", "моя анкета", "анкета"], "кто_я")
-async def c_whoami(msg, args, rank):
-    uid, name, _ = await resolve_target(msg, args)
-    if not uid:
-        uid, name = msg.from_user.id, msg.from_user.full_name
-    cid = msg.chat.id
-    r = await q("SELECT msgs,first_seen,last_seen,profile,username FROM im_members WHERE chat_id=%s AND user_id=%s", (cid, uid), one=True)
-    rk = await get_rank(cid, uid)
-    w = len(await active_warns(cid, uid))
-    if not r:
-        return await reply(msg, f"{mention(uid, name)}: нет данных.")
-    msgs, first, last, prof, un = r
-    prof = prof or {}
-    place = await q("SELECT count(*)+1 FROM im_members WHERE chat_id=%s AND msgs>%s", (cid, msgs), one=True)
-    out = [f"<b>{mention(uid, name)}</b>" + (f" (@{un})" if un else ""), f"ID: <code>{uid}</code>",
-           f"Ранг: <b>{rk}</b>" + ("  ⚠️ варнов: %d" % w if w else "")]
-    for key, label in (("nick", "Ник"), ("title", "Звание"), ("motto", "Девиз"), ("gender", "Пол"), ("city", "Город"), ("bday", "ДР"), ("about", "О себе")):
-        if prof.get(key):
-            out.append(f"{label}: {esc(prof[key])}")
-    out += [f"Сообщений: {msgs} (место #{place[0]})", f"В чате с {first.astimezone(_MSK).strftime('%d.%m.%Y')}", f"Был: {_ago(last)}",
-            "📊 Активность за 30 дней на графике"]
-    vals, dys = await _series(cid, uid)
-    await reply_chart(msg, "\n".join(out), vals, dys, sum(vals))
 
 
 _PROF = {"ник": ("nick", 30), "звание": ("title", 30), "девиз": ("motto", 100), "город": ("city", 40), "о себе": ("about", 800),
@@ -1206,11 +1150,6 @@ async def c_olds(msg, args, rank):
 async def c_news(msg, args, rank):
     rows = await q("SELECT name,first_seen FROM im_members WHERE chat_id=%s ORDER BY first_seen DESC LIMIT 15", (msg.chat.id,), many=True)
     await reply(msg, "<b>Новички</b>\n" + "\n".join(f"{esc(n)} — {t.astimezone(_MSK).strftime('%d.%m.%Y')}" for n, t in rows))
-
-
-@cmd(["моя стата"], "стата")
-async def c_mystat(msg, args, rank):
-    return await c_whoami(msg, [], rank)
 
 
 # ---- базовые РП
@@ -1465,7 +1404,7 @@ def setup(dp, bot, get_db, is_main_admin, skip_chat_ids=()):
     global _bot, _get_db, _is_main_admin, _skip
     _bot, _get_db, _is_main_admin = bot, get_db, is_main_admin
     _skip = set(skip_chat_ids)
-    for modname in ("iris_eco", "iris_fun", "iris_grid"):
+    for modname in ("iris_eco", "iris_fun", "iris_grid", "iris_card"):
         try:
             __import__(modname)   # регистрируют свои команды в CMDS
         except Exception:
