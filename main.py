@@ -87,11 +87,20 @@ router = Router()
 # Инициализация юзербота через Telethon
 userbot: UserClient | None = None
 if USER_SESSION_STRING and TELEGRAM_API_ID and TELEGRAM_API_HASH:
-    userbot = UserClient(
-        StringSession(USER_SESSION_STRING),
-        api_id=TELEGRAM_API_ID,
-        api_hash=TELEGRAM_API_HASH
-    )
+    # чистим пробелы, переносы и случайные кавычки, которые часто попадают при копировании
+    _sess = "".join(str(USER_SESSION_STRING).split()).strip("\"'`")
+    try:
+        userbot = UserClient(
+            StringSession(_sess),
+            api_id=TELEGRAM_API_ID,
+            api_hash=TELEGRAM_API_HASH
+        )
+    except Exception as _e:
+        userbot = None
+        logging.error(
+            "Юзербот отключён: строка USER_SESSION_STRING повреждена (длина %d, нужно 352): %s. "
+            "Скопируйте строку целиком заново.", len(_sess), _e
+        )
 else:
     logging.warning(
         "Юзербот отключён: задайте переменные окружения USER_SESSION_STRING, TELEGRAM_API_ID и TELEGRAM_API_HASH."
