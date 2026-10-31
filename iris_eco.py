@@ -66,7 +66,7 @@ async def _off(msg, flag):
     return bool(cfg.get(flag))
 
 
-@cmd(["баланс", "мои монеты", "кошелёк", "кошелек", "монеты"], "экономика")
+@cmd(["баланс", "мои монеты", "кошелёк", "кошелек"], "экономика")
 async def c_balance(msg, args, rank):
     if await _off(msg, "no_eco"):
         return

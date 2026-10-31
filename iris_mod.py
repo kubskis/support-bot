@@ -31,6 +31,7 @@ _skip = set()
 _enabled_cache = {}          # chat_id -> (bool, ts)
 _join_times = {}             # chat_id -> [ts,...] для антирейда
 router = Router()
+ALIAS_FN = None     # iris_alias.apply: синонимы команд
 DYNAMIC = []        # async fn(msg, first, rank)->bool: динамические команды (свои РП)
 GRID_HOOKS = {}     # rank / join — подключает iris_grid
 STRICT_BANG = {"!кто", "!скажи", "!инфа", "!выбери", "!жребий", "!данет", "!пинг", "!погода", "!ид", "!id"}
@@ -1220,6 +1221,7 @@ async def c_help(msg, args, rank):
         "<b>Клубы:</b> создать клан/кружок, клан вступить, кланы, кружки, клан созвать\n"
         "<b>Прочее:</b> +, -, рейтинг, наградить, награды, +заметка, +закладка, +таймер, карта, +мрп, созвать всех/онлайн/модеров, !инфа, !выбери, !погода, !ид\n"
         "<b>Сетка:</b> создать сетку, установить сетку, чаты, глобан, глоразбан, гломут, +глмодер\n"
+        "Команды можно писать по-разному: «я кто», «ты кто», «забань», «кикни», «замуть», «сколько монет» и т.д.\n"
         "Сроки: 30м, 2ч, 3д, 1н, 1мес, навсегда."))
 
 
@@ -1305,6 +1307,11 @@ async def _on_message(msg: Message):
     if not msg.from_user or msg.from_user.is_bot:
         return
     first = _normalize(msg.text) if msg.text else None
+    if first and ALIAS_FN:
+        try:
+            first = ALIAS_FN(first, msg)
+        except Exception:
+            log.exception("alias")
     low = (first or "").lower()
     if low in ("+надзор", "надзор старт", "надзор вкл"):
         return await _activate(msg)
@@ -1411,7 +1418,7 @@ def setup(dp, bot, get_db, is_main_admin, skip_chat_ids=()):
     global _bot, _get_db, _is_main_admin, _skip
     _bot, _get_db, _is_main_admin = bot, get_db, is_main_admin
     _skip = set(skip_chat_ids)
-    for modname in ("iris_eco", "iris_fun", "iris_grid", "iris_card"):
+    for modname in ("iris_eco", "iris_fun", "iris_grid", "iris_card", "iris_alias"):
         try:
             __import__(modname)   # регистрируют свои команды в CMDS
         except Exception:
