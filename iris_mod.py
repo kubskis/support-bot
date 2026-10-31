@@ -66,6 +66,11 @@ async def q(sql, args=(), one=False, many=False):
 
 async def init_tables():
     await asyncio.to_thread(_q, _DDL)
+    try:
+        import iris_eco
+        await iris_eco.init_tables()
+    except Exception:
+        log.exception("iris_eco init")
 
 
 # ---------------------------------------------------------------- утилиты
@@ -1186,6 +1191,7 @@ async def c_help(msg, args, rank):
         "<b>Чат:</b> +приветствие, +правила, правила, антирейд N, -ссылки/+ссылки, -смс, !пург, кик неактив [дней], кик молчунов, варны лимит N, варны чс срок, +рп/-рп\n"
         "<b>Стата:</b> кто я, топ [сутки|неделя|месяц|вся], чат инфо, кто онлайн, олды, новички, +ник/+звание/+девиз/+город/+о себе/+др/+пол\n"
         "<b>РП:</b> рп список (ответом на сообщение)\n"
+        "<b>Экономика и игры:</b> баланс, ферма, передать N, топ богачей, дуэль [ставка], рулетка, кубы [ставка], брак, мой брак, браки, развод\n"
         "Сроки: 30м, 2ч, 3д, 1н, 1мес, навсегда."))
 
 
@@ -1363,5 +1369,9 @@ def setup(dp, bot, get_db, is_main_admin, skip_chat_ids=()):
     global _bot, _get_db, _is_main_admin, _skip
     _bot, _get_db, _is_main_admin = bot, get_db, is_main_admin
     _skip = set(skip_chat_ids)
+    try:
+        import iris_eco  # noqa: F401  регистрирует экономику, браки, дуэли
+    except Exception:
+        log.exception("iris_eco import")
     dp.message.outer_middleware(IrisMiddleware())
     dp.include_router(router)
