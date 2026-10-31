@@ -31,6 +31,9 @@ _skip = set()
 _enabled_cache = {}          # chat_id -> (bool, ts)
 _join_times = {}             # chat_id -> [ts,...] для антирейда
 router = Router()
+DYNAMIC = []        # async fn(msg, first, rank)->bool: динамические команды (свои РП)
+GRID_HOOKS = {}     # rank / join — подключает iris_grid
+STRICT_BANG = {"!кто", "!скажи", "!инфа", "!выбери", "!жребий", "!данет", "!пинг", "!погода", "!ид", "!id"}
 
 # ---------------------------------------------------------------- БД
 _DDL = """
@@ -66,11 +69,12 @@ async def q(sql, args=(), one=False, many=False):
 
 async def init_tables():
     await asyncio.to_thread(_q, _DDL)
-    try:
-        import iris_eco
-        await iris_eco.init_tables()
-    except Exception:
-        log.exception("iris_eco init")
+    for modname in ("iris_eco", "iris_fun", "iris_grid"):
+        try:
+            mod = __import__(modname)
+            await mod.init_tables()
+        except Exception:
+            log.exception("%s init", modname)
 
 
 # ---------------------------------------------------------------- утилиты
@@ -159,8 +163,16 @@ async def get_rank(chat_id, uid):
     except Exception:
         pass
     r = await q("SELECT rank FROM im_ranks WHERE chat_id=%s AND user_id=%s", (chat_id, uid), one=True)
+    gr = 0
+    if GRID_HOOKS.get("rank"):
+        try:
+            gr = await GRID_HOOKS["rank"](chat_id, uid)
+        except Exception:
+            gr = 0
     if r:
-        return r[0]
+        return max(r[0], gr)
+    if gr:
+        return gr
     try:
         m = await _bot.get_chat_member(chat_id, uid)
         if m.status == "creator":
@@ -1192,6 +1204,9 @@ async def c_help(msg, args, rank):
         "<b>Стата:</b> кто я, топ [сутки|неделя|месяц|вся], чат инфо, кто онлайн, олды, новички, +ник/+звание/+девиз/+город/+о себе/+др/+пол\n"
         "<b>РП:</b> рп список (ответом на сообщение)\n"
         "<b>Экономика и игры:</b> баланс, ферма, передать N, топ богачей, дуэль [ставка], рулетка, кубы [ставка], брак, мой брак, браки, развод\n"
+        "<b>Клубы:</b> создать клан/кружок, клан вступить, кланы, кружки, клан созвать\n"
+        "<b>Прочее:</b> +, -, рейтинг, наградить, награды, +заметка, +закладка, +таймер, карта, +мрп, созвать всех/онлайн/модеров, !инфа, !выбери, !погода, !ид\n"
+        "<b>Сетка:</b> создать сетку, установить сетку, чаты, глобан, глоразбан, гломут, +глмодер\n"
         "Сроки: 30м, 2ч, 3д, 1н, 1мес, навсегда."))
 
 
@@ -1237,6 +1252,8 @@ def _match(first):
         if low == ph or low.startswith(ph + " "):
             return fn, code, first[len(ph):].split()
         # «! бан», «!бан» → бан (восклицательный знак необязателен)
+        if ph in STRICT_BANG:
+            continue
         if ph.startswith("!") and (low == ph[1:] or low.startswith(ph[1:] + " ")):
             return fn, code, first[len(ph) - 1:].split()
         if low.lstrip("!") == ph or low.lstrip("!").startswith(ph + " "):
@@ -1302,6 +1319,12 @@ async def _on_message(msg: Message):
             elif rank > 0 or code in ("дк", "лдк", "сброс"):
                 await reply(msg, "Недостаточно прав для этой команды.")
             return
+        for dyn in DYNAMIC:
+            try:
+                if await dyn(msg, first, rank):
+                    return
+            except Exception:
+                log.exception("dynamic cmd")
     # автомодерация: модераторы (ранг ≥1) не трогаются
     if rank >= 1:
         return
@@ -1338,6 +1361,12 @@ async def _on_join(msg: Message):
         await q("""INSERT INTO im_members(chat_id,user_id,name,username) VALUES(%s,%s,%s,%s)
                    ON CONFLICT(chat_id,user_id) DO UPDATE SET name=EXCLUDED.name,username=EXCLUDED.username,last_seen=now()""",
                 (cid, u.id, u.full_name, (u.username or "").lower()))
+        if GRID_HOOKS.get("join"):
+            try:
+                if await GRID_HOOKS["join"](cid, u.id):
+                    continue
+            except Exception:
+                log.exception("grid join")
         if lim and len(lst) > int(lim):
             try:
                 await do_kick(cid, u.id, _bot.id, "антирейд")
@@ -1369,9 +1398,15 @@ def setup(dp, bot, get_db, is_main_admin, skip_chat_ids=()):
     global _bot, _get_db, _is_main_admin, _skip
     _bot, _get_db, _is_main_admin = bot, get_db, is_main_admin
     _skip = set(skip_chat_ids)
+    for modname in ("iris_eco", "iris_fun", "iris_grid"):
+        try:
+            __import__(modname)   # регистрируют свои команды в CMDS
+        except Exception:
+            log.exception("%s import", modname)
     try:
-        import iris_eco  # noqa: F401  регистрирует экономику, браки, дуэли
+        import iris_fun
+        asyncio.create_task(iris_fun.worker())
     except Exception:
-        log.exception("iris_eco import")
+        log.exception("iris_fun worker")
     dp.message.outer_middleware(IrisMiddleware())
     dp.include_router(router)
