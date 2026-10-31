@@ -16544,8 +16544,8 @@ async def main():
     await _ref_cfg_load()
     try:
         import iris_mod
-        await iris_mod.init_tables()
         iris_mod.setup(dp, bot, get_db, is_main_admin, skip_chat_ids=[ADMIN_CHAT_ID])
+        await iris_mod.init_tables()
         logging.info("Модуль «Надзор» подключён.")
     except Exception as e:
         logging.error(f"Модуль «Надзор» не подключён: {e}")
