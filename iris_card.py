@@ -203,6 +203,12 @@ async def build_card(cid, uid, name):
     L = [f"👤 Это пользователь <b>{mention(uid, shown)}</b>", await _tg_status(cid, uid), ""]
     L.append(f"⭐ [{rk}] Ранг: <b>{RANK_NAMES.get(rk, rk)}</b>")
     L.append(f"🏠 Гражданин этого чата {span(now - first)}")
+    try:
+        vu = await q("SELECT until FROM im_vip WHERE chat_id=%s AND user_id=%s", (cid, uid), one=True)
+        if vu and (vu[0] is None or vu[0] > now):
+            L.append("💎 Имеет особый VIP-статус" + (f" (на {span(vu[0] - now)})" if vu[0] else " (навсегда)"))
+    except Exception:
+        pass
     # экономика, брак, клубы, репутация — каждый блок необязателен
     try:
         mar = await q("SELECT a,b,ts FROM im_marriage WHERE chat_id=%s AND active AND (a=%s OR b=%s)", (cid, uid, uid), one=True)
@@ -227,6 +233,12 @@ async def build_card(cid, uid, name):
         w = await q("SELECT coins FROM im_wallet WHERE chat_id=%s AND user_id=%s", (cid, uid), one=True)
         if w:
             line.append(f"🪙 {_short(w[0])}")
+    except Exception:
+        pass
+    try:
+        gd = await q("SELECT gold FROM im_gold WHERE user_id=%s", (uid,), one=True)
+        if gd and gd[0]:
+            line.append(f"🥇 {_short(gd[0])}")
     except Exception:
         pass
     try:

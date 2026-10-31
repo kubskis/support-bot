@@ -225,7 +225,7 @@ async def c_dice(msg, args, rank):
 
 
 # ---------------------------------------------------------------- дуэли
-@cmd(["дуэль", "золотая дуэль"], "дуэль")
+@cmd(["дуэль"], "дуэль")
 async def c_duel(msg, args, rank):
     if await _off(msg, "no_games"):
         return
