@@ -356,6 +356,12 @@ async def c_divorce(msg, args, rank):
     r = await _spouse(msg.chat.id, msg.from_user.id)
     if not r:
         return await reply(msg, "Вы не в браке.")
+    try:
+        import iris_ext
+        if await iris_ext.divorce_gate(msg, r):
+            return
+    except Exception:
+        log.exception("divorce gate")
     await q("UPDATE im_marriage SET active=FALSE WHERE id=%s", (r[0],))
     await reply(msg, "💔 Брак расторгнут.")
 

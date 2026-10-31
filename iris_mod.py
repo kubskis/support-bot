@@ -31,6 +31,10 @@ _skip = set()
 _enabled_cache = {}          # chat_id -> (bool, ts)
 _join_times = {}             # chat_id -> [ts,...] для антирейда
 router = Router()
+AUTOMOD = []        # async fn(msg, cfg, rank)->bool: автомодерация сообщений (слоумод и др.)
+SERVICE_HOOKS = []  # async fn(msg, cfg): служебные сообщения (вышел, закрепили…)
+JOIN_HOOKS = []     # async fn(cid, user, cfg, msg)->bool: проверки при входе; True = обработан
+SERVICE_TYPES = {"left_chat_member", "new_chat_title", "new_chat_photo", "delete_chat_photo", "pinned_message", "forum_topic_created", "forum_topic_closed", "forum_topic_reopened", "forum_topic_edited", "video_chat_started", "video_chat_ended", "video_chat_scheduled", "message_auto_delete_timer_changed", "migrate_to_chat_id", "migrate_from_chat_id"}
 ALIAS_FN = None     # iris_alias.apply: синонимы команд
 DYNAMIC = []        # async fn(msg, first, rank)->bool: динамические команды (свои РП)
 GRID_HOOKS = {}     # rank / join — подключает iris_grid
@@ -70,7 +74,7 @@ async def q(sql, args=(), one=False, many=False):
 
 async def init_tables():
     await asyncio.to_thread(_q, _DDL)
-    for modname in ("iris_eco", "iris_fun", "iris_grid", "iris_import"):
+    for modname in ("iris_eco", "iris_fun", "iris_grid", "iris_import", "iris_ext", "iris_gold", "iris_misc"):
         try:
             mod = __import__(modname)
             await mod.init_tables()
@@ -1304,6 +1308,15 @@ async def _on_message(msg: Message):
     # приветствие / антирейд на сервисных сообщениях
     if msg.new_chat_members:
         return await _on_join(msg)
+    if getattr(msg, "content_type", None) in SERVICE_TYPES:
+        if await chat_enabled(cid):
+            cfg0 = await get_cfg(cid)
+            for h in SERVICE_HOOKS:
+                try:
+                    await h(msg, cfg0)
+                except Exception:
+                    log.exception("service hook")
+        return
     if not msg.from_user or msg.from_user.is_bot:
         return
     first = _normalize(msg.text) if msg.text else None
@@ -1349,6 +1362,12 @@ async def _on_message(msg: Message):
     if rank >= 1:
         return
     cfg = await get_cfg(cid)
+    for h in AUTOMOD:
+        try:
+            if await h(msg, cfg, rank):
+                return
+        except Exception:
+            log.exception("automod hook")
     events = detect(msg)
     if cfg.get("nolinks") and "links" in events:
         try:
@@ -1387,6 +1406,16 @@ async def _on_join(msg: Message):
                     continue
             except Exception:
                 log.exception("grid join")
+        handled = False
+        for h in JOIN_HOOKS:
+            try:
+                if await h(cid, u, cfg, msg):
+                    handled = True
+                    break
+            except Exception:
+                log.exception("join hook")
+        if handled:
+            continue
         if lim and len(lst) > int(lim):
             try:
                 await do_kick(cid, u.id, _bot.id, "антирейд")
@@ -1418,20 +1447,24 @@ def setup(dp, bot, get_db, is_main_admin, skip_chat_ids=()):
     global _bot, _get_db, _is_main_admin, _skip
     _bot, _get_db, _is_main_admin = bot, get_db, is_main_admin
     _skip = set(skip_chat_ids)
-    for modname in ("iris_eco", "iris_fun", "iris_grid", "iris_card", "iris_alias", "iris_import"):
+    for modname in ("iris_eco", "iris_fun", "iris_grid", "iris_card", "iris_alias", "iris_import", "iris_ext", "iris_gold", "iris_misc"):
         try:
             __import__(modname)   # регистрируют свои команды в CMDS
         except Exception:
             log.exception("%s import", modname)
-    try:
-        import iris_fun
-        asyncio.create_task(iris_fun.worker())
-    except Exception:
-        log.exception("iris_fun worker")
+    for modname in ("iris_fun", "iris_ext", "iris_gold", "iris_misc"):
+        try:
+            mod = __import__(modname)
+            if hasattr(mod, "worker"):
+                asyncio.create_task(mod.worker())
+        except Exception:
+            log.exception("%s worker", modname)
     dp.message.outer_middleware(IrisMiddleware())
-    try:
-        import iris_import
-        iris_import.install(dp)
-    except Exception:
-        log.exception("iris_import install")
+    for modname in ("iris_import", "iris_ext", "iris_gold", "iris_misc"):
+        try:
+            mod = __import__(modname)
+            if hasattr(mod, "install"):
+                mod.install(dp)
+        except Exception:
+            log.exception("%s install", modname)
     dp.include_router(router)
