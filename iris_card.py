@@ -199,7 +199,8 @@ async def build_card(cid, uid, name):
     week = (await q("SELECT coalesce(sum(msgs),0) FROM im_daily WHERE chat_id=%s AND user_id=%s AND day>CURRENT_DATE-7", (cid, uid), one=True))[0]
     month = (await q("SELECT coalesce(sum(msgs),0) FROM im_daily WHERE chat_id=%s AND user_id=%s AND day>CURRENT_DATE-30", (cid, uid), one=True))[0]
     place = (await q("SELECT count(*)+1 FROM im_members WHERE chat_id=%s AND msgs>%s", (cid, msgs), one=True))[0]
-    L = [f"👤 Это пользователь <b>{mention(uid, name)}</b>" + (f" (@{esc(un)})" if un else ""), await _tg_status(cid, uid), ""]
+    shown = prof.get("nick") or name          # как у Ириса: вместо имени показывается ник, без (@юзернейма)
+    L = [f"👤 Это пользователь <b>{mention(uid, shown)}</b>", await _tg_status(cid, uid), ""]
     L.append(f"⭐ [{rk}] Ранг: <b>{RANK_NAMES.get(rk, rk)}</b>")
     L.append(f"🏠 Гражданин этого чата {span(now - first)}")
     # экономика, брак, клубы, репутация — каждый блок необязателен
@@ -238,7 +239,7 @@ async def build_card(cid, uid, name):
     warns = len(await m.active_warns(cid, uid))
     if warns:
         L.append(f"⚠️ Варны: {warns}")
-    for key, ico, lab in (("nick", "🏷", "Ник"), ("title", "🎖", "Звание"), ("motto", "💬", "Девиз"),
+    for key, ico, lab in (("title", "🎖", "Звание"), ("motto", "💬", "Девиз"),
                           ("gender", "👫", "Пол"), ("city", "📍", "Город"), ("bday", "🎂", "День рождения")):
         if prof.get(key):
             L.append(f"{ico} {lab}: {esc(prof[key])}")
