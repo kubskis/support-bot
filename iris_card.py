@@ -238,7 +238,8 @@ async def build_card(cid, uid, name):
     warns = len(await m.active_warns(cid, uid))
     if warns:
         L.append(f"⚠️ Варны: {warns}")
-    for key, ico, lab in (("nick", "🏷", "Ник"), ("title", "🎖", "Звание"), ("motto", "💬", "Девиз")):
+    for key, ico, lab in (("nick", "🏷", "Ник"), ("title", "🎖", "Звание"), ("motto", "💬", "Девиз"),
+                          ("gender", "👫", "Пол"), ("city", "📍", "Город"), ("bday", "🎂", "День рождения")):
         if prof.get(key):
             L.append(f"{ico} {lab}: {esc(prof[key])}")
     L += ["", f"📈 Место по активности: #{place}",

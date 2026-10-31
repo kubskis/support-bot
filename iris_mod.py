@@ -1072,28 +1072,35 @@ _PROF = {"ник": ("nick", 30), "звание": ("title", 30), "девиз": ("
 
 
 async def _prof_set(msg, key, val):
-    r = await q("SELECT profile FROM im_members WHERE chat_id=%s AND user_id=%s", (msg.chat.id, msg.from_user.id), one=True)
-    prof = (r[0] if r else {}) or {}
+    """Атомарно: создаёт строку участника при необходимости и меняет одно поле анкеты."""
+    cid, uid = msg.chat.id, msg.from_user.id
     if val:
-        prof[key] = val
+        await q("""INSERT INTO im_members(chat_id,user_id,name,username,profile) VALUES(%s,%s,%s,%s,jsonb_build_object(%s::text,%s::text))
+                   ON CONFLICT(chat_id,user_id) DO UPDATE
+                   SET profile=coalesce(im_members.profile,'{}'::jsonb) || jsonb_build_object(%s::text,%s::text)""",
+                (cid, uid, msg.from_user.full_name, (msg.from_user.username or "").lower(), key, val, key, val))
     else:
-        prof.pop(key, None)
-    await q("UPDATE im_members SET profile=%s WHERE chat_id=%s AND user_id=%s", (json.dumps(prof), msg.chat.id, msg.from_user.id))
+        await q("UPDATE im_members SET profile=coalesce(profile,'{}'::jsonb) - %s::text WHERE chat_id=%s AND user_id=%s", (key, cid, uid))
+    chk = await q("SELECT profile->>%s::text FROM im_members WHERE chat_id=%s AND user_id=%s", (key, cid, uid), one=True)
+    return chk[0] if chk else None
 
 
 def _mk_prof(label, key, limit):
     @cmd([f"+{label}", f"+{label} "], "анкета")
-    async def _h(msg, args, rank, key=key, limit=limit):
+    async def _h(msg, args, rank, key=key, limit=limit, label=label):
         val = " ".join(args)[:limit]
         if not val:
             return await reply(msg, f"Пример: <code>+{label} …</code>")
-        await _prof_set(msg, key, val)
-        await reply(msg, "Сохранено ✅")
+        saved = await _prof_set(msg, key, val)
+        if saved == val:
+            await reply(msg, f"Сохранено ✅ {label}: <b>{esc(val)}</b>")
+        else:
+            await reply(msg, "⚠️ Не удалось сохранить, попробуйте ещё раз.")
 
     @cmd([f"-{label}"], "анкета")
-    async def _d(msg, args, rank, key=key):
+    async def _d(msg, args, rank, key=key, label=label):
         await _prof_set(msg, key, "")
-        await reply(msg, "Удалено.")
+        await reply(msg, f"Удалено: {label}.")
 
 
 for _l, (_k, _lim) in _PROF.items():
