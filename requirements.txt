@@ -2,3 +2,4 @@ aiogram>=3.13,<4
 aiohttp>=3.9
 psycopg2-binary>=2.9
 telethon>=1.44
+pillow>=10.1

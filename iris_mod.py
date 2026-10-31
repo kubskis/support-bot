@@ -948,6 +948,66 @@ async def cb_vote(cb: CallbackQuery):
 # ---- статистика / анкета
 _MSK = timezone(timedelta(hours=3))
 
+# ---------------------------------------------------------------- графики активности (Pillow)
+def make_chart(values, days, title_num=None):
+    """Столбчатый график активности (тёмная карточка). Только цифры — шрифт по умолчанию без кириллицы."""
+    from io import BytesIO
+    from PIL import Image, ImageDraw, ImageFont
+    W, H, pad = 900, 420, 40
+    img = Image.new("RGB", (W, H), (24, 28, 38))
+    d = ImageDraw.Draw(img)
+    try:
+        f = ImageFont.load_default(size=18)
+        fb = ImageFont.load_default(size=44)
+    except TypeError:
+        f = fb = ImageFont.load_default()
+    mx = max(values) if values and max(values) > 0 else 1
+    total = sum(values)
+    d.text((pad, 22), str(title_num if title_num is not None else total), fill=(255, 255, 255), font=fb)
+    top, bot = 100, H - 52
+    n = len(values)
+    gap = 4
+    L = 80
+    bw = (W - L - pad - gap * (n - 1)) / n
+    for g in range(1, 4):
+        y = bot - (bot - top) * g / 3
+        d.line([(L, y), (W - pad, y)], fill=(44, 50, 64), width=1)
+        d.text((10, y - 11), str(int(mx * g / 3)), fill=(110, 120, 140), font=f)
+    for i, v in enumerate(values):
+        x0 = L + i * (bw + gap)
+        h = (bot - top) * v / mx
+        col = (82, 156, 255) if v else (44, 50, 64)
+        d.rounded_rectangle([x0, bot - max(h, 3), x0 + bw, bot], radius=3, fill=col)
+        if i % 5 == 0 or i == n - 1:
+            d.text((x0 - 2, bot + 10), days[i], fill=(140, 150, 170), font=f)
+    buf = BytesIO()
+    img.save(buf, "PNG")
+    return buf.getvalue()
+
+
+async def _series(chat_id, uid=None, days=30):
+    if uid:
+        rows = await q("SELECT day,msgs FROM im_daily WHERE chat_id=%s AND user_id=%s AND day>CURRENT_DATE-%s", (chat_id, uid, days), many=True)
+    else:
+        rows = await q("SELECT day,sum(msgs) FROM im_daily WHERE chat_id=%s AND day>CURRENT_DATE-%s GROUP BY day", (chat_id, days), many=True)
+    m = {r[0]: int(r[1]) for r in rows}
+    today = datetime.now(_MSK).date()
+    ds = [today - timedelta(days=days - 1 - i) for i in range(days)]
+    return [m.get(x, 0) for x in ds], [x.strftime("%d") for x in ds]
+
+
+async def reply_chart(msg, text, vals, days, num=None):
+    from aiogram.types import BufferedInputFile
+    try:
+        png = await asyncio.to_thread(make_chart, vals, days, num)
+        if len(text) <= 1000:
+            return await msg.reply_photo(BufferedInputFile(png, "activity.png"), caption=text, parse_mode="HTML")
+        await msg.reply_photo(BufferedInputFile(png, "activity.png"))
+    except Exception:
+        log.exception("chart")
+    return await reply(msg, text)
+
+
 
 def _ago(ts):
     s = int((datetime.now(timezone.utc) - ts).total_seconds())
@@ -973,8 +1033,10 @@ async def c_whoami(msg, args, rank):
     for key, label in (("nick", "Ник"), ("title", "Звание"), ("motto", "Девиз"), ("gender", "Пол"), ("city", "Город"), ("bday", "ДР"), ("about", "О себе")):
         if prof.get(key):
             out.append(f"{label}: {esc(prof[key])}")
-    out += [f"Сообщений: {msgs} (место #{place[0]})", f"В чате с {first.astimezone(_MSK).strftime('%d.%m.%Y')}", f"Был: {_ago(last)}"]
-    await reply(msg, "\n".join(out))
+    out += [f"Сообщений: {msgs} (место #{place[0]})", f"В чате с {first.astimezone(_MSK).strftime('%d.%m.%Y')}", f"Был: {_ago(last)}",
+            "📊 Активность за 30 дней на графике"]
+    vals, dys = await _series(cid, uid)
+    await reply_chart(msg, "\n".join(out), vals, dys, sum(vals))
 
 
 _PROF = {"ник": ("nick", 30), "звание": ("title", 30), "девиз": ("motto", 100), "город": ("city", 40), "о себе": ("about", 800),
@@ -1039,8 +1101,9 @@ async def c_chatinfo(msg, args, rank):
         cnt = await _bot.get_chat_member_count(cid)
     except Exception:
         cnt = "?"
-    await reply(msg, f"<b>{esc(msg.chat.title)}</b>\nУчастников: {cnt} (в базе {tot[0]})\nСообщений всего: {tot[1]}\n"
-                     f"Сегодня: {today[0]} от {today[1]} чел.\nЗа неделю: {week[0]}")
+    vals, dys = await _series(cid)
+    await reply_chart(msg, f"<b>{esc(msg.chat.title)}</b>\nУчастников: {cnt} (в базе {tot[0]})\nСообщений всего: {tot[1]}\n"
+                           f"Сегодня: {today[0]} от {today[1]} чел.\nЗа неделю: {week[0]}\n📊 Сообщения за 30 дней на графике", vals, dys, sum(vals))
 
 
 @cmd(["кто онлайн", "онлайн"], "онлайн")
