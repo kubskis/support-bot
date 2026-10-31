@@ -77,6 +77,66 @@ async def init_tables():
             log.exception("%s init", modname)
 
 
+# ---------------------------------------------------------------- понятные ошибки
+_ERR_RULES = [
+    ("can't remove chat owner", "Это создатель чата — его нельзя заблокировать или ограничить."),
+    ("can't restrict self", "Бот не может ограничить сам себя."),
+    ("user is an administrator of the chat", "Пользователь — администратор чата, его нельзя заблокировать/ограничить. Сначала снимите с него админство в Telegram."),
+    ("not enough rights to restrict", "Нельзя ограничить этого участника: либо у бота нет права «Блокировка пользователей», либо цель — администратор чата. Проверьте права бота и статус цели."),
+    ("not enough rights to kick", "У бота нет права блокировать участников, либо цель — администратор чата."),
+    ("not enough rights to delete", "У бота нет права удалять сообщения. Включите «Удаление сообщений» в правах администратора."),
+    ("not enough rights", "У бота не хватает прав администратора. Выдайте право на нужное действие (блокировка, удаление сообщений, закрепление)."),
+    ("chat_admin_required", "Боту нужны права администратора в этом чате."),
+    ("need administrator rights", "Боту нужны права администратора в этом чате."),
+    ("rights_forbidden", "Telegram запретил действие: у бота недостаточно прав в этом чате."),
+    ("right_forbidden", "Telegram запретил действие: у бота недостаточно прав в этом чате."),
+    ("participant_id_invalid", "Этот пользователь не найден в чате."),
+    ("user_not_participant", "Этого пользователя нет в чате."),
+    ("user not found", "Пользователь не найден. Укажите его ответом на сообщение, @ником или числовым id."),
+    ("user_id_invalid", "Некорректный id пользователя."),
+    ("peer_id_invalid", "Telegram не знает такого пользователя или чата (он ещё не писал боту)."),
+    ("member not found", "Участник не найден в этом чате."),
+    ("message to delete not found", "Сообщение уже удалено."),
+    ("message can't be deleted", "Это сообщение нельзя удалить (слишком старое — старше 48 часов — или у бота нет прав)."),
+    ("message to edit not found", "Сообщение для изменения не найдено."),
+    ("message is not modified", "Изменений нет — всё уже так и стоит."),
+    ("message to reply not found", "Сообщение, на которое нужно ответить, не найдено."),
+    ("reply message not found", "Сообщение, на которое нужно ответить, не найдено."),
+    ("bot was kicked", "Бота исключили из чата."),
+    ("bot is not a member", "Бота нет в этом чате."),
+    ("chat not found", "Чат не найден: бот не состоит в нём или код неверный."),
+    ("chat_write_forbidden", "В этом чате боту запрещено писать сообщения."),
+    ("have no rights to send", "В этом чате боту запрещено писать сообщения."),
+    ("not enough rights to send", "В этом чате боту запрещено писать сообщения."),
+    ("method is available for supergroup", "Эта функция доступна только в супергруппах. Преобразуйте группу в супергруппу (включите историю чата или темы)."),
+    ("only supergroups", "Эта функция доступна только в супергруппах."),
+    ("can't initiate conversation", "Бот не может первым написать этому пользователю: пусть сначала запустит бота."),
+    ("bot was blocked by the user", "Пользователь заблокировал бота."),
+    ("user is deactivated", "Аккаунт пользователя удалён."),
+    ("too many requests", "Слишком много запросов к Telegram. Подождите немного и повторите."),
+    ("timed out", "Telegram не ответил вовремя. Повторите команду."),
+    ("network", "Сетевая ошибка при обращении к Telegram. Повторите позже."),
+]
+
+
+def human_error(e) -> str:
+    """Telegram/БД-ошибка → понятное сообщение для чата."""
+    raw = str(e)
+    low = raw.lower()
+    for key, text in _ERR_RULES:
+        if key in low:
+            extra = ""
+            mm = re.search(r"retry after (\d+)", low)
+            if key == "too many requests" and mm:
+                extra = f" Повторите через {mm.group(1)} с."
+            return f"⚠️ <b>Ошибка Телеграм:</b>\n\n💬 {text}{extra}"
+    if any(k in low for k in ("psycopg2", "connection", "database", "relation ")):
+        return "⚠️ <b>Ошибка базы данных:</b>\n\n💬 Не удалось сохранить или получить данные. Повторите позже; если не проходит — сообщите администратору бота."
+    log.warning("необработанная ошибка: %s", raw)
+    short = esc(raw.replace("Telegram server says - ", "")[:160])
+    return f"⚠️ <b>Ошибка:</b>\n\n💬 Команда не выполнена. Причина: {short}"
+
+
 # ---------------------------------------------------------------- утилиты
 def esc(s):
     return html.escape(str(s or ""))
@@ -441,6 +501,13 @@ async def _target_check(msg, my_rank, uid):
     if uid == _bot.id:
         await reply(msg, "Себя я наказывать не буду.")
         return False
+    try:
+        tm = await _bot.get_chat_member(msg.chat.id, uid)
+        if tm.status == "creator":
+            await reply(msg, "⚠️ <b>Нельзя:</b>\n\n💬 Это создатель чата — его нельзя наказать.")
+            return False
+    except Exception:
+        pass
     tr = await get_rank(msg.chat.id, uid)
     if tr >= my_rank and tr > 0:
         await reply(msg, "Нельзя наказать участника с равным или более высоким рангом.")
@@ -886,7 +953,7 @@ async def c_delmsg(msg, args, rank):
             await msg.reply_to_message.delete()
             await msg.delete()
         except Exception as e:
-            await reply(msg, f"Не получилось: {esc(e)}")
+            await reply(msg, human_error(e))
 
 
 @cmd(["!пург", "пург"], "пург")
@@ -955,7 +1022,7 @@ async def cb_vote(cb: CallbackQuery):
             await do_ban(chat_id, target, 0, "по итогам голосования", _bot.id)
             await cb.message.edit_text(f"🔨 {mention(target, await member_name(chat_id, target))} забанен по голосованию ({len(voters)}/{need}).", parse_mode="HTML")
         except Exception as e:
-            await cb.message.edit_text(f"Не удалось забанить: {esc(e)}")
+            await cb.message.edit_text(human_error(e), parse_mode="HTML")
     else:
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"👍 За бан ({len(voters)}/{need})", callback_data="imgb:y")]])
         await cb.message.edit_reply_markup(reply_markup=kb)
@@ -1313,7 +1380,7 @@ async def _on_message(msg: Message):
                 except Exception as e:
                     log.exception("cmd %s", code)
                     try:
-                        await reply(msg, f"Ошибка: {esc(str(e)[:200])}")
+                        await reply(msg, human_error(e))
                     except Exception:
                         pass
             elif rank > 0 or code in ("дк", "лдк", "сброс"):

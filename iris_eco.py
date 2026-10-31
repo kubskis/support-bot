@@ -166,7 +166,7 @@ async def _penalty(cid, uid, kind_cfg, by):
             await m.do_ban(cid, uid, s, "игра", by)
             return f" 🔨 бан на {fmt_dur(s)}"
     except Exception as e:
-        return f" (не удалось наказать: {esc(str(e)[:80])})"
+        return " (⚠️ наказание не применено: " + m.human_error(e).split("💬 ", 1)[-1] + ")"
     return ""
 
 
