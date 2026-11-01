@@ -16556,8 +16556,20 @@ async def main():
         iris_mod.setup(dp, bot, get_db, is_main_admin, skip_chat_ids=[ADMIN_CHAT_ID])
         await iris_mod.init_tables()
         logging.info("Модуль «Надзор» подключён.")
+        try:
+            _st = iris_mod.STATUS
+            _txt = (f"🛡 <b>Надзор запущен</b>, версия <code>{iris_mod.VERSION}</code>\nМодулей: {len(_st['ok'])}, БД: {html.escape(str(_st['db']))}")
+            if _st["fail"]:
+                _txt += "\n❌ Ошибки: " + "; ".join(f"{k}: {html.escape(str(v))[:100]}" for k, v in _st["fail"].items())
+            await bot.send_message(ADMIN_CHAT_ID, _txt, parse_mode="HTML")
+        except Exception as _e:
+            logging.warning(f"Не удалось отправить статус Надзора: {_e}")
     except Exception as e:
         logging.error(f"Модуль «Надзор» не подключён: {e}")
+        try:
+            await bot.send_message(ADMIN_CHAT_ID, f"❌ <b>Надзор не подключён:</b> {html.escape(str(e))[:300]}", parse_mode="HTML")
+        except Exception:
+            pass
     await web_server()
     await setup_bot_commands(bot)
     await load_emoji_pack_setting()

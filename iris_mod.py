@@ -29,6 +29,8 @@ _get_db = None
 _is_main_admin = None
 _skip = set()
 _enabled_cache = {}          # chat_id -> (bool, ts)
+VERSION = "2026-11-01-D"
+STATUS = {"ok": [], "fail": {}, "db": None}
 _not_creator = {}            # (chat,uid) -> ts: не создатель (кэш, чтобы не дёргать API на каждое сообщение)
 _join_times = {}             # chat_id -> [ts,...] для антирейда
 router = Router()
@@ -74,12 +76,19 @@ async def q(sql, args=(), one=False, many=False):
 
 
 async def init_tables():
-    await asyncio.to_thread(_q, _DDL)
+    try:
+        await asyncio.to_thread(_q, _DDL)
+        STATUS["db"] = "ok"
+    except Exception as e:
+        STATUS["db"] = f"ОШИБКА: {e}"
+        log.exception("im DDL")
+        raise
     for modname in ("iris_eco", "iris_fun", "iris_grid", "iris_import", "iris_ext", "iris_gold", "iris_misc", "iris_full"):
         try:
             mod = __import__(modname)
             await mod.init_tables()
-        except Exception:
+        except Exception as e:
+            STATUS["fail"][modname] = f"init: {e}"
             log.exception("%s init", modname)
 
 
@@ -1282,7 +1291,7 @@ SLASH_ALIASES = {
     "warns": "варны", "warnlist": "варнлист", "banlist": "банлист", "mutes": "муты", "reason": "причина", "amnesty": "!амнистия",
     "rules": "правила", "top": "топ", "me": "кто я", "who": "кто я", "whoami": "кто я", "profile": "кто я",
     "moder": "+модер", "unmoder": "снять", "admins": "кто админ", "dk": "дк", "ldk": "лдк", "purge": "!пург", "rp": "рп список",
-    "nadzor": "надзор", "help": "надзор", "on": "+надзор", "off": "-надзор", "nadzor_on": "+надзор", "nadzor_off": "-надзор",
+    "nadzor": "надзор", "nadzor_status": "надзор статус", "status": "надзор статус", "help": "надзор", "on": "+надзор", "off": "-надзор", "nadzor_on": "+надзор", "nadzor_off": "-надзор",
     "stats": "чат инфо", "chatinfo": "чат инфо", "online": "кто онлайн", "olds": "олды", "newbies": "новички",
     "balance": "баланс", "bal": "баланс", "farm": "ферма", "give": "передать", "rich": "топ богачей", "duel": "дуэль",
     "roulette": "!рулетка", "dice": "кубы", "marry": "брак", "marriage": "мой брак", "marriages": "браки", "divorce": "!развод",
@@ -1364,6 +1373,36 @@ async def _deactivate(msg: Message):
     await reply(msg, "Надзор выключен.")
 
 
+async def status_text(msg: Message) -> str:
+    cid = msg.chat.id
+    lines = [f"<b>Надзор — диагностика</b>", f"Версия: <code>{VERSION}</code>",
+             f"Модулей загружено: {len(STATUS['ok'])}" + (f"; <b>с ошибками: {len(STATUS['fail'])}</b>" if STATUS["fail"] else "")]
+    for k, v in STATUS["fail"].items():
+        lines.append(f"❌ {k}: {esc(str(v))[:160]}")
+    lines.append(f"БД (таблицы Надзора): {esc(str(STATUS['db']))}")
+    lines.append(f"Команд в таблице: {sum(len(c[0]) for c in CMDS)}")
+    if cid in _skip:
+        lines.append("⚠️ <b>Это админ-группа бота: здесь Надзор намеренно отключён.</b> Проверяйте в обычной группе.")
+    else:
+        try:
+            en = await chat_enabled(cid)
+        except Exception as e:
+            en = f"ошибка БД: {e}"
+        lines.append(f"Надзор в этом чате: {'включён' if en is True else ('<b>выключен — напишите +надзор или /on</b>' if en is False else esc(str(en)))}")
+    try:
+        me = await _bot.get_me()
+        bm = await _bot.get_chat_member(cid, _bot.id)
+        lines.append(f"Бот в чате: {bm.status}" + ("" if bm.status == "administrator" else " — <b>нужен администратор</b>"))
+        lines.append(f"Читает все сообщения группы (приватность выкл.): {'да' if me.can_read_all_group_messages else 'нет — без админки видит только /команды'}")
+        if bm.status == "administrator":
+            miss = [n for n, a in (("блокировка", "can_restrict_members"), ("удаление", "can_delete_messages"), ("закреп", "can_pin_messages")) if not getattr(bm, a, False)]
+            if miss:
+                lines.append("Не хватает прав: " + ", ".join(miss))
+    except Exception as e:
+        lines.append(f"Права бота не удалось проверить: {esc(str(e))[:120]}")
+    return "\n".join(lines)
+
+
 async def _on_message(msg: Message):
     cid = msg.chat.id
     # приветствие / антирейд на сервисных сообщениях
@@ -1387,6 +1426,8 @@ async def _on_message(msg: Message):
         except Exception:
             log.exception("alias")
     low = (first or "").lower()
+    if low in ("надзор статус", "надзор диагностика"):
+        return await reply(msg, await status_text(msg))
     if low in ("+надзор", "надзор старт", "надзор вкл") or (low == "надзор" and not await chat_enabled(cid)):
         return await _activate(msg)
     if not await chat_enabled(cid):
@@ -1499,8 +1540,11 @@ class IrisMiddleware(BaseMiddleware):
 
     async def __call__(self, handler, event, data):
         try:
-            if isinstance(event, Message) and event.chat.type in ("group", "supergroup") and event.chat.id not in _skip:
-                await _on_message(event)
+            if isinstance(event, Message) and event.chat.type in ("group", "supergroup"):
+                if event.chat.id not in _skip:
+                    await _on_message(event)
+                elif (event.text or "").lower().startswith(("/nadzor_status", "/status")):
+                    await reply(event, await status_text(event))
         except Exception:
             log.exception("iris middleware")
         return await handler(event, data)
@@ -1513,7 +1557,9 @@ def setup(dp, bot, get_db, is_main_admin, skip_chat_ids=()):
     for modname in ("iris_eco", "iris_fun", "iris_grid", "iris_card", "iris_alias", "iris_import", "iris_ext", "iris_gold", "iris_misc", "iris_full"):
         try:
             __import__(modname)   # регистрируют свои команды в CMDS
-        except Exception:
+            STATUS["ok"].append(modname)
+        except Exception as e:
+            STATUS["fail"][modname] = f"import: {e}"
             log.exception("%s import", modname)
     for modname in ("iris_fun", "iris_ext", "iris_gold", "iris_misc", "iris_full"):
         try:
