@@ -2043,6 +2043,9 @@ async def setup_bot_commands(bot: Bot):
             BotCommand(command="topic_id", description="🔍 Узнать реальный ID текущей темы"),
             BotCommand(command="mystats", description="📊 Моя статистика агента"),
             BotCommand(command="secstats", description="🔮 Моя статистика публикатора"),
+            BotCommand(command="norm", description="📋 Мой норматив по секреткам"),
+            BotCommand(command="normtop", description="📊 Норматив: таблица стаффа"),
+            BotCommand(command="otgul", description="🏖 Отгул от норматива"),
             BotCommand(command="supptop", description="🏆 Топ агентов поддержки (Гл. Админ)"),
             BotCommand(command="sectop", description="🏆 Топ искателей за всё время (Гл. Админ)"),
             BotCommand(command="opentickets", description="📋 Неразобранные тикеты (Гл. Админ)"),
@@ -14581,6 +14584,9 @@ _CMD_REGISTRY = [
         ("/topic_id", "узнать ID текущей темы (любой участник)"),
         ("/mystats", "моя статистика агента (хелпер/гл. админ)"),
         ("/secstats", "моя статистика публикатора (публикатор/гл. админ)"),
+        ("/norm", "мой норматив по секреткам: норма дня, предупреждения"),
+        ("/normtop", "таблица норматива всего стаффа"),
+        ("/otgul", "заявка на отгул от норматива (болезнь, нет випки, поездка)"),
         ("/givetik №", "передать тикет другому хелперу"),
         ("/note текст", "заметка игроку (Reply на тикет/сообщение)"),
         ("/ban [ID|@ник] [причина]", "бан игрока (или Reply на тикет)"),
@@ -14591,6 +14597,7 @@ _CMD_REGISTRY = [
         ("/worktickets", "тикеты в работе"),
         ("/supptop", "топ агентов поддержки"),
         ("/sectop", "топ искателей за всё время"),
+        ("/normadmin", "настройка норматива: on/off, percent, warn, excuse, run"),
         ("/deletenote", "удалить заметку игрока (Reply)"),
         ("/news текст", "рассылка всем пользователям (или Reply на пост/медиа)"),
     ]),
@@ -16570,6 +16577,13 @@ async def main():
             await bot.send_message(ADMIN_CHAT_ID, f"❌ <b>Надзор не подключён:</b> {html.escape(str(e))[:300]}", parse_mode="HTML")
         except Exception:
             pass
+    try:
+        import norm_mod
+        norm_mod.setup(dp, bot, get_db, is_main_admin, is_secret_publisher, _mention_html, ADMIN_CHAT_ID, TOPIC_SECRETS_ID)
+        await norm_mod.init_tables()
+        logging.info("Модуль норматива секреток подключён.")
+    except Exception as e:
+        logging.error(f"Модуль норматива не подключён: {e}")
     await web_server()
     await setup_bot_commands(bot)
     await load_emoji_pack_setting()
@@ -16588,6 +16602,11 @@ async def main():
             
     spawn(_supervised(reminder_worker))
     spawn(_supervised(daily_summary_worker))
+    try:
+        import norm_mod
+        spawn(_supervised(norm_mod.norm_worker))
+    except Exception as e:
+        logging.error(f"Воркер норматива не запущен: {e}")
     spawn(_supervised(secret_timer_worker))
     spawn(_supervised(mutator_timer_worker))
     spawn(_supervised(prelink_expiry_worker))
