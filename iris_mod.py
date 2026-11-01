@@ -1550,8 +1550,28 @@ class IrisMiddleware(BaseMiddleware):
         return await handler(event, data)
 
 
+def _ensure_pillow():
+    """Хост может не ставить Pillow из requirements.txt — ставим сами, иначе не будет графиков «кто я»."""
+    try:
+        import PIL  # noqa: F401
+        return
+    except ImportError:
+        pass
+    import subprocess
+    import sys
+    for extra in ([], ["--break-system-packages"]):
+        try:
+            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "pillow>=10.1", *extra],
+                           check=True, timeout=240, capture_output=True)
+            log.info("Pillow установлен автоматически")
+            return
+        except Exception as e:
+            log.warning("автоустановка Pillow не удалась (%s)", e)
+
+
 def setup(dp, bot, get_db, is_main_admin, skip_chat_ids=()):
     global _bot, _get_db, _is_main_admin, _skip
+    _ensure_pillow()
     _bot, _get_db, _is_main_admin = bot, get_db, is_main_admin
     _skip = set(skip_chat_ids)
     for modname in ("iris_eco", "iris_fun", "iris_grid", "iris_card", "iris_alias", "iris_import", "iris_ext", "iris_gold", "iris_misc", "iris_full"):
