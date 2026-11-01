@@ -314,6 +314,30 @@ async def _remind(kind):
         log.warning("напоминание: %s", e)
 
 
+async def _remind_dm(hours_left):
+    """Личное предупреждение тем, у кого 0 секреток, пока ещё можно успеть (предупреждение выдаётся, только если общая норма не выполнена)."""
+    d = today_msk()
+    if d < await _start():
+        return
+    pool = await eligible_on(d)
+    finds = await finds_on(d)
+    total = sum(finds.values())
+    req = required_for(len(pool), int(await cfg("percent")))
+    if total >= req:
+        return
+    end = (await window())[1]
+    icon = "🚨" if hours_left <= 1 else "⏰"
+    word = "остался 1 час" if hours_left <= 1 else f"осталось {hours_left} ч."
+    for u in [u for u in pool if finds.get(u, 0) == 0]:
+        try:
+            await _bot.send_message(
+                u, f"{icon} <b>Норматив: у вас сегодня 0 секреток.</b>\nДо закрытия приёма ({end:02d}:00 МСК) {word}\n"
+                   f"Общая норма дня пока не выполнена ({total}/{req}), без секретки получите предупреждение.\n"
+                   f"Если вы болеете или уезжаете — оформите отгул: /otgul", parse_mode="HTML")
+        except Exception as e:
+            log.info("лс-напоминание %s не доставлено: %s", u, e)
+
+
 async def norm_worker():
     log.info("Воркер норматива запущен")
     await init_tables()
@@ -327,6 +351,10 @@ async def norm_worker():
                     await _remind("morning")
                 if wb - 3 <= now.hour < wb and await flag_once(f"evening:{now.date()}"):
                     await _remind("evening")
+                if wb - 3 <= now.hour < wb - 1 and await flag_once(f"dm3:{now.date()}"):
+                    await _remind_dm(wb - now.hour)
+                if now.hour == wb - 1 and await flag_once(f"dm1:{now.date()}"):
+                    await _remind_dm(1)
         except Exception:
             log.exception("norm worker")
         await asyncio.sleep(60)
