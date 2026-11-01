@@ -109,10 +109,10 @@ async def window_label() -> str:
 
 
 async def last_closed_day() -> date:
-    """Последний полностью закрытый день: сегодня — после конца окна (+5 минут), иначе вчера."""
+    """Последний полностью закрытый день: сегодня — после конца окна (+1 минута), иначе вчера."""
     a, b = await window()
     now = datetime.now(MSK)
-    return now.date() if now.hour * 60 + now.minute >= b * 60 + 5 else now.date() - timedelta(days=1)
+    return now.date() if now.hour * 60 + now.minute >= b * 60 + 1 else now.date() - timedelta(days=1)
 
 
 def _fmt(d: date) -> str:
@@ -307,11 +307,14 @@ async def _remind(kind):
         txt = (f"🌅 <b>Новый день, норматив {_fmt(d)}</b>\nСекретки засчитываются с {await window_label()}.\n"
                f"Искателей в учёте: {len(pool)} · общая норма: <b>{req}</b> секр.\nКаждому — 1 секретка. Статус: /norm, таблица: /normtop")
     else:
-        if total >= req:
-            return
         lag = [u for u in pool if finds.get(u, 0) == 0]
-        txt = (f"⏰ <b>Норма дня не выполнена:</b> {total}/{req}. Приём секреток закрывается в {(await window())[1]:02d}:00 МСК.\n"
-               + ("Ещё не нашли: " + ", ".join([await _mention(u) for u in lag]) if lag else ""))
+        end = (await window())[1]
+        if total >= req:
+            txt = (f"⏰ <b>Норматив: осталось 3 часа</b> (приём до {end:02d}:00 МСК).\nОбщая норма уже выполнена: {total}/{req} ✅\n"
+                   + ("Без секреток пока: " + ", ".join([await _mention(u) for u in lag]) if lag else "Все искатели уже с секретками."))
+        else:
+            txt = (f"⏰ <b>Норматив: осталось 3 часа.</b> Общая норма не выполнена: {total}/{req}. Приём секреток закрывается в {end:02d}:00 МСК.\n"
+                   + ("Ещё не нашли: " + ", ".join([await _mention(u) for u in lag]) if lag else ""))
     try:
         await _bot.send_message(_admin_chat, txt, parse_mode="HTML", message_thread_id=_topic)
     except Exception as e:
@@ -475,21 +478,36 @@ def _kb(rows):
 async def cmd_otgul(message: Message):
     if not await _allowed(message.from_user.id):
         return
-    await message.answer("Причина отгула от норматива:", reply_markup=_kb([[InlineKeyboardButton(text=t, callback_data=f"nrm:r:{k}")] for k, t in REASONS.items()]))
+    uid = message.from_user.id
+    await message.reply(f"{html.escape(message.from_user.full_name)}, причина отгула от норматива:\n<i>Кнопки доступны только вам.</i>", parse_mode="HTML",
+                        reply_markup=_kb([[InlineKeyboardButton(text=t, callback_data=f"nrm:r:{k}:{uid}")] for k, t in REASONS.items()]))
 
 
-@router.callback_query(F.data.startswith("nrm:r:"))
+def _not_owner(cb: CallbackQuery, owner: int) -> bool:
+    return cb.from_user.id != owner
+
+
+@router.callback_query(F.data.regexp(r"^nrm:r:\w+:\d+$"))
 async def cb_reason(cb: CallbackQuery):
-    kind = cb.data.split(":")[2]
+    _, _, kind, owner = cb.data.split(":")
+    if _not_owner(cb, int(owner)):
+        return await cb.answer("Это заявка другого человека — вызовите /otgul сами.", show_alert=True)
     opts = [1, 2, 3, 5, 7] + ([] if kind == "vip" else [10, 14])
-    rows = [[InlineKeyboardButton(text=f"{n} дн.", callback_data=f"nrm:d:{kind}:{n}") for n in opts[i:i + 4]] for i in range(0, len(opts), 4)]
+    rows = [[InlineKeyboardButton(text=f"{n} дн.", callback_data=f"nrm:d:{kind}:{n}:{owner}") for n in opts[i:i + 4]] for i in range(0, len(opts), 4)]
     await cb.message.edit_text(f"{REASONS.get(kind, '')}\nНа сколько дней?", reply_markup=_kb(rows))
     await cb.answer()
 
 
-@router.callback_query(F.data.startswith("nrm:d:"))
+@router.callback_query(F.data.regexp(r"^nrm:r:\w+$|^nrm:d:\w+:\d+$"))
+async def cb_old_buttons(cb: CallbackQuery):
+    await cb.answer("Кнопка устарела — вызовите /otgul заново.", show_alert=True)
+
+
+@router.callback_query(F.data.regexp(r"^nrm:d:\w+:\d+:\d+$"))
 async def cb_days(cb: CallbackQuery):
-    _, _, kind, n = cb.data.split(":")
+    _, _, kind, n, owner = cb.data.split(":")
+    if _not_owner(cb, int(owner)):
+        return await cb.answer("Это заявка другого человека — вызовите /otgul сами.", show_alert=True)
     n = int(n)
     if kind == "vip":
         n = min(n, 7)
