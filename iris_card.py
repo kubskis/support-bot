@@ -275,6 +275,10 @@ async def c_whoami(msg, args, rank):
     if not uid:
         uid, name = msg.from_user.id, msg.from_user.full_name
     cid = msg.chat.id
+    if uid != msg.from_user.id and rank < 1:
+        hid = await q("SELECT 1 FROM im_members WHERE chat_id=%s AND user_id=%s AND (profile->>'hidden')='1'", (cid, uid), one=True)
+        if hid:
+            return await reply(msg, f"{mention(uid, name)} скрыл(а) свою анкету.")
     card = await build_card(cid, uid, name)
     if not card:
         return await reply(msg, f"{mention(uid, name)}: нет данных.")

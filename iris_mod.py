@@ -29,6 +29,7 @@ _get_db = None
 _is_main_admin = None
 _skip = set()
 _enabled_cache = {}          # chat_id -> (bool, ts)
+_not_creator = {}            # (chat,uid) -> ts: не создатель (кэш, чтобы не дёргать API на каждое сообщение)
 _join_times = {}             # chat_id -> [ts,...] для антирейда
 router = Router()
 AUTOMOD = []        # async fn(msg, cfg, rank)->bool: автомодерация сообщений (слоумод и др.)
@@ -74,7 +75,7 @@ async def q(sql, args=(), one=False, many=False):
 
 async def init_tables():
     await asyncio.to_thread(_q, _DDL)
-    for modname in ("iris_eco", "iris_fun", "iris_grid", "iris_import", "iris_ext", "iris_gold", "iris_misc"):
+    for modname in ("iris_eco", "iris_fun", "iris_grid", "iris_import", "iris_ext", "iris_gold", "iris_misc", "iris_full"):
         try:
             mod = __import__(modname)
             await mod.init_tables()
@@ -195,6 +196,9 @@ DEFAULT_DK = {
 }
 
 
+DK_SECTIONS = {}   # раздел ДК -> список кодов (заполняет iris_full)
+
+
 async def chat_enabled(chat_id):
     v = _enabled_cache.get(chat_id)
     if v and time.time() - v[1] < 30:
@@ -238,11 +242,17 @@ async def get_rank(chat_id, uid):
         return max(r[0], gr)
     if gr:
         return gr
+    key = (chat_id, uid)
+    if time.time() - _not_creator.get(key, 0) < 600:
+        return 0
     try:
         m = await _bot.get_chat_member(chat_id, uid)
         if m.status == "creator":
             await q("INSERT INTO im_ranks(chat_id,user_id,rank) VALUES(%s,%s,5) ON CONFLICT DO NOTHING", (chat_id, uid))
             return 5
+        _not_creator[key] = time.time()
+        if len(_not_creator) > 50000:
+            _not_creator.clear()
     except Exception:
         pass
     return 0
@@ -371,6 +381,8 @@ async def active_warns(chat_id, uid):
 
 
 async def do_warn(chat_id, uid, sec, reason, by):
+    if not sec:
+        sec = int((await get_cfg(chat_id)).get("warn_period", 0) or 0)
     until = _until(sec) if sec else None
     await q("INSERT INTO im_punish(chat_id,user_id,kind,until,reason,by_id) VALUES(%s,%s,'warn',%s,%s,%s)",
             (chat_id, uid, until, reason, by))
@@ -596,7 +608,8 @@ async def c_mute(msg, args, rank):
         return await reply(msg, "Укажите цель.")
     if not await _target_check(msg, rank, uid):
         return
-    sec, reason = await _split_dur_reason(msg, rest, 7 * 86400)
+    cfg = await get_cfg(msg.chat.id)
+    sec, reason = await _split_dur_reason(msg, rest, int(cfg.get("mute_default", 7 * 86400)))
     await do_mute(msg.chat.id, uid, sec, reason, msg.from_user.id)
     await reply(msg, f"🔇 {mention(uid, name)} в муте: <b>{fmt_dur(sec)}</b>" + (f"\nПричина: {esc(reason)}" if reason else ""))
 
@@ -788,7 +801,9 @@ async def c_who_admin(msg, args, rank):
         return await reply(msg, "Модераторов нет.")
     out = ["<b>Модераторы</b>"]
     for u, r in rows:
-        out.append(f"{r} — {mention(u, await member_name(msg.chat.id, u))}")
+        on = await q("SELECT 1 FROM im_members WHERE chat_id=%s AND user_id=%s AND (profile->>'show_online')='1' AND last_seen>now()-interval '10 minutes'",
+                     (msg.chat.id, u), one=True)
+        out.append(f"{r} — {mention(u, await member_name(msg.chat.id, u))}{' 🟢' if on else ''}")
     await reply(msg, "\n".join(out))
 
 
@@ -820,7 +835,7 @@ async def c_dk_set(msg, args, rank):
     await reply(msg, f"ДК: <b>{esc(code)}</b> → {'отключена' if val >= 6 else 'ранг ' + str(val)}")
 
 
-@cmd(["дк", "доступ команд", "мдк"], "дк")
+@cmd(["дк", "доступ команд"], "дк")
 async def c_dk_show(msg, args, rank):
     rows = dict(await q("SELECT code,rank FROM im_dk WHERE chat_id=%s", (msg.chat.id,), many=True) or [])
     out = ["<b>Доступ команд</b> (код — ранг; * изменено)"]
@@ -833,9 +848,18 @@ async def c_dk_show(msg, args, rank):
     await reply(msg, "\n".join(out))
 
 
-@cmd(["!сброс дк", "!сброс команд"], "сброс")
+@cmd(["!сброс дк", "!сброс команд", "сброс команд", "сброс дк"], "сброс")
 async def c_dk_reset(msg, args, rank):
+    sec = " ".join(args).lower().strip()
+    if sec:
+        codes = DK_SECTIONS.get(sec)
+        if codes is None:
+            return await reply(msg, "Неизвестный раздел. Список: <code>дк</code>")
+        await q("DELETE FROM im_dk WHERE chat_id=%s AND code=ANY(%s)", (msg.chat.id, list(codes)))
+        await logact(msg.chat.id, msg.from_user.id, "dk", None, f"сброс раздела {sec}")
+        return await reply(msg, f"ДК раздела «{esc(sec)}» сброшены.")
     await q("DELETE FROM im_dk WHERE chat_id=%s", (msg.chat.id,))
+    await logact(msg.chat.id, msg.from_user.id, "dk", None, "сброс всех")
     await reply(msg, "ДК сброшены к значениям по умолчанию.")
 
 
@@ -980,11 +1004,15 @@ async def c_purge(msg, args, rank):
 @cmd(["кик неактив", "кик молчунов"], "кикнеактив")
 async def c_kick_inactive(msg, args, rank):
     silent = (msg.text or "").lower().startswith("кик молч")
-    days = int(args[0]) if args and args[0].isdigit() else 30
+    sec = 30 * 86400
+    if args:
+        d = int(args[0]) * 86400 if args[0].isdigit() else parse_dur(args[0])
+        if d:
+            sec = max(d, 86400)
     if silent:
-        rows = await q("SELECT user_id FROM im_members WHERE chat_id=%s AND msgs<=1 AND first_seen<now()-interval '%s days'" % ("%s", days), (msg.chat.id,), many=True)
+        rows = await q("SELECT user_id FROM im_members WHERE chat_id=%s AND msgs<=1 AND first_seen<now()-make_interval(secs=>%s)", (msg.chat.id, sec), many=True)
     else:
-        rows = await q("SELECT user_id FROM im_members WHERE chat_id=%s AND last_seen<now()-interval '%s days'" % ("%s", days), (msg.chat.id,), many=True)
+        rows = await q("SELECT user_id FROM im_members WHERE chat_id=%s AND last_seen<now()-make_interval(secs=>%s)", (msg.chat.id, sec), many=True)
     n = 0
     for (u,) in rows:
         if await get_rank(msg.chat.id, u) > 0:
@@ -1224,6 +1252,10 @@ async def c_help(msg, args, rank):
         "<b>Экономика и игры:</b> баланс, ферма, передать N, топ богачей, дуэль [ставка], рулетка, кубы [ставка], брак, мой брак, браки, развод\n"
         "<b>Клубы:</b> создать клан/кружок, клан вступить, кланы, кружки, клан созвать\n"
         "<b>Прочее:</b> +, -, рейтинг, наградить, награды, +заметка, +закладка, +таймер, карта, +мрп, созвать всех/онлайн/модеров, !инфа, !выбери, !погода, !ид\n"
+        "<b>Ещё:</b> снять варны N @ник, снять варн номер N, проверить мут, бан/мут/варны период, +дк/-дк раздел, мдк, лог дк, +/-команды, "
+        "+/-чаты/сайты/теги/боты, ссылки срок/рейтинг, !разрешить ссылку, +/-капс/стикеры/гифки, +ирис антиспам, кик актив/новичков/по смс/удалённых, "
+        "список неактив/молчунов/по смс, входы/выходы, кто добавил, +/-тг админ, обновить чат, +/-анкета, мои баны, мой актив, !население, "
+        "чек N, обналичить КОД, кинг, пиу, мрп экспорт, +гмрп, +скам, ачивки, стата по часам, топ упоминаний\n"
         "<b>Сетка:</b> создать сетку, установить сетку, чаты, глобан, глоразбан, гломут, +глмодер\n"
         "Команды можно писать по-разному: «я кто», «ты кто», «забань», «кикни», «замуть», «сколько монет» и т.д.\n"
         "Сроки: 30м, 2ч, 3д, 1н, 1мес, навсегда."))
@@ -1245,6 +1277,25 @@ def _sorted_cmds():
     return _CMD_SORTED
 
 
+SLASH_ALIASES = {
+    "ban": "бан", "unban": "разбан", "kick": "кик", "mute": "мут", "unmute": "-мут", "warn": "варн", "unwarn": "-варн",
+    "warns": "варны", "warnlist": "варнлист", "banlist": "банлист", "mutes": "муты", "reason": "причина", "amnesty": "!амнистия",
+    "rules": "правила", "top": "топ", "me": "кто я", "who": "кто я", "whoami": "кто я", "profile": "кто я",
+    "moder": "+модер", "unmoder": "снять", "admins": "кто админ", "dk": "дк", "ldk": "лдк", "purge": "!пург", "rp": "рп список",
+    "nadzor": "надзор", "help": "надзор", "on": "+надзор", "off": "-надзор", "nadzor_on": "+надзор", "nadzor_off": "-надзор",
+    "stats": "чат инфо", "chatinfo": "чат инфо", "online": "кто онлайн", "olds": "олды", "newbies": "новички",
+    "balance": "баланс", "bal": "баланс", "farm": "ферма", "give": "передать", "rich": "топ богачей", "duel": "дуэль",
+    "roulette": "!рулетка", "dice": "кубы", "marry": "брак", "marriage": "мой брак", "marriages": "браки", "divorce": "!развод",
+    "rep": "рейтинг", "awards": "награды", "notes": "заметки", "bookmarks": "закладки", "timers": "таймеры", "map": "карта",
+    "clans": "кланы", "clubs": "кружки", "gold": "золото", "vip": "вип", "whovip": "кто вип", "ach": "ачивки", "achievements": "ачивки",
+    "hours": "стата по часам", "mentions": "топ упоминаний", "scam": "скам", "id": "!ид", "ping": "!пинг", "weather": "!погода",
+    "info": "!инфа", "choose": "!выбери", "random": "рандом", "say": "!скажи", "ship": "шипперим", "vote": "гб", "voteban": "гб",
+    "slow": "слоумод", "antiraid": "антирейд", "welcome": "+приветствие", "triggers": "триггеры", "log": "модер лог",
+    "import": "перенести стату", "check": "проверить мут", "inactive": "список неактив", "population": "!население",
+    "myactive": "мой актив", "mybans": "мои баны", "myspam": "мой спам", "invited": "кто добавил", "cheque": "чек", "king": "кинг",
+}
+
+
 def _normalize(text):
     t = (text or "").strip()
     if not t:
@@ -1252,13 +1303,10 @@ def _normalize(text):
     first = t.split("\n", 1)[0]
     if first.startswith("/"):
         first = first[1:]
-        first = re.sub(r"@\w+", "", first, count=1)
-        # слэш-алиасы
-        alias = {"ban": "бан", "unban": "разбан", "kick": "кик", "mute": "мут", "unmute": "-мут", "warn": "варн", "unwarn": "-варн",
-                 "warns": "варны", "nadzor": "надзор", "rules": "правила", "top": "топ", "me": "кто я", "banlist": "банлист",
-                 "moder": "+модер", "dk": "дк", "purge": "!пург", "who": "кто я", "rp": "рп список"}
+        # убираем только @имя_бота, приклеенное к команде (/ban@bot), но не цель (@ник)
+        first = re.sub(r"^(\S+?)@\w+", r"\1", first, count=1)
         w = first.split(None, 1)
-        head = alias.get(w[0].lower())
+        head = SLASH_ALIASES.get(w[0].lower())
         if not head:
             return None
         first = head + (" " + w[1] if len(w) > 1 else "")
@@ -1292,7 +1340,20 @@ async def _activate(msg: Message):
     await q("INSERT INTO im_chats(chat_id,enabled) VALUES(%s,TRUE) ON CONFLICT(chat_id) DO UPDATE SET enabled=TRUE", (cid,))
     _enabled_cache.pop(cid, None)
     await q("INSERT INTO im_ranks(chat_id,user_id,rank) VALUES(%s,%s,5) ON CONFLICT(chat_id,user_id) DO UPDATE SET rank=5", (cid, msg.from_user.id))
-    await reply(msg, "🛡 <b>Надзор включён.</b> Вы — ранг 5. Для работы выдайте боту права администратора (бан, удаление, ограничение).\nСписок команд: <code>надзор</code>")
+    note = ""
+    try:
+        bm = await _bot.get_chat_member(cid, _bot.id)
+        if bm.status != "administrator":
+            note = ("\n\n⚠️ <b>Я не администратор чата.</b> Telegram не передаёт мне обычные сообщения участников (режим приватности), "
+                    "поэтому текстовые команды вроде «кто я» работать не будут — только /команды латиницей. "
+                    "Назначьте меня администратором (права: блокировка, удаление, закрепление, приглашение) — тогда заработает всё.")
+        else:
+            need = [n for n, a in (("блокировка", "can_restrict_members"), ("удаление сообщений", "can_delete_messages")) if not getattr(bm, a, False)]
+            if need:
+                note = "\n\n⚠️ Не хватает прав: " + ", ".join(need) + "."
+    except Exception:
+        pass
+    await reply(msg, "🛡 <b>Надзор включён.</b> Вы — ранг 5. Для работы выдайте боту права администратора (бан, удаление, ограничение).\nСписок команд: <code>надзор</code>" + note)
 
 
 async def _deactivate(msg: Message):
@@ -1326,7 +1387,7 @@ async def _on_message(msg: Message):
         except Exception:
             log.exception("alias")
     low = (first or "").lower()
-    if low in ("+надзор", "надзор старт", "надзор вкл"):
+    if low in ("+надзор", "надзор старт", "надзор вкл") or (low == "надзор" and not await chat_enabled(cid)):
         return await _activate(msg)
     if not await chat_enabled(cid):
         return
@@ -1336,6 +1397,8 @@ async def _on_message(msg: Message):
     uid = msg.from_user.id
     rank = await get_rank(cid, uid)
     # командный разбор
+    if first and (await get_cfg(cid)).get("nocmd") and not low.lstrip("!.").startswith(("+команды", "+надзор")):
+        first = None
     if first:
         m = _match(first)
         if m:
@@ -1447,12 +1510,12 @@ def setup(dp, bot, get_db, is_main_admin, skip_chat_ids=()):
     global _bot, _get_db, _is_main_admin, _skip
     _bot, _get_db, _is_main_admin = bot, get_db, is_main_admin
     _skip = set(skip_chat_ids)
-    for modname in ("iris_eco", "iris_fun", "iris_grid", "iris_card", "iris_alias", "iris_import", "iris_ext", "iris_gold", "iris_misc"):
+    for modname in ("iris_eco", "iris_fun", "iris_grid", "iris_card", "iris_alias", "iris_import", "iris_ext", "iris_gold", "iris_misc", "iris_full"):
         try:
             __import__(modname)   # регистрируют свои команды в CMDS
         except Exception:
             log.exception("%s import", modname)
-    for modname in ("iris_fun", "iris_ext", "iris_gold", "iris_misc"):
+    for modname in ("iris_fun", "iris_ext", "iris_gold", "iris_misc", "iris_full"):
         try:
             mod = __import__(modname)
             if hasattr(mod, "worker"):
@@ -1460,7 +1523,7 @@ def setup(dp, bot, get_db, is_main_admin, skip_chat_ids=()):
         except Exception:
             log.exception("%s worker", modname)
     dp.message.outer_middleware(IrisMiddleware())
-    for modname in ("iris_import", "iris_ext", "iris_gold", "iris_misc"):
+    for modname in ("iris_import", "iris_ext", "iris_gold", "iris_misc", "iris_full"):
         try:
             mod = __import__(modname)
             if hasattr(mod, "install"):

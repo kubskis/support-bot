@@ -296,7 +296,7 @@ def approx_age_months(uid):
     return max(0, now.year * 12 + now.month - reg)
 
 
-@cmd(["минакк"], "защитавхода")
+@cmd(["минакк", "+минрег", "минрег"], "защитавхода")
 async def c_min_age(msg, args, rank):
     if not args or not args[0].isdigit():
         return await reply(msg, "Пример: <code>минакк 6</code> (месяцев; 0 — выкл). Возраст оценивается по номеру аккаунта, это приблизительно (±полгода).")
