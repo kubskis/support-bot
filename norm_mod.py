@@ -478,11 +478,6 @@ async def cb_days(cb: CallbackQuery):
     rid = (await q("INSERT INTO norm_excuse(user_id,from_ts,to_ts,reason) VALUES(%s,%s,%s,%s) RETURNING id", (uid, t0, t1, REASONS[kind]), one=True))[0]
     await cb.message.edit_text(f"🕓 Заявка на отгул ({n} дн.) отправлена главным админам.")
     kb = _kb([[InlineKeyboardButton(text="✅ Одобрить", callback_data=f"nrm:ok:{rid}"), InlineKeyboardButton(text="❌ Отклонить", callback_data=f"nrm:no:{rid}")]])
-    try:
-        await _bot.send_message(_admin_chat, f"🏖 <b>Заявка на отгул от норматива</b>\n{await _mention(uid)}: {html.escape(REASONS[kind])}\n"
-                                f"С {fmt_dt(t0)} по {fmt_dt(t1)} МСК ({n} дн.)", parse_mode="HTML", reply_markup=kb, message_thread_id=_topic)
-    except Exception as e:
-        log.warning("заявка: %s", e)
     await _dm_main_admins(f"🏖 <b>Заявка на отгул от норматива</b>\n{await _mention(uid)}: {html.escape(REASONS[kind])}\n"
                           f"С {fmt_dt(t0)} по {fmt_dt(t1)} МСК ({n} дн.)", kb)
     await cb.answer()
