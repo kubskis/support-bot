@@ -53,6 +53,7 @@ ALTER TABLE norm_excuse ADD COLUMN IF NOT EXISTS ended_at TIMESTAMPTZ;
 UPDATE norm_excuse SET from_ts=(from_day::timestamp AT TIME ZONE 'Europe/Moscow'), to_ts=((to_day+1)::timestamp AT TIME ZONE 'Europe/Moscow') WHERE from_ts IS NULL AND from_day IS NOT NULL;
 CREATE TABLE IF NOT EXISTS norm_state(user_id BIGINT PRIMARY KEY, since DATE, alerted BOOLEAN DEFAULT FALSE);
 CREATE TABLE IF NOT EXISTS norm_flags(key TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS norm_manual(id SERIAL PRIMARY KEY, user_id BIGINT, day DATE, note TEXT, by_id BIGINT, ts TIMESTAMPTZ DEFAULT now());
 """
 
 
@@ -132,7 +133,10 @@ async def finders():
 async def finds_on(d: date) -> dict:
     a, b = await window()
     rows = await q(f"SELECT user_id, COUNT(*) FROM secret_posts WHERE {_LOC}::date=%s AND {_WIN_SQL} GROUP BY user_id", (d, a, b), many=True)
-    return {u: int(n) for u, n in (rows or [])}
+    res = {u: int(n) for u, n in (rows or [])}
+    for u, n in (await q("SELECT user_id, COUNT(*) FROM norm_manual WHERE day=%s GROUP BY user_id", (d,), many=True) or []):
+        res[u] = res.get(u, 0) + int(n)
+    return res
 
 
 _END_EFF = "LEAST(to_ts, COALESCE(ended_at, to_ts))"
@@ -338,6 +342,24 @@ async def _remind_dm(hours_left):
             log.info("лс-напоминание %s не доставлено: %s", u, e)
 
 
+async def _remind_excuse_end():
+    """За 6 часов до конца отгула пишем человеку и главным админам."""
+    rows = await q(f"""SELECT id, user_id, from_ts, {_END_EFF} FROM norm_excuse
+                       WHERE status='ok' AND from_ts IS NOT NULL AND ended_at IS NULL
+                       AND {_END_EFF} > now() AND {_END_EFF} <= now() + interval '6 hours'
+                       AND {_END_EFF} - from_ts > interval '6 hours'""", many=True)
+    for eid, u, f, e in rows or []:
+        if not await flag_once(f"exend:{eid}:{int(e.timestamp())}"):
+            continue
+        left = max(1, round((e - datetime.now(MSK)).total_seconds() / 3600))
+        try:
+            await _bot.send_message(u, f"🏖 <b>Ваш отгул от норматива скоро закончится</b> (через ~{left} ч., до {fmt_dt(e)} МСК).\n"
+                                       "После этого норма снова считается — не забудьте про секретки.", parse_mode="HTML")
+        except Exception as ex:
+            log.info("конец отгула, лс %s: %s", u, ex)
+        await _dm_main_admins(f"🏖 Отгул у {await _mention(u)} заканчивается через ~{left} ч. ({fmt_dt(e)} МСК). Дальше норма снова считается.")
+
+
 async def norm_worker():
     log.info("Воркер норматива запущен")
     await init_tables()
@@ -355,6 +377,7 @@ async def norm_worker():
                     await _remind_dm(wb - now.hour)
                 if now.hour == wb - 1 and await flag_once(f"dm1:{now.date()}"):
                     await _remind_dm(1)
+                await _remind_excuse_end()
         except Exception:
             log.exception("norm worker")
         await asyncio.sleep(60)
@@ -598,6 +621,7 @@ async def grant_excuse(uid, hours, reason, by) -> datetime:
 
 class NormStates(StatesGroup):
     hours = State()
+    mnote = State()
 
 
 # ---------------------------------------------------------------- раздел админ-панели
@@ -696,7 +720,8 @@ async def overview(page=0):
         nav.append(InlineKeyboardButton(text="▶️", callback_data=f"nrmp:{page + 1}"))
     kb = _ikb([nav,
                [InlineKeyboardButton(text="⚠️ Предупреждения", callback_data="nrmw"), InlineKeyboardButton(text="📅 История", callback_data="nrmh")],
-               [InlineKeyboardButton(text="🏖 Отгулы", callback_data="nrme"), InlineKeyboardButton(text="⚙️ Настройки", callback_data="nrms")],
+               [InlineKeyboardButton(text="🏖 Отгулы", callback_data="nrme"), InlineKeyboardButton(text="✍️ Ручная правка", callback_data="nrmm")],
+               [InlineKeyboardButton(text="⚙️ Настройки", callback_data="nrms")],
                [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_adm")]])
     return "\n".join(lines), kb
 
@@ -854,6 +879,111 @@ async def adm_norm_hours(message: Message, state: FSMContext):
     t1 = await grant_excuse(uid, hours, reason, message.from_user.id)
     await message.answer(f"✅ Отгул выдан: <b>{await _nm(uid)}</b> на {fmt_hours(hours)}, до {fmt_dt(t1)} МСК.\nЗавершить досрочно можно в «🏖 Отгулы».",
                          parse_mode="HTML", reply_markup=_ikb([[InlineKeyboardButton(text="🏖 К отгулам", callback_data="nrme")]]))
+
+
+# ---------------------------------------------------------------- ручная правка дня
+@router.callback_query(F.data == "nrmm")
+async def adm_norm_manual(cb: CallbackQuery, state: FSMContext = None):
+    if not await _guard(cb):
+        return
+    if state:
+        await state.clear()
+    rows = await q("SELECT id, user_id, day, note FROM norm_manual ORDER BY id DESC LIMIT 10", many=True)
+    lines = ["✍️ <b>Ручная правка дня</b>\nЕсли секретка найдена, но бот её не засчитал, добавьте её вручную.\n"]
+    btns = [[InlineKeyboardButton(text="➕ Засчитать секретку", callback_data="nrmma")]]
+    if rows:
+        lines.append("<b>Последние ручные зачёты:</b>")
+    for mid, u, d, note in rows or []:
+        lines.append(f"• {await _nm(u)} — {_fmt(d)}" + (f" · {html.escape(note)}" if note else ""))
+        btns.append([InlineKeyboardButton(text=f"↩️ Отменить: {(await _nm(u))[:16]} {_fmt(d)}", callback_data=f"nrmmd:{mid}")])
+    btns.append([InlineKeyboardButton(text="🔙 К таблице", callback_data="adm_norm")])
+    await _edit(cb, "\n".join(lines), _ikb(btns))
+
+
+@router.callback_query(F.data == "nrmma")
+async def adm_norm_manual_user(cb: CallbackQuery, state: FSMContext):
+    if not await _guard(cb):
+        return
+    await state.clear()
+    btns, line = [], []
+    for u in (await finders())[:40]:
+        line.append(InlineKeyboardButton(text=(await _nm(u))[:22], callback_data=f"nrmmu:{u}"))
+        if len(line) == 2:
+            btns.append(line)
+            line = []
+    if line:
+        btns.append(line)
+    btns.append([InlineKeyboardButton(text="🔙 Назад", callback_data="nrmm")])
+    await _edit(cb, "✍️ <b>Засчитать секретку</b>\nКому?", _ikb(btns))
+
+
+@router.callback_query(F.data.regexp(r"^nrmmu:\d+$"))
+async def adm_norm_manual_day(cb: CallbackQuery):
+    if not await _guard(cb):
+        return
+    uid = int(cb.data.split(":")[1])
+    t = today_msk()
+    days = [t - timedelta(days=i) for i in range(0, 7) if t - timedelta(days=i) >= (await _start())]
+    if not days:
+        return await cb.answer("Норматив ещё не начался", show_alert=True)
+    btns, line = [], []
+    for d in days:
+        line.append(InlineKeyboardButton(text=("сегодня " if d == t else "") + _fmt(d), callback_data=f"nrmmd2:{uid}:{d.isoformat()}"))
+        if len(line) == 2:
+            btns.append(line)
+            line = []
+    if line:
+        btns.append(line)
+    btns.append([InlineKeyboardButton(text="🔙 Назад", callback_data="nrmma")])
+    await _edit(cb, f"✍️ <b>{await _nm(uid)}</b>\nЗа какой день засчитать секретку?", _ikb(btns))
+
+
+@router.callback_query(F.data.regexp(r"^nrmmd2:\d+:\d{4}-\d{2}-\d{2}$"))
+async def adm_norm_manual_note(cb: CallbackQuery, state: FSMContext):
+    if not await _guard(cb):
+        return
+    _, uid, d = cb.data.split(":")
+    await state.set_state(NormStates.mnote)
+    await state.update_data(uid=int(uid), day=d)
+    await cb.message.answer(f"Засчитать секретку <b>{await _nm(int(uid))}</b> за {_fmt(date.fromisoformat(d))}.\n"
+                            "Напишите <b>пометку</b> (например, «нашёл, но бот не увидел») или <code>-</code> без пометки.",
+                            parse_mode="HTML", reply_markup=_ikb([[InlineKeyboardButton(text="✖️ Отмена", callback_data="nrmm")]]))
+    await cb.answer()
+
+
+@router.message(NormStates.mnote, F.chat.type == "private")
+async def adm_norm_manual_save(message: Message, state: FSMContext):
+    if not await _is_main_admin(message.from_user.id):
+        return
+    txt = (message.text or "").strip()
+    if txt.startswith("/"):
+        await state.clear()
+        return await message.answer("Ручная правка отменена.")
+    data = await state.get_data()
+    await state.clear()
+    uid, d = data.get("uid"), date.fromisoformat(data.get("day"))
+    note = "" if txt == "-" else txt[:200]
+    await q("INSERT INTO norm_manual(user_id, day, note, by_id) VALUES(%s,%s,%s,%s)", (uid, d, note, message.from_user.id))
+    extra = ""
+    # день уже закрыт — снимаем предупреждение за «ноль» в этот день
+    r = await q("UPDATE norm_warns SET active=FALSE WHERE user_id=%s AND day=%s AND kind='day' AND active RETURNING 1", (uid, d), one=True)
+    if r:
+        extra = "\n⚠️ Предупреждение за этот день снято."
+    try:
+        await _bot.send_message(uid, f"✅ Вам вручную засчитана секретка за {_fmt(d)}." + (f"\nПометка: {html.escape(note)}" if note else "") + extra.replace("⚠️ ", ""))
+    except Exception:
+        pass
+    await message.answer(f"✅ Засчитано: <b>{await _nm(uid)}</b> — {_fmt(d)}.{extra}",
+                         parse_mode="HTML", reply_markup=_ikb([[InlineKeyboardButton(text="✍️ К ручной правке", callback_data="nrmm")]]))
+
+
+@router.callback_query(F.data.regexp(r"^nrmmd:\d+$"))
+async def adm_norm_manual_del(cb: CallbackQuery, state: FSMContext = None):
+    if not await _guard(cb):
+        return
+    await q("DELETE FROM norm_manual WHERE id=%s", (int(cb.data.split(":")[1]),))
+    await adm_norm_manual(cb, state)
+
 
 
 async def _settings_view():
