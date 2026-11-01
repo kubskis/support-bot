@@ -13,6 +13,7 @@
 import asyncio
 import html
 import logging
+import math
 from datetime import date, datetime, timedelta, timezone
 
 from aiogram import F, Router
@@ -31,7 +32,7 @@ _mention = None
 _admin_chat = None
 _topic = None
 
-DEFAULTS = {"enabled": "1", "percent": "60", "start": "2026-11-02", "max_warns": "3"}
+DEFAULTS = {"enabled": "1", "percent": "60", "start": "2026-11-02", "max_warns": "3", "win_from": "6", "win_to": "23"}
 REASONS = {"sick": "🤒 Болезнь / плохое самочувствие", "vip": "🔑 Нет випки (до 7 дней)", "trip": "✈️ Поездка / нет интернета"}
 
 _DDL = """
@@ -84,6 +85,27 @@ async def _start() -> date:
     return date.fromisoformat(await cfg("start"))
 
 
+async def window() -> tuple:
+    """(час начала, час конца) приёма секреток по МСК: засчитываются секретки с a:00 до b:00."""
+    return int(await cfg("win_from")), int(await cfg("win_to"))
+
+
+_LOC = "(created_at AT TIME ZONE 'Europe/Moscow')"
+_WIN_SQL = f"EXTRACT(HOUR FROM {_LOC}) >= %s AND EXTRACT(HOUR FROM {_LOC}) < %s"
+
+
+async def window_label() -> str:
+    a, b = await window()
+    return f"{a:02d}:00–{b:02d}:00 МСК"
+
+
+async def last_closed_day() -> date:
+    """Последний полностью закрытый день: сегодня — после конца окна (+5 минут), иначе вчера."""
+    a, b = await window()
+    now = datetime.now(MSK)
+    return now.date() if now.hour * 60 + now.minute >= b * 60 + 5 else now.date() - timedelta(days=1)
+
+
 def _fmt(d: date) -> str:
     return d.strftime("%d.%m")
 
@@ -100,7 +122,8 @@ async def finders():
 
 
 async def finds_on(d: date) -> dict:
-    rows = await q("SELECT user_id, COUNT(*) FROM secret_posts WHERE (created_at AT TIME ZONE 'Europe/Moscow')::date=%s GROUP BY user_id", (d,), many=True)
+    a, b = await window()
+    rows = await q(f"SELECT user_id, COUNT(*) FROM secret_posts WHERE {_LOC}::date=%s AND {_WIN_SQL} GROUP BY user_id", (d, a, b), many=True)
     return {u: int(n) for u, n in (rows or [])}
 
 
@@ -186,7 +209,8 @@ async def process_day(d: date):
         for u in elig:
             if u in warned:
                 continue
-            cnt = (await q("SELECT COUNT(*) FROM secret_posts WHERE user_id=%s AND (created_at AT TIME ZONE 'Europe/Moscow')::date BETWEEN %s AND %s", (u, d0, d), one=True))[0]
+            wa, wb = await window()
+            cnt = (await q(f"SELECT COUNT(*) FROM secret_posts WHERE user_id=%s AND {_LOC}::date BETWEEN %s AND %s AND {_WIN_SQL}", (u, d0, d, wa, wb), one=True))[0]
             if cnt:
                 continue
             if await q("SELECT 1 FROM norm_excuse WHERE user_id=%s AND status='ok' AND from_day<=%s AND to_day>=%s", (u, d, d0), one=True):
@@ -196,7 +220,7 @@ async def process_day(d: date):
             await add_warn(u, d, "streak", f"{_fmt(d0)}–{_fmt(d)}: ни одной секретки за 3 дня подряд.")
             streak_warned.append(u)
     await q("INSERT INTO norm_days(day,finders,required,found,met) VALUES(%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING", (d, len(elig), req, total, met))
-    lines = [f"📊 <b>Итог дня {_fmt(d)}</b>", f"Искателей в учёте: {len(elig)} · нужно секреток: {req} · найдено: {total}",
+    lines = [f"📊 <b>Итог дня {_fmt(d)}</b> (приём {await window_label()})", f"Искателей в учёте: {len(elig)} · нужно секреток: {req} · найдено: {total}",
              "✅ Общая норма выполнена." if met else "❌ Общая норма не выполнена."]
     if warned:
         lines.append("⚠️ Предупреждения за день: " + ", ".join([await _mention(u) for u in warned]))
@@ -211,9 +235,9 @@ async def process_day(d: date):
 
 
 async def process_pending():
-    start, today = await _start(), today_msk()
+    start, last = await _start(), await last_closed_day()
     d = start
-    while d < today:
+    while d <= last:
         await process_day(d)
         d += timedelta(days=1)
 
@@ -227,12 +251,13 @@ async def _remind(kind):
     total = sum(finds.values())
     req = required_for(len(pool), int(await cfg("percent")))
     if kind == "morning":
-        txt = f"🌅 <b>Новый день, норматив {_fmt(d)}</b>\nИскателей в учёте: {len(pool)} · общая норма: <b>{req}</b> секр.\nКаждому — 1 секретка. Статус: /norm, таблица: /normtop"
+        txt = (f"🌅 <b>Новый день, норматив {_fmt(d)}</b>\nСекретки засчитываются с {await window_label()}.\n"
+               f"Искателей в учёте: {len(pool)} · общая норма: <b>{req}</b> секр.\nКаждому — 1 секретка. Статус: /norm, таблица: /normtop")
     else:
         if total >= req:
             return
         lag = [u for u in pool if finds.get(u, 0) == 0]
-        txt = (f"⏰ <b>Норма дня не выполнена:</b> {total}/{req}. День заканчивается в 00:00 МСК.\n"
+        txt = (f"⏰ <b>Норма дня не выполнена:</b> {total}/{req}. Приём секреток закрывается в {(await window())[1]:02d}:00 МСК.\n"
                + ("Ещё не нашли: " + ", ".join([await _mention(u) for u in lag]) if lag else ""))
     try:
         await _bot.send_message(_admin_chat, txt, parse_mode="HTML", message_thread_id=_topic)
@@ -247,11 +272,11 @@ async def norm_worker():
         try:
             if (await cfg("enabled")) == "1":
                 now = datetime.now(MSK)
-                if now.hour * 60 + now.minute >= 2:
-                    await process_pending()
-                if now.hour >= 10 and await flag_once(f"morning:{now.date()}"):
+                wa, wb = await window()
+                await process_pending()
+                if wa <= now.hour < wb and await flag_once(f"morning:{now.date()}"):
                     await _remind("morning")
-                if now.hour >= 20 and await flag_once(f"evening:{now.date()}"):
+                if wb - 3 <= now.hour < wb and await flag_once(f"evening:{now.date()}"):
                     await _remind("evening")
         except Exception:
             log.exception("norm worker")
@@ -273,7 +298,8 @@ async def _streak_days(uid) -> int:
     d = today_msk() - timedelta(days=1)
     start = await _start()
     while n < 30 and d >= start:
-        if await q("SELECT 1 FROM secret_posts WHERE user_id=%s AND (created_at AT TIME ZONE 'Europe/Moscow')::date=%s", (uid, d), one=True):
+        wa, wb = await window()
+        if await q(f"SELECT 1 FROM secret_posts WHERE user_id=%s AND {_LOC}::date=%s AND {_WIN_SQL}", (uid, d, wa, wb), one=True):
             break
         if await q("SELECT 1 FROM norm_excuse WHERE user_id=%s AND status='ok' AND from_day<=%s AND to_day>=%s", (uid, d, d), one=True):
             break
@@ -300,7 +326,7 @@ async def cmd_norm(message: Message):
     limit = int(await cfg("max_warns"))
     ex = await q("SELECT to_day, reason FROM norm_excuse WHERE user_id=%s AND status='ok' AND to_day>=%s ORDER BY to_day DESC LIMIT 1", (uid, d), one=True)
     pend = await q("SELECT 1 FROM norm_excuse WHERE user_id=%s AND status='pending'", (uid,), one=True)
-    lines = [f"📋 <b>Норматив секреток · {_fmt(d)}</b>"]
+    lines = [f"📋 <b>Норматив секреток · {_fmt(d)}</b>", f"Приём секреток: {await window_label()}"]
     if d < start:
         lines.append(f"Начнётся с {start.strftime('%d.%m.%Y')}.")
     lines += [
@@ -467,6 +493,230 @@ async def cmd_admin(message: Message):
     if c == "status":
         return await message.answer(f"Включён: {await cfg('enabled')}\nПроцент: {await cfg('percent')}\nСтарт: {await cfg('start')}\nЛимит предупреждений: {await cfg('max_warns')}\nИскателей: {len(await finders())}")
     await message.answer(help_, parse_mode="HTML")
+
+
+# ---------------------------------------------------------------- раздел админ-панели
+_names = {}
+PAGE = 15
+
+
+async def _nm(uid) -> str:
+    n = _names.get(uid)
+    if n:
+        return n
+    try:
+        ch = await _bot.get_chat(uid)
+        n = html.escape(ch.full_name or str(uid))
+        if ch.username:
+            n += f" (@{ch.username})"
+    except Exception:
+        n = str(uid)
+    _names[uid] = n
+    return n
+
+
+def _bar(done, total, width=10) -> str:
+    if total <= 0:
+        return "▰" * width
+    k = min(width, int(round(width * done / total)))
+    return "▰" * k + "▱" * (width - k)
+
+
+def _ikb(rows):
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _edit(cb: CallbackQuery, text, kb):
+    try:
+        await cb.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception as e:
+        if "not modified" not in str(e).lower():
+            log.warning("panel edit: %s", e)
+    await cb.answer()
+
+
+async def _time_note(d) -> str:
+    a, b = await window()
+    now = datetime.now(MSK)
+    if d < await _start():
+        return f"Старт норматива: {(await _start()).strftime('%d.%m.%Y')} в {a:02d}:00 МСК."
+    m = now.hour * 60 + now.minute
+    if m < a * 60:
+        return f"Приём откроется в {a:02d}:00 МСК."
+    if m >= b * 60:
+        return f"Приём закрыт, итог дня в {b:02d}:05 МСК." if m < b * 60 + 5 else "Приём закрыт, итог дня подведён."
+    left = b * 60 - m
+    return f"До закрытия приёма: {left // 60} ч {left % 60:02d} мин."
+
+
+async def overview(page=0):
+    d = today_msk()
+    pct = int(await cfg("percent"))
+    pool = set(await eligible_on(d))
+    exc = await excused_on(d)
+    fs = await finders()
+    finds = await finds_on(d)
+    total_all = sum(finds.get(u, 0) for u in fs)
+    req = required_for(len(pool), pct)
+    perc = int(total_all * 100 / req) if req else 100
+    enabled = (await cfg("enabled")) == "1"
+    lines = [f"📋 <b>Норматив секреток · {_fmt(d)}</b>" + ("" if enabled else " · 🔴 <b>ВЫКЛЮЧЕН</b>"),
+             f"Приём секреток: {await window_label()} · {html.escape(await _time_note(d))}", "",
+             f"<b>Общая норма:</b> {total_all}/{req} · {perc}%  {_bar(total_all, req)}",
+             f"Искателей в учёте: {len(pool)} из {len(fs)} · отгул: {len([u for u in fs if u in exc])} · норма {pct}%", ""]
+    rows = []
+    for u in fs:
+        n = await active_warns(u)
+        rows.append((u, finds.get(u, 0), n, u in exc, u in pool))
+    rows.sort(key=lambda r: (-r[1], r[2], r[0]))
+    pages = max(1, math.ceil(len(rows) / PAGE))
+    page = max(0, min(page, pages - 1))
+    for u, f, n, e, inpool in rows[page * PAGE:(page + 1) * PAGE]:
+        if e:
+            mark, pc = "🏖", "отгул"
+        elif not inpool:
+            mark, pc = "🆕", "с завтра"
+        else:
+            mark, pc = ("✅" if f else "▫️"), f"{f * 100}% нормы"
+        lines.append(f"{mark} {await _nm(u)} — <b>{f}</b> · {pc}" + (f" · ⚠️{n}/{await cfg('max_warns')}" if n else ""))
+    if not rows:
+        lines.append("Список искателей пуст.")
+    if pages > 1:
+        lines.append(f"\nСтраница {page + 1}/{pages}")
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"nrmp:{page - 1}"))
+    nav.append(InlineKeyboardButton(text="🔄 Обновить", callback_data=f"nrmp:{page}"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"nrmp:{page + 1}"))
+    kb = _ikb([nav,
+               [InlineKeyboardButton(text="⚠️ Предупреждения", callback_data="nrmw"), InlineKeyboardButton(text="📅 История", callback_data="nrmh")],
+               [InlineKeyboardButton(text="🏖 Отгулы", callback_data="nrme"), InlineKeyboardButton(text="⚙️ Настройки", callback_data="nrms")],
+               [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_adm")]])
+    return "\n".join(lines), kb
+
+
+async def _guard(cb: CallbackQuery) -> bool:
+    if not await _is_main_admin(cb.from_user.id):
+        await cb.answer("❌ Нет доступа", show_alert=True)
+        return False
+    return True
+
+
+@router.callback_query(F.data == "adm_norm")
+async def adm_norm(cb: CallbackQuery):
+    if not await _guard(cb):
+        return
+    text, kb = await overview(0)
+    await _edit(cb, text, kb)
+
+
+@router.callback_query(F.data.regexp(r"^nrmp:\d+$"))
+async def adm_norm_page(cb: CallbackQuery):
+    if not await _guard(cb):
+        return
+    text, kb = await overview(int(cb.data.split(":")[1]))
+    await _edit(cb, text, kb)
+
+
+@router.callback_query(F.data == "nrmw")
+async def adm_norm_warns(cb: CallbackQuery):
+    if not await _guard(cb):
+        return
+    rows = await q("SELECT user_id, COUNT(*), MAX(day) FROM norm_warns WHERE active GROUP BY user_id ORDER BY COUNT(*) DESC, MAX(day) DESC LIMIT 15", many=True)
+    lim = await cfg("max_warns")
+    lines = ["⚠️ <b>Предупреждения по нормативу</b>\n"]
+    btns = []
+    if not rows:
+        lines.append("Активных предупреждений нет.")
+    for u, n, last in rows or []:
+        notes = await q("SELECT day, kind, note FROM norm_warns WHERE user_id=%s AND active ORDER BY id DESC LIMIT 3", (u,), many=True)
+        lines.append(f"<b>{await _nm(u)}</b> — {n}/{lim} (последнее {_fmt(last)})")
+        for dd, kind, note in notes or []:
+            lines.append(f"   • {html.escape(note or '')[:110]}")
+        btns.append([InlineKeyboardButton(text=f"🗑 Сбросить: {(await _nm(u))[:24]}", callback_data=f"nrmr:{u}")])
+    btns.append([InlineKeyboardButton(text="🔙 К таблице", callback_data="adm_norm")])
+    await _edit(cb, "\n".join(lines), _ikb(btns))
+
+
+@router.callback_query(F.data.regexp(r"^nrmr:\d+$"))
+async def adm_norm_reset(cb: CallbackQuery):
+    if not await _guard(cb):
+        return
+    uid = int(cb.data.split(":")[1])
+    await q("UPDATE norm_warns SET active=FALSE WHERE user_id=%s", (uid,))
+    await q("UPDATE norm_state SET alerted=FALSE WHERE user_id=%s", (uid,))
+    await adm_norm_warns(cb)
+
+
+@router.callback_query(F.data == "nrmh")
+async def adm_norm_hist(cb: CallbackQuery):
+    if not await _guard(cb):
+        return
+    rows = await q("SELECT day, finders, required, found, met FROM norm_days ORDER BY day DESC LIMIT 14", many=True)
+    lines = ["📅 <b>История норматива</b> (последние дни)\n"]
+    if not rows:
+        lines.append("Итогов пока нет — первый подводится после закрытия приёма в первый день.")
+    for dd, fn, rq, fd, met in rows or []:
+        lines.append(f"{'✅' if met else '❌'} {dd.strftime('%d.%m')} — найдено {fd} из {rq} · искателей {fn}")
+    wr = await q("SELECT COUNT(*) FROM norm_warns WHERE ts>now()-interval '7 days'", one=True)
+    lines.append(f"\nПредупреждений за 7 дней: {wr[0]}")
+    await _edit(cb, "\n".join(lines), _ikb([[InlineKeyboardButton(text="🔙 К таблице", callback_data="adm_norm")]]))
+
+
+@router.callback_query(F.data == "nrme")
+async def adm_norm_exc(cb: CallbackQuery):
+    if not await _guard(cb):
+        return
+    rows = await q("SELECT user_id, from_day, to_day, reason, status FROM norm_excuse WHERE status IN ('ok','pending') AND to_day>=%s ORDER BY id DESC LIMIT 20", (today_msk(),), many=True)
+    lines = ["🏖 <b>Отгулы от норматива</b>\n"]
+    if not rows:
+        lines.append("Активных отгулов и заявок нет.")
+    for u, f, t, r, st in rows or []:
+        lines.append(f"{'✅' if st == 'ok' else '🕓'} {await _nm(u)} — {_fmt(f)}–{_fmt(t)} · {html.escape(r or '')}" + ("" if st == "ok" else " (ждёт решения)"))
+    lines.append("\nВыдать отгул вручную: <code>/normadmin excuse UID дней причина</code>")
+    await _edit(cb, "\n".join(lines), _ikb([[InlineKeyboardButton(text="🔙 К таблице", callback_data="adm_norm")]]))
+
+
+async def _settings_view():
+    on = (await cfg("enabled")) == "1"
+    pct = await cfg("percent")
+    a, b = await window()
+    text = ("⚙️ <b>Настройки норматива</b>\n\n"
+            f"Состояние: {'🟢 включён' if on else '🔴 выключен'}\nОбщая норма: <b>{pct}%</b> от числа искателей (округление вверх)\n"
+            f"Приём секреток: <b>{a:02d}:00–{b:02d}:00 МСК</b>\nСтарт: {(await _start()).strftime('%d.%m.%Y')}\n"
+            f"Вылет при предупреждениях: {await cfg('max_warns')}")
+    rows = [[InlineKeyboardButton(text="🔴 Выключить" if on else "🟢 Включить", callback_data="nrmt:enabled:" + ("0" if on else "1"))],
+            [InlineKeyboardButton(text=("• " if str(v) == pct else "") + f"{v}%", callback_data=f"nrmt:percent:{v}") for v in (40, 50, 60, 70, 80)],
+            [InlineKeyboardButton(text=("• " if v == a else "") + f"с {v:02d}:00", callback_data=f"nrmt:win_from:{v}") for v in (0, 6, 8, 10)],
+            [InlineKeyboardButton(text=("• " if v == b else "") + f"до {v:02d}:00", callback_data=f"nrmt:win_to:{v}") for v in (22, 23, 24)],
+            [InlineKeyboardButton(text=("• " if int(await cfg("max_warns")) == v else "") + f"{v} предупр.", callback_data=f"nrmt:max_warns:{v}") for v in (2, 3, 4, 5)],
+            [InlineKeyboardButton(text="🔙 К таблице", callback_data="adm_norm")]]
+    return text, _ikb(rows)
+
+
+@router.callback_query(F.data == "nrms")
+async def adm_norm_settings(cb: CallbackQuery):
+    if not await _guard(cb):
+        return
+    text, kb = await _settings_view()
+    await _edit(cb, text, kb)
+
+
+@router.callback_query(F.data.regexp(r"^nrmt:(enabled|percent|win_from|win_to|max_warns):\d+$"))
+async def adm_norm_set(cb: CallbackQuery):
+    if not await _guard(cb):
+        return
+    _, key, val = cb.data.split(":")
+    v = int(val)
+    a, b = await window()
+    if key == "win_from" and v >= b:
+        return await cb.answer("Начало должно быть раньше конца", show_alert=True)
+    if key == "win_to" and v <= a:
+        return await cb.answer("Конец должен быть позже начала", show_alert=True)
+    await set_cfg(key, v)
+    text, kb = await _settings_view()
+    await _edit(cb, text, kb)
 
 
 # ---------------------------------------------------------------- подключение

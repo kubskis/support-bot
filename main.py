@@ -3936,6 +3936,7 @@ async def admin_panel_kb():
          IB(text="👥 Статистика хелперов", callback_data="adm_list_stats")],
         [IB(text="📝 Наборы и друзья", callback_data="adm_recruit")],
         [IB(text="🔮 Секретки", callback_data="adm_secret_panel")],
+        [IB(text="📋 Норматив секреток", callback_data="adm_norm")],
         [IB(text="📈 Аналитика канала", callback_data="adm_chan_stats")],
         [IB(text="💎 Платные услуги (Stars)", callback_data="shopa_menu")],
         [IB(text="👥 Рефералка", callback_data="refa_menu")],
