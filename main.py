@@ -273,12 +273,20 @@ _VS16 = "\ufe0f"
 _ID_GLYPH = {}
 for _k, _v in EMOJI_IDS.items():
     _ID_GLYPH.setdefault(_v, _k)
-_EMOJI_ALT = "|".join(
-    "".join(re.escape(_ch) + _VS16 + "?" for _ch in _k)
-    for _k in sorted(EMOJI_IDS, key=len, reverse=True)
-)
-_EMOJI_RE = re.compile(_EMOJI_ALT)
-_LEAD_EMOJI_RE = re.compile(r"^\s*(" + _EMOJI_ALT + r")\s*")
+
+
+def _build_emoji_regex():
+    """Собирает регулярки по текущему реестру (вызывается при старте и после подключения пака с новыми эмодзи)."""
+    global _EMOJI_ALT, _EMOJI_RE, _LEAD_EMOJI_RE
+    _EMOJI_ALT = "|".join(
+        "".join(re.escape(_ch) + _VS16 + "?" for _ch in _k)
+        for _k in sorted(EMOJI_IDS, key=len, reverse=True)
+    )
+    _EMOJI_RE = re.compile(_EMOJI_ALT)
+    _LEAD_EMOJI_RE = re.compile(r"^\s*(" + _EMOJI_ALT + r")\s*")
+
+
+_build_emoji_regex()
 _PROTECTED_RE = re.compile(
     r"<tg-emoji\b[^>]*>.*?</tg-emoji>|<(code|pre)\b[^>]*>.*?</\1>|<[^>]+>", re.DOTALL
 )
@@ -389,6 +397,30 @@ def KB(text: str, **kw) -> KeyboardButton:
     return KeyboardButton(text=text, **kw)
 
 
+def _iconize_markup(markup):
+    """Всем inline-кнопкам с эмодзи в начале текста ставит тгп-иконку, даже если кнопку создали обычным InlineKeyboardButton
+    (так не нужно помнить про IB() в каждом новом разделе)."""
+    rows = getattr(markup, "inline_keyboard", None)
+    if not rows:
+        return markup
+    changed, out = False, []
+    for row in rows:
+        nr = []
+        for b in row:
+            t = getattr(b, "text", None)
+            if isinstance(t, str) and not getattr(b, "icon_custom_emoji_id", None):
+                emo, rest = _split_lead_emoji(t)
+                if emo and rest:
+                    data = b.model_dump(exclude_none=True)
+                    data["text"] = rest
+                    data["icon_custom_emoji_id"] = EMOJI_IDS[_emoji_key(emo)]
+                    b = type(b)(**data)
+                    changed = True
+            nr.append(b)
+        out.append(nr)
+    return markup.model_copy(update={"inline_keyboard": out}) if changed else markup
+
+
 def _btn_has_icon(b) -> bool:
     return bool(getattr(b, "icon_custom_emoji_id", None))
 
@@ -495,6 +527,10 @@ def _convert_request(method, plain: bool = False):
     markup = getattr(method, "reply_markup", None)
     if markup is not None and (plain or not BUTTON_ICONS_ON) and _markup_has_icons(markup):
         upd["reply_markup"] = _strip_icons(markup)
+    elif markup is not None and BUTTON_ICONS_ON and not plain:
+        new_markup = _iconize_markup(markup)
+        if new_markup is not markup:
+            upd["reply_markup"] = new_markup
     return (method.model_copy(update=upd) if upd else method), used_text
 
 
@@ -14682,13 +14718,22 @@ def _remap_emoji_ids(text: str) -> str:
     return _EMOJI_ID_ATTR_RE.sub(lambda m: f"emoji-id={m.group(1)}{EMOJI_REMAP.get(m.group(2), m.group(2))}{m.group(1)}", text)
 
 
+def _reset_pack_ids():
+    """Возвращает реестр к исходному (без эмодзи, добавленных паком)."""
+    for k in list(EMOJI_IDS):
+        if k in EMOJI_IDS_ORIG:
+            EMOJI_IDS[k] = EMOJI_IDS_ORIG[k]
+        else:
+            EMOJI_IDS.pop(k, None)
+
+
 def _apply_pack_ids(glyph_ids: dict):
-    """glyph_ids: {эмодзи: custom_emoji_id нашего пака}. Подменяет ID в реестре и в готовых тегах."""
+    """glyph_ids: {эмодзи: custom_emoji_id нашего пака}. Подменяет ID в реестре и в готовых тегах.
+    Эмодзи, которых не было в исходном реестре (новые иконки пака), добавляются в реестр: их тоже заменяет автозамена."""
     global STARS_CUR_ID
     STARS_CUR_ID = glyph_ids.get("🌠")
     EMOJI_REMAP.clear()
-    for k in list(EMOJI_IDS):
-        EMOJI_IDS[k] = EMOJI_IDS_ORIG[k]
+    _reset_pack_ids()
     by_norm = {_norm_emoji(g): i for g, i in glyph_ids.items()}
     for k, old in EMOJI_IDS_ORIG.items():
         new = by_norm.get(_norm_emoji(k))
@@ -14696,14 +14741,22 @@ def _apply_pack_ids(glyph_ids: dict):
             EMOJI_IDS[k] = new
             _ID_GLYPH.setdefault(new, k)
             EMOJI_REMAP.setdefault(old, new)
+    known = {_norm_emoji(k) for k in EMOJI_IDS_ORIG}
+    for g, i in glyph_ids.items():
+        n = _norm_emoji(g)
+        if n in known or n == "🌠" or n.endswith("\u20e3"):      # цифры в рамке и звезда-валюта ставятся отдельно
+            continue
+        EMOJI_IDS[n] = i
+        _ID_GLYPH.setdefault(i, n)
+    _build_emoji_regex()
 
 
 def _clear_pack_ids():
     global STARS_CUR_ID
     STARS_CUR_ID = None
     EMOJI_REMAP.clear()
-    for k in list(EMOJI_IDS):
-        EMOJI_IDS[k] = EMOJI_IDS_ORIG[k]
+    _reset_pack_ids()
+    _build_emoji_regex()
 
 
 async def _pack_effective_ids() -> dict:
