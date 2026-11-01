@@ -75,6 +75,7 @@ async def q(sql, args=(), one=False, many=False):
 
 async def init_tables():
     await q(_DDL)
+    await q("UPDATE norm_excuse SET status='no' WHERE status='pending' AND ts < now() - interval '2 days'")
 
 
 async def cfg(key):
@@ -428,7 +429,7 @@ async def cmd_norm(message: Message):
     n = await active_warns(uid)
     limit = int(await cfg("max_warns"))
     ex = await q(f"SELECT {_END_EFF}, reason FROM norm_excuse WHERE user_id=%s AND status='ok' AND {_END_EFF} > now() ORDER BY {_END_EFF} DESC LIMIT 1", (uid,), one=True)
-    pend = await q("SELECT 1 FROM norm_excuse WHERE user_id=%s AND status='pending'", (uid,), one=True)
+    pend = await q("SELECT 1 FROM norm_excuse WHERE user_id=%s AND status='pending' AND ts > now() - interval '2 days'", (uid,), one=True)
     lines = [f"📋 <b>Норматив секреток · {_fmt(d)}</b>", f"Приём секреток: {await window_label()}"]
     if d < start:
         lines.append(f"Начнётся с {start.strftime('%d.%m.%Y')}.")
@@ -516,6 +517,7 @@ async def cb_days(cb: CallbackQuery):
         return await cb.answer("Нет доступа", show_alert=True)
     t0 = datetime.now(MSK)
     t1 = t0 + timedelta(days=n)
+    await q("UPDATE norm_excuse SET status='no' WHERE user_id=%s AND status='pending'", (uid,))
     rid = (await q("INSERT INTO norm_excuse(user_id,from_ts,to_ts,reason) VALUES(%s,%s,%s,%s) RETURNING id", (uid, t0, t1, REASONS[kind]), one=True))[0]
     await cb.message.edit_text(f"🕓 Заявка на отгул ({n} дн.) отправлена главным админам.")
     kb = _kb([[InlineKeyboardButton(text="✅ Одобрить", callback_data=f"nrm:ok:{rid}"), InlineKeyboardButton(text="❌ Отклонить", callback_data=f"nrm:no:{rid}")]])
@@ -832,8 +834,18 @@ async def adm_norm_exc(cb: CallbackQuery, state: FSMContext = None):
         lines.append(f"{'✅' if st == 'ok' else '🕓'} {await _nm(u)} — до {fmt_dt(min(t, ended or t))} · {tail} · {html.escape(r or '')}")
         if st == "ok":
             btns.append([InlineKeyboardButton(text=f"⏹ Завершить: {(await _nm(u))[:26]}", callback_data=f"nrmx:{eid}")])
+        else:
+            btns.append([InlineKeyboardButton(text=f"🗑 Убрать заявку: {(await _nm(u))[:22]}", callback_data=f"nrmz:{eid}")])
     btns.append([InlineKeyboardButton(text="🔙 К таблице", callback_data="adm_norm")])
     await _edit(cb, "\n".join(lines), _ikb(btns))
+
+
+@router.callback_query(F.data.regexp(r"^nrmz:\d+$"))
+async def adm_norm_drop(cb: CallbackQuery, state: FSMContext = None):
+    if not await _guard(cb):
+        return
+    await q("UPDATE norm_excuse SET status='no', decided_by=%s WHERE id=%s AND status='pending'", (cb.from_user.id, int(cb.data.split(":")[1])))
+    await adm_norm_exc(cb, state)
 
 
 @router.callback_query(F.data.regexp(r"^nrmx:\d+$"))
