@@ -14,6 +14,7 @@ import asyncio
 import html
 import logging
 import math
+import os
 import re
 from datetime import date, datetime, timedelta, timezone
 
@@ -202,6 +203,27 @@ async def add_warn(uid, d, kind, note, by=None):
     return n
 
 
+async def _dm_main_admins(text, kb=None):
+    """Дублирует важное сообщение в личку владельцу и всем главным админам."""
+    ids = set()
+    try:
+        owner = int(os.getenv("ADMIN_ID", "0"))
+        if owner:
+            ids.add(owner)
+    except Exception:
+        pass
+    try:
+        for r in (await q("SELECT admin_id FROM main_admins", many=True) or []):
+            ids.add(int(r[0]))
+    except Exception as e:
+        log.warning("main_admins: %s", e)
+    for i in ids:
+        try:
+            await _bot.send_message(i, text, parse_mode="HTML", reply_markup=kb)
+        except Exception as e:
+            log.info("лс главному админу %s не доставлено: %s", i, e)
+
+
 async def _alert_limit(uid, n):
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="🚪 Вылет", callback_data=f"nrm:out:{uid}"),
@@ -212,6 +234,7 @@ async def _alert_limit(uid, n):
             parse_mode="HTML", reply_markup=kb, message_thread_id=_topic)
     except Exception as e:
         log.warning("alert: %s", e)
+    await _dm_main_admins(f"🚨 <b>{n} предупреждения по нормативу</b> у {await _mention(uid)} (<code>{uid}</code>).\nРешение:", kb)
 
 
 # ---------------------------------------------------------------- итог дня
@@ -432,6 +455,8 @@ async def cb_days(cb: CallbackQuery):
                                 f"С {fmt_dt(t0)} по {fmt_dt(t1)} МСК ({n} дн.)", parse_mode="HTML", reply_markup=kb, message_thread_id=_topic)
     except Exception as e:
         log.warning("заявка: %s", e)
+    await _dm_main_admins(f"🏖 <b>Заявка на отгул от норматива</b>\n{await _mention(uid)}: {html.escape(REASONS[kind])}\n"
+                          f"С {fmt_dt(t0)} по {fmt_dt(t1)} МСК ({n} дн.)", kb)
     await cb.answer()
 
 
