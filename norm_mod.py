@@ -14,10 +14,13 @@ import asyncio
 import html
 import logging
 import math
+import re
 from datetime import date, datetime, timedelta, timezone
 
 from aiogram import F, Router
 from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 log = logging.getLogger("norm")
@@ -32,7 +35,7 @@ _mention = None
 _admin_chat = None
 _topic = None
 
-DEFAULTS = {"enabled": "1", "percent": "60", "start": "2026-11-02", "max_warns": "3", "win_from": "6", "win_to": "23"}
+DEFAULTS = {"enabled": "1", "percent": "60", "start": "2026-11-02", "max_warns": "5", "win_from": "6", "win_to": "23"}
 REASONS = {"sick": "🤒 Болезнь / плохое самочувствие", "vip": "🔑 Нет випки (до 7 дней)", "trip": "✈️ Поездка / нет интернета"}
 
 _DDL = """
@@ -43,6 +46,10 @@ CREATE TABLE IF NOT EXISTS norm_warns(id SERIAL PRIMARY KEY, user_id BIGINT, day
 CREATE INDEX IF NOT EXISTS norm_warns_u ON norm_warns(user_id, active);
 CREATE TABLE IF NOT EXISTS norm_excuse(id SERIAL PRIMARY KEY, user_id BIGINT, from_day DATE, to_day DATE, reason TEXT,
                                        status TEXT DEFAULT 'pending', decided_by BIGINT, ts TIMESTAMPTZ DEFAULT now());
+ALTER TABLE norm_excuse ADD COLUMN IF NOT EXISTS from_ts TIMESTAMPTZ;
+ALTER TABLE norm_excuse ADD COLUMN IF NOT EXISTS to_ts TIMESTAMPTZ;
+ALTER TABLE norm_excuse ADD COLUMN IF NOT EXISTS ended_at TIMESTAMPTZ;
+UPDATE norm_excuse SET from_ts=(from_day::timestamp AT TIME ZONE 'Europe/Moscow'), to_ts=((to_day+1)::timestamp AT TIME ZONE 'Europe/Moscow') WHERE from_ts IS NULL AND from_day IS NOT NULL;
 CREATE TABLE IF NOT EXISTS norm_state(user_id BIGINT PRIMARY KEY, since DATE, alerted BOOLEAN DEFAULT FALSE);
 CREATE TABLE IF NOT EXISTS norm_flags(key TEXT PRIMARY KEY);
 """
@@ -127,9 +134,28 @@ async def finds_on(d: date) -> dict:
     return {u: int(n) for u, n in (rows or [])}
 
 
+_END_EFF = "LEAST(to_ts, COALESCE(ended_at, to_ts))"
+
+
 async def excused_on(d: date) -> set:
-    rows = await q("SELECT DISTINCT user_id FROM norm_excuse WHERE status='ok' AND from_day<=%s AND to_day>=%s", (d, d), many=True)
+    """День — отгул, если отгул покрывает не меньше половины времени приёма секреток в этот день."""
+    a, b = await window()
+    ws = datetime(d.year, d.month, d.day, tzinfo=MSK) + timedelta(hours=a)
+    we = datetime(d.year, d.month, d.day, tzinfo=MSK) + timedelta(hours=b)
+    half = (we - ws).total_seconds() / 2
+    rows = await q(f"""SELECT DISTINCT user_id FROM norm_excuse WHERE status='ok' AND from_ts IS NOT NULL
+                       AND EXTRACT(EPOCH FROM (LEAST({_END_EFF}, %s) - GREATEST(from_ts, %s))) >= %s""", (we, ws, half), many=True)
     return {r[0] for r in (rows or [])}
+
+
+def fmt_dt(dt_) -> str:
+    return dt_.astimezone(MSK).strftime("%d.%m.%Y %H:%M")
+
+
+def fmt_hours(h: float) -> str:
+    if h >= 48:
+        return f"{h / 24:g} дн. ({h:g} ч)"
+    return f"{h:g} ч"
 
 
 async def sync_state():
@@ -213,7 +239,7 @@ async def process_day(d: date):
             cnt = (await q(f"SELECT COUNT(*) FROM secret_posts WHERE user_id=%s AND {_LOC}::date BETWEEN %s AND %s AND {_WIN_SQL}", (u, d0, d, wa, wb), one=True))[0]
             if cnt:
                 continue
-            if await q("SELECT 1 FROM norm_excuse WHERE user_id=%s AND status='ok' AND from_day<=%s AND to_day>=%s", (u, d, d0), one=True):
+            if any(u in await excused_on(d0 + timedelta(days=i)) for i in range(3)):
                 continue
             if await q("SELECT 1 FROM norm_warns WHERE user_id=%s AND day BETWEEN %s AND %s AND kind IN ('day','streak')", (u, d0, d), one=True):
                 continue
@@ -301,7 +327,7 @@ async def _streak_days(uid) -> int:
         wa, wb = await window()
         if await q(f"SELECT 1 FROM secret_posts WHERE user_id=%s AND {_LOC}::date=%s AND {_WIN_SQL}", (uid, d, wa, wb), one=True):
             break
-        if await q("SELECT 1 FROM norm_excuse WHERE user_id=%s AND status='ok' AND from_day<=%s AND to_day>=%s", (uid, d, d), one=True):
+        if uid in await excused_on(d):
             break
         n += 1
         d -= timedelta(days=1)
@@ -324,7 +350,7 @@ async def cmd_norm(message: Message):
     mine = finds.get(uid, 0)
     n = await active_warns(uid)
     limit = int(await cfg("max_warns"))
-    ex = await q("SELECT to_day, reason FROM norm_excuse WHERE user_id=%s AND status='ok' AND to_day>=%s ORDER BY to_day DESC LIMIT 1", (uid, d), one=True)
+    ex = await q(f"SELECT {_END_EFF}, reason FROM norm_excuse WHERE user_id=%s AND status='ok' AND {_END_EFF} > now() ORDER BY {_END_EFF} DESC LIMIT 1", (uid,), one=True)
     pend = await q("SELECT 1 FROM norm_excuse WHERE user_id=%s AND status='pending'", (uid,), one=True)
     lines = [f"📋 <b>Норматив секреток · {_fmt(d)}</b>", f"Приём секреток: {await window_label()}"]
     if d < start:
@@ -336,7 +362,7 @@ async def cmd_norm(message: Message):
         f"Дней без секреток подряд: {await _streak_days(uid)}",
     ]
     if ex:
-        lines.append(f"🏖 Отгул до {ex[0].strftime('%d.%m')} ({html.escape(ex[1] or '')})")
+        lines.append(f"🏖 Отгул до {fmt_dt(ex[0])} МСК ({html.escape(ex[1] or '')})")
     elif pend:
         lines.append("🕓 Заявка на отгул ждёт решения админов.")
     lines.append("\nОтгул: /otgul · таблица стаффа: /normtop")
@@ -393,15 +419,17 @@ async def cb_days(cb: CallbackQuery):
     n = int(n)
     if kind == "vip":
         n = min(n, 7)
-    uid, d = cb.from_user.id, today_msk()
+    uid = cb.from_user.id
     if not await _allowed(uid):
         return await cb.answer("Нет доступа", show_alert=True)
-    rid = (await q("INSERT INTO norm_excuse(user_id,from_day,to_day,reason) VALUES(%s,%s,%s,%s) RETURNING id", (uid, d, d + timedelta(days=n - 1), REASONS[kind]), one=True))[0]
+    t0 = datetime.now(MSK)
+    t1 = t0 + timedelta(days=n)
+    rid = (await q("INSERT INTO norm_excuse(user_id,from_ts,to_ts,reason) VALUES(%s,%s,%s,%s) RETURNING id", (uid, t0, t1, REASONS[kind]), one=True))[0]
     await cb.message.edit_text(f"🕓 Заявка на отгул ({n} дн.) отправлена главным админам.")
     kb = _kb([[InlineKeyboardButton(text="✅ Одобрить", callback_data=f"nrm:ok:{rid}"), InlineKeyboardButton(text="❌ Отклонить", callback_data=f"nrm:no:{rid}")]])
     try:
         await _bot.send_message(_admin_chat, f"🏖 <b>Заявка на отгул от норматива</b>\n{await _mention(uid)}: {html.escape(REASONS[kind])}\n"
-                                f"С {_fmt(d)} по {_fmt(d + timedelta(days=n - 1))} ({n} дн.)", parse_mode="HTML", reply_markup=kb, message_thread_id=_topic)
+                                f"С {fmt_dt(t0)} по {fmt_dt(t1)} МСК ({n} дн.)", parse_mode="HTML", reply_markup=kb, message_thread_id=_topic)
     except Exception as e:
         log.warning("заявка: %s", e)
     await cb.answer()
@@ -413,13 +441,13 @@ async def cb_decide(cb: CallbackQuery):
         return await cb.answer("Только главные админы", show_alert=True)
     _, act, rid = cb.data.split(":")
     ok = act == "ok"
-    r = await q("UPDATE norm_excuse SET status=%s, decided_by=%s WHERE id=%s AND status='pending' RETURNING user_id, from_day, to_day",
+    r = await q("UPDATE norm_excuse SET status=%s, decided_by=%s WHERE id=%s AND status='pending' RETURNING user_id, from_ts, to_ts",
                 ("ok" if ok else "no", cb.from_user.id, int(rid)), one=True)
     if not r:
         return await cb.answer("Уже решено")
     await cb.message.edit_text(cb.message.html_text + f"\n\n{'✅ Одобрено' if ok else '❌ Отклонено'}: {html.escape(cb.from_user.full_name)}", parse_mode="HTML")
     try:
-        await _bot.send_message(r[0], f"{'✅ Отгул одобрен' if ok else '❌ Отгул отклонён'} ({_fmt(r[1])}–{_fmt(r[2])}).")
+        await _bot.send_message(r[0], f"{'✅ Отгул одобрен' if ok else '❌ Отгул отклонён'} ({fmt_dt(r[1])} — {fmt_dt(r[2])} МСК).")
     except Exception:
         pass
     await cb.answer()
@@ -451,7 +479,7 @@ async def cmd_admin(message: Message):
     a = (message.text or "").split()[1:]
     help_ = ("<b>/normadmin</b>\n<code>on</code> / <code>off</code> — включить/выключить\n<code>percent 60</code> — процент общей нормы\n"
              "<code>start 2026-11-02</code> — день старта\n<code>warn UID +1</code> / <code>warn UID -1</code> — вручную\n"
-             "<code>reset UID</code> — сбросить предупреждения\n<code>excuse UID дней [причина]</code> — выдать отгул\n"
+             "<code>reset UID</code> — сбросить предупреждения\n<code>excuse UID ЧАСОВ [причина]</code> — выдать отгул\n"
              "<code>run</code> — пересчитать прошедшие дни\n<code>status</code> — настройки")
     if not a:
         return await message.answer(help_, parse_mode="HTML")
@@ -482,17 +510,46 @@ async def cmd_admin(message: Message):
         await q("UPDATE norm_warns SET active=FALSE WHERE user_id=%s", (int(a[1]),))
         await q("UPDATE norm_state SET alerted=FALSE WHERE user_id=%s", (int(a[1]),))
         return await message.answer("Предупреждения сброшены.")
-    if c == "excuse" and len(a) > 2 and a[1].isdigit() and a[2].isdigit():
-        d = today_msk()
-        await q("INSERT INTO norm_excuse(user_id,from_day,to_day,reason,status,decided_by) VALUES(%s,%s,%s,%s,'ok',%s)",
-                (int(a[1]), d, d + timedelta(days=int(a[2]) - 1), " ".join(a[3:])[:100] or "по решению админа", message.from_user.id))
-        return await message.answer(f"Отгул выдан: {a[2]} дн.")
+    if c == "excuse" and len(a) > 2 and a[1].isdigit():
+        hours = parse_hours(a[2])
+        if not hours:
+            return await message.answer("Формат: /normadmin excuse UID ЧАСОВ [причина], например 720 или 24*30")
+        t1 = await grant_excuse(int(a[1]), hours, " ".join(a[3:]), message.from_user.id)
+        return await message.answer(f"Отгул выдан на {fmt_hours(hours)}, до {fmt_dt(t1)} МСК.")
     if c == "run":
         await process_pending()
         return await message.answer("Пересчитано.")
     if c == "status":
         return await message.answer(f"Включён: {await cfg('enabled')}\nПроцент: {await cfg('percent')}\nСтарт: {await cfg('start')}\nЛимит предупреждений: {await cfg('max_warns')}\nИскателей: {len(await finders())}")
     await message.answer(help_, parse_mode="HTML")
+
+
+def parse_hours(text) -> float:
+    """«720», «1,5», «24*30» → число часов (0, если не разобрали). Допустимы только цифры и + - * / ( )."""
+    t = (text or "").strip().replace(",", ".").replace("×", "*").replace("х", "*").replace("x", "*")
+    if not t or "**" in t or "//" in t or not re.fullmatch(r"[0-9+\-*/(). ]{1,40}", t):
+        return 0
+    try:
+        v = float(eval(t, {"__builtins__": {}}, {}))   # noqa: S307 — строка уже ограничена цифрами и знаками арифметики
+    except Exception:
+        return 0
+    return v if 0 < v <= 24 * 366 else 0
+
+
+async def grant_excuse(uid, hours, reason, by) -> datetime:
+    t0 = datetime.now(MSK)
+    t1 = t0 + timedelta(hours=hours)
+    await q("INSERT INTO norm_excuse(user_id,from_ts,to_ts,reason,status,decided_by) VALUES(%s,%s,%s,%s,'ok',%s)",
+            (uid, t0, t1, (reason or "").strip()[:100] or "по решению админа", by))
+    try:
+        await _bot.send_message(uid, f"🏖 Вам выдан отгул от норматива на {fmt_hours(hours)} (до {fmt_dt(t1)} МСК).")
+    except Exception:
+        pass
+    return t1
+
+
+class NormStates(StatesGroup):
+    hours = State()
 
 
 # ---------------------------------------------------------------- раздел админ-панели
@@ -665,17 +722,90 @@ async def adm_norm_hist(cb: CallbackQuery):
 
 
 @router.callback_query(F.data == "nrme")
-async def adm_norm_exc(cb: CallbackQuery):
+async def adm_norm_exc(cb: CallbackQuery, state: FSMContext = None):
     if not await _guard(cb):
         return
-    rows = await q("SELECT user_id, from_day, to_day, reason, status FROM norm_excuse WHERE status IN ('ok','pending') AND to_day>=%s ORDER BY id DESC LIMIT 20", (today_msk(),), many=True)
+    if state:
+        await state.clear()
+    rows = await q(f"""SELECT id, user_id, from_ts, to_ts, ended_at, reason, status FROM norm_excuse
+                       WHERE status IN ('ok','pending') AND from_ts IS NOT NULL AND ({_END_EFF} > now() OR status='pending')
+                       ORDER BY id DESC LIMIT 20""", many=True)
     lines = ["🏖 <b>Отгулы от норматива</b>\n"]
+    btns = [[InlineKeyboardButton(text="➕ Выдать отгул", callback_data="nrmg")]]
     if not rows:
         lines.append("Активных отгулов и заявок нет.")
-    for u, f, t, r, st in rows or []:
-        lines.append(f"{'✅' if st == 'ok' else '🕓'} {await _nm(u)} — {_fmt(f)}–{_fmt(t)} · {html.escape(r or '')}" + ("" if st == "ok" else " (ждёт решения)"))
-    lines.append("\nВыдать отгул вручную: <code>/normadmin excuse UID дней причина</code>")
-    await _edit(cb, "\n".join(lines), _ikb([[InlineKeyboardButton(text="🔙 К таблице", callback_data="adm_norm")]]))
+    now = datetime.now(MSK)
+    for eid, u, f, t, ended, r, st in rows or []:
+        left = (min(t, ended or t) - now).total_seconds() / 3600
+        tail = f"осталось {fmt_hours(round(left, 1))}" if st == "ok" else "ждёт решения"
+        lines.append(f"{'✅' if st == 'ok' else '🕓'} {await _nm(u)} — до {fmt_dt(min(t, ended or t))} · {tail} · {html.escape(r or '')}")
+        if st == "ok":
+            btns.append([InlineKeyboardButton(text=f"⏹ Завершить: {(await _nm(u))[:26]}", callback_data=f"nrmx:{eid}")])
+    btns.append([InlineKeyboardButton(text="🔙 К таблице", callback_data="adm_norm")])
+    await _edit(cb, "\n".join(lines), _ikb(btns))
+
+
+@router.callback_query(F.data.regexp(r"^nrmx:\d+$"))
+async def adm_norm_end(cb: CallbackQuery, state: FSMContext = None):
+    if not await _guard(cb):
+        return
+    r = await q(f"UPDATE norm_excuse SET ended_at=now() WHERE id=%s AND status='ok' AND {_END_EFF} > now() RETURNING user_id", (int(cb.data.split(":")[1]),), one=True)
+    if r:
+        try:
+            await _bot.send_message(r[0], "🏁 Ваш отгул от норматива завершён досрочно. Норма снова учитывается.")
+        except Exception:
+            pass
+    await adm_norm_exc(cb, state)
+
+
+@router.callback_query(F.data == "nrmg")
+async def adm_norm_grant(cb: CallbackQuery, state: FSMContext):
+    if not await _guard(cb):
+        return
+    await state.clear()
+    fs = await finders()
+    btns, line = [], []
+    for u in fs[:40]:
+        line.append(InlineKeyboardButton(text=(await _nm(u))[:22], callback_data=f"nrmu:{u}"))
+        if len(line) == 2:
+            btns.append(line)
+            line = []
+    if line:
+        btns.append(line)
+    btns.append([InlineKeyboardButton(text="🔙 Назад", callback_data="nrme")])
+    await _edit(cb, "➕ <b>Выдать отгул</b>\nВыберите искателя:", _ikb(btns))
+
+
+@router.callback_query(F.data.regexp(r"^nrmu:\d+$"))
+async def adm_norm_pick(cb: CallbackQuery, state: FSMContext):
+    if not await _guard(cb):
+        return
+    uid = int(cb.data.split(":")[1])
+    await state.set_state(NormStates.hours)
+    await state.update_data(uid=uid)
+    await cb.message.answer(f"Отгул для <b>{await _nm(uid)}</b>.\nНапишите <b>количество часов</b> числом (например <code>24</code>, месяц — <code>720</code>) "
+                            "и, если нужно, причину через пробел: <code>72 болеет</code>.\nМожно выражением: <code>24*30</code>.",
+                            parse_mode="HTML", reply_markup=_ikb([[InlineKeyboardButton(text="✖️ Отмена", callback_data="nrme")]]))
+    await cb.answer()
+
+
+@router.message(NormStates.hours, F.chat.type == "private")
+async def adm_norm_hours(message: Message, state: FSMContext):
+    if not await _is_main_admin(message.from_user.id):
+        return
+    txt = (message.text or "").strip()
+    if txt.startswith("/"):
+        await state.clear()
+        return await message.answer("Выдача отгула отменена.")
+    head, _, reason = txt.partition(" ")
+    hours = parse_hours(head)
+    if not hours:
+        return await message.answer("Не понял число часов. Пример: <code>24</code>, <code>720</code> или <code>24*30</code>.", parse_mode="HTML")
+    uid = (await state.get_data()).get("uid")
+    await state.clear()
+    t1 = await grant_excuse(uid, hours, reason, message.from_user.id)
+    await message.answer(f"✅ Отгул выдан: <b>{await _nm(uid)}</b> на {fmt_hours(hours)}, до {fmt_dt(t1)} МСК.\nЗавершить досрочно можно в «🏖 Отгулы».",
+                         parse_mode="HTML", reply_markup=_ikb([[InlineKeyboardButton(text="🏖 К отгулам", callback_data="nrme")]]))
 
 
 async def _settings_view():
@@ -690,7 +820,7 @@ async def _settings_view():
             [InlineKeyboardButton(text=("• " if str(v) == pct else "") + f"{v}%", callback_data=f"nrmt:percent:{v}") for v in (40, 50, 60, 70, 80)],
             [InlineKeyboardButton(text=("• " if v == a else "") + f"с {v:02d}:00", callback_data=f"nrmt:win_from:{v}") for v in (0, 6, 8, 10)],
             [InlineKeyboardButton(text=("• " if v == b else "") + f"до {v:02d}:00", callback_data=f"nrmt:win_to:{v}") for v in (22, 23, 24)],
-            [InlineKeyboardButton(text=("• " if int(await cfg("max_warns")) == v else "") + f"{v} предупр.", callback_data=f"nrmt:max_warns:{v}") for v in (2, 3, 4, 5)],
+            [InlineKeyboardButton(text=("• " if int(await cfg("max_warns")) == v else "") + f"{v} предупр.", callback_data=f"nrmt:max_warns:{v}") for v in (3, 4, 5, 6, 7)],
             [InlineKeyboardButton(text="🔙 К таблице", callback_data="adm_norm")]]
     return text, _ikb(rows)
 
@@ -724,3 +854,9 @@ def setup(dp, bot, get_db, is_main_admin, is_publisher, mention_fn, admin_chat_i
     global _bot, _get_db, _is_main_admin, _is_publisher, _mention, _admin_chat, _topic
     _bot, _get_db, _is_main_admin, _is_publisher, _mention, _admin_chat, _topic = bot, get_db, is_main_admin, is_publisher, mention_fn, admin_chat_id, topic_id
     dp.include_router(router)
+    # наш роутер — первым, чтобы общие обработчики приватных сообщений не перехватывали ввод часов
+    try:
+        dp.sub_routers.remove(router)
+        dp.sub_routers.insert(0, router)
+    except Exception:
+        log.warning("не удалось поднять приоритет роутера норматива")
