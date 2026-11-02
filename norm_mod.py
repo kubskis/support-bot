@@ -351,6 +351,16 @@ async def process_day(d: date):
         log.warning("итог дня: %s", e)
 
 
+async def refresh_days(days):
+    """Пересчитывает итог уже закрытых дней (после ручной выдачи/снятия секреток). Предупреждения уже выданные не трогает."""
+    for d in sorted(set(days)):
+        row = await q("SELECT required FROM norm_days WHERE day=%s", (d,), one=True)
+        if not row:
+            continue
+        total = sum((await finds_on(d)).values())
+        await q("UPDATE norm_days SET found=%s, met=%s WHERE day=%s", (total, total >= row[0], d))
+
+
 async def process_pending():
     start, last = await _start(), await last_closed_day()
     d = start
