@@ -76,38 +76,38 @@ def _profile(rid) -> str:
     return f"https://www.roblox.com/users/{rid}/profile"
 
 
-def _entry_html(i, e) -> str:
+MAX_CHARS = 3900   # лимит Telegram 4096, с запасом
+
+
+def _compact(i, e) -> str:
     _, rid, nick, display, reason, by, by_name, at = e
-    when = at.astimezone(MSK).strftime("%d.%m.%Y")
-    shown = f" ({html.escape(display)})" if display and display != nick else ""
-    return (f"<blockquote><b>{i}.</b> 🔗 <a href=\"{_profile(rid)}\">Профиль Roblox</a> · 👤 <code>{html.escape(nick)}</code>{shown}\n"
-            f"📝 <b>Причина:</b> {html.escape(reason or '—')}\n"
-            f"✍️ <b>Внёс:</b> <a href=\"tg://user?id={by}\">{html.escape(by_name or str(by))[:40]}</a> · {when}</blockquote>")
+    when = at.astimezone(MSK).strftime("%d.%m")
+    rs = html.escape((reason or "—").replace("\n", " "))[:90]
+    who = html.escape(by_name or str(by))[:24]
+    return (f"<b>{i}.</b> <code>{html.escape(nick)}</code> <a href=\"{_profile(rid)}\">🔗</a> — {rs}\n"
+            f"     ✍️ <a href=\"tg://user?id={by}\">{who}</a> · {when}")
 
 
-async def _pages() -> list:
+async def _render() -> str:
+    """Один текст на весь список. Если не влезает в одно сообщение, показываем самые новые записи и пишем, сколько скрыто."""
     rows = await q("SELECT id, roblox_id, nick, display, reason, added_by, added_name, added_at FROM bl_entries WHERE active ORDER BY id", many=True) or []
     now = datetime.now(MSK).strftime("%d.%m %H:%M")
     head = (f"🚫 <b>Чёрный список игроков</b> · записей: <b>{len(rows)}</b>\n"
-            "<i>Нажмите на ник, чтобы скопировать, или откройте профиль по ссылке. Список ведёт бот, вручную его не правьте.</i>")
+            "<i>Ник — копируется по нажатию, 🔗 — профиль Roblox. Список ведёт бот, его не редактируют вручную.</i>\n\n")
+    foot_t = f"\n<i>Обновлено {now} МСК</i>"
     if not rows:
-        return [head + "\n\n<i>Пока пусто.</i>\n\n" + f"<i>Обновлено {now} МСК</i>"]
-    pages, cur, size = [], [], 0
-    for n, e in enumerate(rows, 1):
-        block = _entry_html(n, e)
-        if cur and (len(cur) >= PAGE_ENTRIES or size + len(block) > PAGE_CHARS):
-            pages.append(cur)
-            cur, size = [], 0
-        cur.append(block)
-        size += len(block)
-    if cur:
-        pages.append(cur)
-    out = []
-    for i, blocks in enumerate(pages, 1):
-        title = head if i == 1 else f"🚫 <b>Чёрный список</b> · продолжение ({i}/{len(pages)})"
-        foot = f"\n\n<i>Обновлено {now} МСК" + (f" · страница {i}/{len(pages)}" if len(pages) > 1 else "") + "</i>"
-        out.append(title + "\n\n" + "\n".join(blocks) + foot)
-    return out
+        return head + "<i>Пока пусто.</i>" + foot_t
+    blocks = [_compact(n, e) for n, e in enumerate(rows, 1)]
+    keep, size = [], len(head) + len(foot_t) + 80
+    for blk in reversed(blocks):
+        if size + len(blk) + 2 > MAX_CHARS:
+            break
+        keep.append(blk)
+        size += len(blk) + 2
+    keep.reverse()
+    hidden = len(blocks) - len(keep)
+    note = (f"\n<i>Скрыто старых записей: {hidden}. В одном сообщении Telegram вмещает около {len(keep)} строк.</i>" if hidden else "")
+    return head + "\n\n".join(keep) + note + foot_t
 
 
 def _lp():
@@ -115,46 +115,51 @@ def _lp():
 
 
 async def rebuild():
-    """Приводит сообщения в обеих темах к актуальному списку: правит существующие, добавляет и убирает страницы."""
+    """Одно сообщение на тему: правим его. Новое создаём только если старое удалено. Лишние сообщения удаляем."""
     async with _lock:
         try:
-            pages = await _pages()
+            text = await _render()
         except Exception:
-            log.exception("bl pages")
+            log.exception("bl render")
             return
         for topic in _topics:
-            have = {r[0]: r[1] for r in (await q("SELECT idx, message_id FROM bl_msgs WHERE topic_id=%s", (topic,), many=True) or [])}
-            for idx, text in enumerate(pages):
-                mid = have.get(idx)
-                done = False
-                if mid:
-                    try:
-                        await _bot.edit_message_text(text, chat_id=_chat, message_id=mid, parse_mode="HTML", **_lp())
-                        done = True
-                    except Exception as e:
-                        if "not modified" in str(e).lower():
-                            done = True
-                        else:
-                            log.info("bl edit %s/%s: %s", topic, idx, e)
-                if not done:
-                    try:
-                        m = await _bot.send_message(_chat, text, parse_mode="HTML", message_thread_id=topic, **_lp())
-                        await q("INSERT INTO bl_msgs(topic_id,idx,message_id) VALUES(%s,%s,%s) ON CONFLICT(topic_id,idx) DO UPDATE SET message_id=EXCLUDED.message_id", (topic, idx, m.message_id))
-                        if idx == 0:
-                            try:
-                                await _bot.pin_chat_message(_chat, m.message_id, disable_notification=True)
-                            except Exception:
-                                pass
-                    except Exception as e:
-                        log.warning("bl send %s/%s: %s", topic, idx, e)
-            for idx, mid in have.items():
-                if idx >= len(pages):
-                    try:
-                        await _bot.delete_message(_chat, mid)
-                    except Exception:
-                        pass
-                    await q("DELETE FROM bl_msgs WHERE topic_id=%s AND idx=%s", (topic, idx))
+            row = await q("SELECT message_id FROM bl_msgs WHERE topic_id=%s AND idx=0", (topic,), one=True)
+            mid = row[0] if row else None
+            if mid:
+                try:
+                    await _bot.edit_message_text(text, chat_id=_chat, message_id=mid, parse_mode="HTML", **_lp())
+                    await _drop_extra(topic)
+                    continue
+                except Exception as e:
+                    el = str(e).lower()
+                    if "not modified" in el:
+                        await _drop_extra(topic)
+                        continue
+                    if "not found" not in el and "can't be edited" not in el:
+                        log.warning("bl edit %s: %s (повтор позже)", topic, e)
+                        continue                      # временная ошибка: не плодим новое сообщение
+                    log.info("bl: старое сообщение в теме %s не найдено, создаём новое", topic)
+            try:
+                m = await _bot.send_message(_chat, text, parse_mode="HTML", message_thread_id=topic, **_lp())
+                await q("INSERT INTO bl_msgs(topic_id,idx,message_id) VALUES(%s,0,%s) ON CONFLICT(topic_id,idx) DO UPDATE SET message_id=EXCLUDED.message_id", (topic, m.message_id))
+                try:
+                    await _bot.pin_chat_message(_chat, m.message_id, disable_notification=True)
+                except Exception as e:
+                    log.info("bl: закрепить не удалось: %s", e)
+            except Exception as e:
+                log.warning("bl send %s: %s", topic, e)
+            await _drop_extra(topic)
             await asyncio.sleep(0.3)
+
+
+async def _drop_extra(topic):
+    """Удаляет всё, кроме основного сообщения темы (старые страницы из прошлых версий)."""
+    for idx, mid in await q("SELECT idx, message_id FROM bl_msgs WHERE topic_id=%s AND idx<>0", (topic,), many=True) or []:
+        try:
+            await _bot.delete_message(_chat, mid)
+        except Exception:
+            pass
+        await q("DELETE FROM bl_msgs WHERE topic_id=%s AND idx=%s", (topic, idx))
 
 
 # ---------------------------------------------------------------- вспомогательное
