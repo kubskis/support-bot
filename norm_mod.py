@@ -242,6 +242,62 @@ async def _alert_limit(uid, n):
     await _dm_main_admins(f"🚨 <b>{n} предупреждения по нормативу</b> у {await _mention(uid)} (<code>{uid}</code>).\nРешение:", kb)
 
 
+# ---------------------------------------------------------------- рекорды и «секретка дня»
+_EPOCH = date(2020, 1, 1)
+
+
+async def per_user_day(d1: date, d2: date) -> list:
+    """[(user_id, day, n)] — секретки в окне приёма + ручные зачёты, за период."""
+    a, b = await window()
+    rows = await q(f"""SELECT user_id, day, SUM(n) FROM (
+        SELECT user_id, {_LOC}::date AS day, COUNT(*) AS n FROM secret_posts
+          WHERE {_LOC}::date BETWEEN %s AND %s AND {_WIN_SQL} GROUP BY 1,2
+        UNION ALL SELECT user_id, day, COUNT(*) FROM norm_manual WHERE day BETWEEN %s AND %s GROUP BY 1,2) t
+        GROUP BY 1,2""", (d1, d2, a, b, d1, d2), many=True)
+    return [(u, d, int(n)) for u, d, n in (rows or [])]
+
+
+async def best_user_day(before: date):
+    """Лучший день одного искателя до указанной даты (не включая): (n, user_id, day) или None."""
+    rows = await per_user_day(_EPOCH, before - timedelta(days=1))
+    return max(((n, u, d) for u, d, n in rows), default=None)
+
+
+def _top(rows, limit=5):
+    tot = {}
+    for u, _, n in rows:
+        tot[u] = tot.get(u, 0) + n
+    return sorted(tot.items(), key=lambda x: -x[1])[:limit]
+
+
+MEDALS = ["🥇", "🥈", "🥉"]
+
+
+async def _top_lines(rows, limit=5):
+    out = []
+    for i, (u, n) in enumerate(_top(rows, limit)):
+        out.append(f"{MEDALS[i] if i < 3 else '▫️'} {await _mention(u)} — <b>{n}</b>")
+    return out
+
+
+async def day_highlights(d: date) -> list:
+    """Строки для итога дня: секретка дня и рекорды."""
+    rows = [r for r in await per_user_day(d, d) if r[2] > 0]
+    if not rows:
+        return []
+    top_n = max(n for _, _, n in rows)
+    winners = [u for u, _, n in rows if n == top_n]
+    lines = [f"🥇 Искатель дня: {', '.join([await _mention(u) for u in winners])} — <b>{top_n}</b> секр."]
+    prev = await best_user_day(d)
+    if top_n >= 2 and (not prev or top_n > prev[0]):
+        lines.append(f"🏆 <b>Новый рекорд!</b> {top_n} секр. за день у одного искателя" + (f" (прежний — {prev[0]})." if prev else "."))
+    total = sum(n for _, _, n in rows)
+    pt = await q("SELECT MAX(found) FROM norm_days WHERE day<%s", (d,), one=True)
+    if total >= 3 and pt and pt[0] is not None and total > pt[0]:
+        lines.append(f"📈 Рекорд общего числа за день: <b>{total}</b> (было {pt[0]}).")
+    return lines
+
+
 # ---------------------------------------------------------------- итог дня
 async def process_day(d: date):
     if await q("SELECT 1 FROM norm_days WHERE day=%s", (d,), one=True):
@@ -282,6 +338,13 @@ async def process_day(d: date):
         lines.append("⚠️ Предупреждения за 3 дня без секреток: " + ", ".join([await _mention(u) for u in streak_warned]))
     if met and not streak_warned:
         lines.append("Личных предупреждений за день нет.")
+    try:
+        hl = await day_highlights(d)
+        if hl:
+            lines.append("")
+            lines += hl
+    except Exception:
+        log.exception("рекорды дня")
     try:
         await _bot.send_message(_admin_chat, "\n".join(lines), parse_mode="HTML", message_thread_id=_topic)
     except Exception as e:
@@ -443,7 +506,28 @@ async def cmd_norm(message: Message):
         lines.append(f"🏖 Отгул до {fmt_dt(ex[0])} МСК ({html.escape(ex[1] or '')})")
     elif pend:
         lines.append("🕓 Заявка на отгул ждёт решения админов.")
-    lines.append("\nОтгул: /otgul · таблица стаффа: /normtop")
+    lines.append("\nОтгул: /otgul · таблица стаффа: /normtop · рекорды: /normrec")
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+@router.message(Command("normrec"))
+async def cmd_normrec(message: Message):
+    if not await _allowed(message.from_user.id):
+        return
+    t = today_msk()
+    day = await per_user_day(t, t)
+    week = await per_user_day(t - timedelta(days=6), t)
+    month = await per_user_day(t - timedelta(days=29), t)
+    lines = [f"🏆 <b>Рекорды и топ искателей</b> (приём {await window_label()})"]
+    for title, rows in (("Сегодня", day), ("7 дней", week), ("30 дней", month)):
+        tl = await _top_lines(rows)
+        lines.append(f"\n<b>{title}</b>\n" + ("\n".join(tl) if tl else "пока никого"))
+    best = await best_user_day(t + timedelta(days=1))
+    if best:
+        lines.append(f"\n<b>Рекорд одного искателя за день</b>\n{await _mention(best[1])} — <b>{best[0]}</b> ({_fmt(best[2])}.{best[2].year})")
+    bt = await q("SELECT found, day FROM norm_days ORDER BY found DESC, day DESC LIMIT 1", one=True)
+    if bt and bt[0]:
+        lines.append(f"<b>Рекорд общего числа за день (с норматива)</b>\n{bt[0]} ({_fmt(bt[1])}.{bt[1].year})")
     await message.answer("\n".join(lines), parse_mode="HTML")
 
 
