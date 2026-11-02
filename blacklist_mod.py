@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS bl_entries(id SERIAL PRIMARY KEY, roblox_id BIGINT, n
                                       added_by BIGINT, added_name TEXT, added_at TIMESTAMPTZ DEFAULT now(), active BOOLEAN DEFAULT TRUE,
                                       removed_by BIGINT, removed_at TIMESTAMPTZ);
 CREATE TABLE IF NOT EXISTS bl_msgs(topic_id INT, idx INT, message_id BIGINT, PRIMARY KEY(topic_id, idx));
+CREATE TABLE IF NOT EXISTS bl_flags(key TEXT PRIMARY KEY);
 """
 
 _lock = asyncio.Lock()
@@ -301,6 +302,60 @@ async def bl_remove(message: Message, command: CommandObject):
     await message.answer(f"✅ <code>{html.escape(row[1])}</code> убран из чёрного списка.", parse_mode="HTML")
     await rebuild()
 
+
+
+# ---------------------------------------------------------------- разовый импорт стартового списка
+SEED_KEY = "seed_admin_list_2026_11_03"
+SEED = [
+    ("Koshka_Sendy598", None), ("cococola_519", None), ("bogdan60g72", None), ("COLLART08", None),
+    ("fheifehifhiefhi", None), ("skebobik675242", None), ("gdgdg8732", None), ("liplipmaglaplik_9330", None),
+    ("ennoughh", None), ("Alisartywi", None), ("aafkot", None), ("CAXAPOK_88765", None), ("itsmilana8785", None),
+    ("kara_melka70", None), ("art_kott", None), ("melissa_play111", None), ("STITCH3638746", None),
+    ("lol12345lollolll", None), ("zhans54564", None), ("gikap3", "много раз нарушила правила"),
+    ("kisa_perer019", None), ("Milann_x0", None), ("Alimzhan9995", None), ("Eva_ardi29", None),
+    ("aman_ro15", None), ("Zhenya1378", None), ("iriishkaal", None), ("cotik_366", None), ("Vcim76", None),
+    ("ivvyxu085", None), ("CTEPAH_91", None), ("Fedkow24", None), ("Aika_0776", None),
+]
+SEED_DEFAULT_REASON = "ускорили"
+
+
+async def run_seed(owner_id: int):
+    """Один раз добавляет стартовый список от главного админа и присылает отчёт. Повторно не запускается."""
+    try:
+        if await q("SELECT 1 FROM bl_flags WHERE key=%s", (SEED_KEY,), one=True):
+            return
+        added, skipped, bad = [], [], []
+        name = "Главный админ"
+        for nick, reason in SEED:
+            status, got, info = await _lookup(nick)
+            if status != "ok":
+                bad.append(nick if status == "notfound" else f"{nick} (Roblox не ответил)")
+                await asyncio.sleep(0.5)
+                continue
+            if await q("SELECT 1 FROM bl_entries WHERE active AND roblox_id=%s", (info["id"],), one=True):
+                skipped.append(info["name"])
+                continue
+            await q("INSERT INTO bl_entries(roblox_id,nick,display,reason,added_by,added_name) VALUES(%s,%s,%s,%s,%s,%s)",
+                    (info["id"], info["name"], info["displayName"], reason or SEED_DEFAULT_REASON, owner_id, name))
+            added.append(info["name"])
+            await asyncio.sleep(0.5)
+        await q("INSERT INTO bl_flags(key) VALUES(%s) ON CONFLICT DO NOTHING", (SEED_KEY,))
+        await rebuild()
+        txt = (f"🚫 <b>Чёрный список: стартовый импорт</b>\n"
+               f"Добавлено: <b>{len(added)}</b>" + (f", уже были: {len(skipped)}" if skipped else "") +
+               (f"\n⚠️ Не найдены в Roblox: {', '.join(html.escape(x) for x in bad)}" if bad else "") +
+               f"\n\nУдалить запись: <code>/blremove ник</code>. Удалять может главный админ или тот, кто внёс.")
+        for uid in {owner_id}:
+            try:
+                await _bot.send_message(uid, txt, parse_mode="HTML")
+            except Exception as e:
+                log.info("отчёт импорта владельцу не доставлен: %s", e)
+        try:
+            await _bot.send_message(_chat, txt, parse_mode="HTML", message_thread_id=_topics[-1] if _topics else None)
+        except Exception as e:
+            log.info("отчёт импорта в чат: %s", e)
+    except Exception:
+        log.exception("run_seed")
 
 # ---------------------------------------------------------------- подключение
 def setup(dp, bot, get_db, is_publisher, is_main_admin, lookup_roblox, chat_id, topics):

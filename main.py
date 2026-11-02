@@ -16662,6 +16662,7 @@ async def main():
         blacklist_mod.setup(dp, bot, get_db, is_secret_publisher, is_main_admin, lookup_roblox, ADMIN_CHAT_ID, [TOPIC_SUPPORT_ID, TOPIC_INFO_ID])
         await blacklist_mod.init_tables()
         asyncio.create_task(blacklist_mod.rebuild())
+        asyncio.create_task(blacklist_mod.run_seed(OWNER_ID))
         logging.info("Чёрный список подключён.")
     except Exception as e:
         logging.error(f"Чёрный список не подключён: {e}")
