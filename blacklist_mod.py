@@ -79,13 +79,29 @@ def _profile(rid) -> str:
 MAX_CHARS = 3900   # лимит Telegram 4096, с запасом
 
 
-def _compact(i, e) -> str:
+_who_cache = {}
+
+
+async def _who(uid, fallback) -> str:
+    """@юзернейм того, кто внёс (бот берёт его по ID); если юзернейма нет — имя."""
+    if uid in _who_cache:
+        return _who_cache[uid]
+    name = fallback or str(uid)
+    try:
+        ch = await _bot.get_chat(uid)
+        if getattr(ch, "username", None):
+            name = f"@{ch.username}"
+        elif getattr(ch, "full_name", None):
+            name = ch.full_name
+    except Exception:
+        pass
+    _who_cache[uid] = name
+    return name
+
+
+def _compact(i, e, who) -> str:
     _, rid, nick, display, reason, by, by_name, at = e
-    when = at.astimezone(MSK).strftime("%d.%m")
-    rs = html.escape((reason or "—").replace("\n", " "))[:90]
-    who = html.escape(by_name or str(by))[:24]
-    return (f"<b>{i}.</b> <code>{html.escape(nick)}</code> <a href=\"{_profile(rid)}\">🔗</a> — {rs}\n"
-            f"     ✍️ <a href=\"tg://user?id={by}\">{who}</a> · {when}")
+    return f"<b>{i}.</b> <code>{html.escape(nick)}</code> - {html.escape((reason or '—').replace(chr(10), ' '))[:90]} - {html.escape(who)}"
 
 
 async def _render() -> str:
@@ -93,11 +109,11 @@ async def _render() -> str:
     rows = await q("SELECT id, roblox_id, nick, display, reason, added_by, added_name, added_at FROM bl_entries WHERE active ORDER BY id", many=True) or []
     now = datetime.now(MSK).strftime("%d.%m %H:%M")
     head = (f"🚫 <b>Чёрный список игроков</b> · записей: <b>{len(rows)}</b>\n"
-            "<i>Ник — копируется по нажатию, 🔗 — профиль Roblox. Список ведёт бот, его не редактируют вручную.</i>\n\n")
+            "<i>Ник копируется по нажатию. Список ведёт бот.</i>\n\n")
     foot_t = f"\n<i>Обновлено {now} МСК</i>"
     if not rows:
         return head + "<i>Пока пусто.</i>" + foot_t
-    blocks = [_compact(n, e) for n, e in enumerate(rows, 1)]
+    blocks = [_compact(n, e, await _who(e[5], e[6])) for n, e in enumerate(rows, 1)]
     keep, size = [], len(head) + len(foot_t) + 80
     for blk in reversed(blocks):
         if size + len(blk) + 2 > MAX_CHARS:
@@ -106,8 +122,8 @@ async def _render() -> str:
         size += len(blk) + 2
     keep.reverse()
     hidden = len(blocks) - len(keep)
-    note = (f"\n<i>Скрыто старых записей: {hidden}. В одном сообщении Telegram вмещает около {len(keep)} строк.</i>" if hidden else "")
-    return head + "\n\n".join(keep) + note + foot_t
+    note = (f"\n<i>Скрыто старых записей: {hidden}.</i>" if hidden else "")
+    return head + "\n".join(keep) + note + foot_t
 
 
 def _lp():
