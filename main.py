@@ -14626,7 +14626,7 @@ _CMD_REGISTRY = [
         ("/norm", "мой норматив по секреткам: норма дня, предупреждения"),
         ("/normtop", "таблица норматива всего стаффа"),
         ("/normrec", "топ искателей и рекорды (день, неделя, месяц)"),
-        ("/antiraid", "антирейд: порог входов, автомут, тест оповещения (гл. админ, ЛС или чат стаффа)"),
+        ("/antiraid", "антирейд: порог, щит, проверка новичков, тест оповещения, права бота (гл. админ, ЛС или чат стаффа)"),
         ("/otgul", "заявка на отгул от норматива (болезнь, нет випки, поездка)"),
         ("/givetik №", "передать тикет другому хелперу"),
         ("/note текст", "заметка игроку (Reply на тикет/сообщение)"),
@@ -16672,6 +16672,11 @@ async def main():
         spawn(_supervised(norm_mod.norm_worker))
     except Exception as e:
         logging.error(f"Воркер норматива не запущен: {e}")
+    try:
+        import antiraid
+        spawn(_supervised(antiraid.worker))
+    except Exception as e:
+        logging.error(f"Воркер антирейда не запущен: {e}")
     spawn(_supervised(secret_timer_worker))
     spawn(_supervised(mutator_timer_worker))
     spawn(_supervised(prelink_expiry_worker))
