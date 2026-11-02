@@ -53,6 +53,7 @@ ALTER TABLE norm_excuse ADD COLUMN IF NOT EXISTS ended_at TIMESTAMPTZ;
 UPDATE norm_excuse SET from_ts=(from_day::timestamp AT TIME ZONE 'Europe/Moscow'), to_ts=((to_day+1)::timestamp AT TIME ZONE 'Europe/Moscow') WHERE from_ts IS NULL AND from_day IS NOT NULL;
 CREATE TABLE IF NOT EXISTS norm_state(user_id BIGINT PRIMARY KEY, since DATE, alerted BOOLEAN DEFAULT FALSE);
 CREATE TABLE IF NOT EXISTS norm_flags(key TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS norm_holidays(day DATE PRIMARY KEY, note TEXT);
 CREATE TABLE IF NOT EXISTS norm_manual(id SERIAL PRIMARY KEY, user_id BIGINT, day DATE, note TEXT, by_id BIGINT, ts TIMESTAMPTZ DEFAULT now());
 """
 
@@ -298,6 +299,86 @@ async def day_highlights(d: date) -> list:
     return lines
 
 
+# ---------------------------------------------------------------- праздники
+async def is_holiday(d: date) -> bool:
+    return bool(await q("SELECT 1 FROM norm_holidays WHERE day=%s", (d,), one=True))
+
+
+async def _has_holiday(a: date, b: date) -> bool:
+    return bool(await q("SELECT 1 FROM norm_holidays WHERE day BETWEEN %s AND %s", (a, b), one=True))
+
+
+async def _announce_holidays(days):
+    """Заранее: в тему секреток и каждому искателю в личку."""
+    dl = ", ".join(_fmt(d) for d in sorted(days))
+    txt = (f"🎉 <b>Праздничные дни: {dl}</b>\nНорма в эти дни не считается, предупреждений не будет. "
+           "Секретки всё равно засчитываются в статистику.")
+    try:
+        await _bot.send_message(_admin_chat, txt, parse_mode="HTML", message_thread_id=_topic)
+    except Exception as e:
+        log.warning("праздник: топик: %s", e)
+    for u in await finders():
+        try:
+            await _bot.send_message(u, f"🎉 Норматив: {dl} — праздничные дни, норма не считается.")
+        except Exception:
+            pass
+
+
+def _parse_holiday(tok: str):
+    """ДД.ММ (текущий или ближайший год) или ДД.ММ.ГГГГ. Только не в прошлом."""
+    today = today_msk()
+    for fmt in ("%d.%m.%Y", "%d.%m"):
+        try:
+            d = datetime.strptime(tok, fmt).date()
+        except ValueError:
+            continue
+        if fmt == "%d.%m":
+            d = d.replace(year=today.year)
+            if d < today:
+                return None
+        return d if d >= today else None
+    return None
+
+
+# ---------------------------------------------------------------- итог недели
+async def weekly_report(end: date = None) -> str:
+    end = end or today_msk()
+    start = end - timedelta(days=6)
+    rows = await q("SELECT day, met, required FROM norm_days WHERE day BETWEEN %s AND %s", (start, end), many=True) or []
+    hol = {r[0] for r in (await q("SELECT day FROM norm_holidays WHERE day BETWEEN %s AND %s", (start, end), many=True) or [])}
+    work = [r for r in rows if r[0] not in hol and r[2] > 0]
+    met = sum(1 for r in work if r[1])
+    secrets, days_with = {}, {}
+    for u, d, n in await per_user_day(start, end):
+        if d in hol:
+            continue
+        secrets[u] = secrets.get(u, 0) + n
+        if n > 0:
+            days_with.setdefault(u, set()).add(d)
+    wmap = {int(u): int(c) for u, c in (await q("SELECT user_id, COUNT(*) FROM norm_warns WHERE day BETWEEN %s AND %s GROUP BY user_id",
+                                                 (start, end), many=True) or [])}
+    fs = await finders()
+    lines = [f"📅 <b>Итог недели {_fmt(start)}–{_fmt(end)}</b>",
+             f"Дней с нормой выполнено: <b>{met}/{len(work)}</b>" + (f" · праздничных: {len(hol)}" if hol else "")]
+    top = sorted(((u, n) for u, n in secrets.items() if n > 0), key=lambda x: -x[1])[:5]
+    lines.append("\n<b>Топ недели</b>")
+    lines += [f"{MEDALS[i] if i < 3 else '▫️'} {await _mention(u)} — <b>{n}</b>" for i, (u, n) in enumerate(top)] or ["пока никого"]
+    warned = [u for u in fs if wmap.get(u)]
+    if warned:
+        lines.append("\n⚠️ <b>С предупреждениями за неделю</b>")
+        lines += [f"• {await _mention(u)} — {wmap[u]}" for u in warned]
+    idle = [u for u in fs if not secrets.get(u)]
+    if idle:
+        lines.append("\n😴 <b>Без секреток за неделю</b>")
+        lines += [f"• {await _mention(u)}" for u in idle[:20]]
+    txt = "\n".join(lines)
+    return txt[:3900]
+
+
+async def _send_weekly():
+    await _dm_main_admins(await weekly_report())
+
+
 # ---------------------------------------------------------------- итог дня
 async def process_day(d: date):
     if await q("SELECT 1 FROM norm_days WHERE day=%s", (d,), one=True):
@@ -306,6 +387,14 @@ async def process_day(d: date):
     elig = await eligible_on(d)
     finds = await finds_on(d)
     total = sum(finds.values())
+    if await is_holiday(d):
+        await q("INSERT INTO norm_days(day,finders,required,found,met) VALUES(%s,%s,0,%s,TRUE) ON CONFLICT DO NOTHING", (d, len(elig), total))
+        try:
+            await _bot.send_message(_admin_chat, f"🎉 <b>Праздничный день {_fmt(d)}</b>: норма не считалась, предупреждений нет. Найдено: {total}.",
+                                    parse_mode="HTML", message_thread_id=_topic)
+        except Exception as e:
+            log.warning("праздничный итог: %s", e)
+        return
     req = required_for(len(elig), percent)
     met = total >= req
     warned, streak_warned = [], []
@@ -315,7 +404,7 @@ async def process_day(d: date):
             warned.append(u)
     # серия: 3 дня подряд без секреток и без «дневных» предупреждений
     d0 = d - timedelta(days=2)
-    if d0 >= await _start():
+    if d0 >= await _start() and not await _has_holiday(d0, d):
         for u in elig:
             if u in warned:
                 continue
@@ -373,6 +462,13 @@ async def _remind(kind):
     d = today_msk()
     if d < await _start():
         return
+    if await is_holiday(d):
+        if kind == "morning":
+            try:
+                await _bot.send_message(_admin_chat, f"🎉 Сегодня праздничный день: норма не считается.", parse_mode="HTML", message_thread_id=_topic)
+            except Exception:
+                pass
+        return
     pool = await eligible_on(d)
     finds = await finds_on(d)
     total = sum(finds.values())
@@ -398,7 +494,7 @@ async def _remind(kind):
 async def _remind_dm(hours_left):
     """Личное предупреждение тем, у кого 0 секреток, пока ещё можно успеть (предупреждение выдаётся, только если общая норма не выполнена)."""
     d = today_msk()
-    if d < await _start():
+    if d < await _start() or await is_holiday(d):
         return
     pool = await eligible_on(d)
     finds = await finds_on(d)
@@ -494,6 +590,8 @@ async def norm_worker():
                 if now.hour == wb - 1 and await flag_once(f"dm1:{now.date()}"):
                     await _remind_dm(1)
                 await _remind_excuse_end()
+                if now.weekday() == 6 and now.hour == 23 and now.minute >= 30 and await flag_once(f"weekly:{now.date()}"):
+                    await _send_weekly()
                 if wa <= now.hour < wb and now.minute % 10 == 0 and await flag_once(f"welcome_run:{now.strftime('%Y%m%d%H%M')}"):
                     await _send_welcomes()
         except Exception:
@@ -775,6 +873,7 @@ async def grant_excuse(uid, hours, reason, by) -> datetime:
 
 
 class NormStates(StatesGroup):
+    holi = State()
     hours = State()
     mnote = State()
     wreason = State()
@@ -877,7 +976,7 @@ async def overview(page=0):
     kb = _ikb([nav,
                [InlineKeyboardButton(text="⚠️ Предупреждения", callback_data="nrmw"), InlineKeyboardButton(text="📅 История", callback_data="nrmh")],
                [InlineKeyboardButton(text="🏖 Отгулы", callback_data="nrme"), InlineKeyboardButton(text="✍️ Ручная правка", callback_data="nrmm")],
-               [InlineKeyboardButton(text="⚙️ Настройки", callback_data="nrms")],
+               [InlineKeyboardButton(text="🎉 Праздники", callback_data="nrmholi"), InlineKeyboardButton(text="⚙️ Настройки", callback_data="nrms")],
                [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_adm")]])
     return "\n".join(lines), kb
 
@@ -903,6 +1002,76 @@ async def adm_norm_page(cb: CallbackQuery):
         return
     text, kb = await overview(int(cb.data.split(":")[1]))
     await _edit(cb, text, kb)
+
+
+# ---------------------------------------------------------------- праздники (панель)
+@router.callback_query(F.data == "nrmholi")
+async def adm_holi(cb: CallbackQuery, state: FSMContext = None):
+    if not await _guard(cb):
+        return
+    if state:
+        await state.clear()
+    rows = await q("SELECT day FROM norm_holidays WHERE day >= %s ORDER BY day LIMIT 20", (today_msk(),), many=True) or []
+    lines = ["🎉 <b>Праздничные дни</b>\nВ эти дни норма не считается и предупреждений не будет. Искатели получат уведомление заранее.\n"]
+    btns = [[InlineKeyboardButton(text="➕ Добавить дни", callback_data="nrmholi_add")]]
+    if rows:
+        lines.append("<b>Ближайшие:</b>")
+    for (d,) in rows:
+        lines.append(f"• {d.strftime('%d.%m.%Y')}")
+        btns.append([InlineKeyboardButton(text=f"🗑 Убрать {_fmt(d)}", callback_data=f"nrmholi_del:{d.isoformat()}")])
+    btns.append([InlineKeyboardButton(text="🔙 К таблице", callback_data="adm_norm")])
+    await _edit(cb, "\n".join(lines), _ikb(btns))
+
+
+@router.callback_query(F.data == "nrmholi_add")
+async def adm_holi_add(cb: CallbackQuery, state: FSMContext):
+    if not await _guard(cb):
+        return
+    await state.set_state(NormStates.holi)
+    await cb.message.answer("Напишите даты через пробел: <code>ДД.ММ</code> или <code>ДД.ММ.ГГГГ</code>, например <code>04.11 07.11</code>.",
+                            parse_mode="HTML", reply_markup=_ikb([[InlineKeyboardButton(text="✖️ Отмена", callback_data="nrmholi")]]))
+    await cb.answer()
+
+
+@router.message(NormStates.holi, F.chat.type == "private")
+async def adm_holi_save(message: Message, state: FSMContext):
+    if not await _is_main_admin(message.from_user.id):
+        return
+    txt = (message.text or "").strip()
+    await state.clear()
+    if txt.startswith("/"):
+        return await message.answer("Отменено.")
+    days, bad = [], []
+    for tok in re.split(r"[\s,;]+", txt):
+        if not tok:
+            continue
+        d = _parse_holiday(tok)
+        (days if d else bad).append(d or tok)
+    if not days:
+        return await message.answer("Не разобрал даты (или они в прошлом). Пример: <code>04.11 07.11</code>.", parse_mode="HTML",
+                                    reply_markup=_ikb([[InlineKeyboardButton(text="🎉 К праздникам", callback_data="nrmholi")]]))
+    for d in days:
+        await q("INSERT INTO norm_holidays(day, note) VALUES(%s, %s) ON CONFLICT DO NOTHING", (d, ""))
+    await _announce_holidays(days)
+    extra = f"\nНе разобрал: {', '.join(html.escape(str(b)) for b in bad)}" if bad else ""
+    await message.answer(f"✅ Праздничные дни добавлены: {', '.join(_fmt(d) for d in sorted(days))}. Искатели и тема секреток уведомлены.{extra}",
+                         parse_mode="HTML", reply_markup=_ikb([[InlineKeyboardButton(text="🎉 К праздникам", callback_data="nrmholi")]]))
+
+
+@router.callback_query(F.data.regexp(r"^nrmholi_del:\d{4}-\d{2}-\d{2}$"))
+async def adm_holi_del(cb: CallbackQuery, state: FSMContext = None):
+    if not await _guard(cb):
+        return
+    d = date.fromisoformat(cb.data.split(":", 1)[1])
+    await q("DELETE FROM norm_holidays WHERE day=%s", (d,))
+    await adm_holi(cb, state)
+
+
+@router.message(Command("normweek"))
+async def cmd_normweek(message: Message):
+    if not await _is_main_admin(message.from_user.id):
+        return
+    await message.answer(await weekly_report(), parse_mode="HTML")
 
 
 @router.callback_query(F.data == "nrmw")
