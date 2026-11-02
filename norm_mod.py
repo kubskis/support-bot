@@ -427,6 +427,34 @@ async def _remind_excuse_end():
         await _dm_main_admins(f"🏖 Отгул у {await _mention(u)} заканчивается через ~{left} ч. ({fmt_dt(e)} МСК). Дальше норма снова считается.")
 
 
+async def _welcome_text() -> str:
+    a, b = await window()
+    return ("👋 <b>Добро пожаловать в норматив секреток!</b>\n\n"
+            f"<b>Как это работает</b>\n• Приём секреток: <b>{a:02d}:00–{b:02d}:00 МСК</b>, ночью не считается.\n"
+            f"• Норма на каждого: 1 секретка в день, общая норма дня — {await cfg('percent')}% от числа искателей.\n"
+            f"• Если общая норма не выполнена, а у вас 0 секреток — предупреждение. Лимит: {await cfg('max_warns')}, дальше решают админы.\n"
+            "• Бот напомнит в личку за 3 часа и за 1 час до закрытия, если у вас 0.\n\n"
+            "<b>Команды</b>\n/norm — ваш статус · /normtop — таблица стаффа · /normrec — топ и рекорды · /otgul — заявка на отгул\n\n"
+            "<b>Отгул</b>: болезнь, нет випки (до 7 дней), поездка. Кнопки в /otgul видите только вы, решение примут главные админы.\n\n"
+            "Если вам что-то непонятно — спросите главных админов.")
+
+
+async def _send_welcomes():
+    """Каждому искателю один раз присылаем короткую памятку по нормативу (только в часы приёма, чтобы не будить ночью)."""
+    txt = None
+    for u in await finders():
+        if await q("SELECT 1 FROM norm_flags WHERE key=%s", (f"welcome:{u}",), one=True):
+            continue
+        txt = txt or await _welcome_text()
+        try:
+            await _bot.send_message(u, txt, parse_mode="HTML")
+        except Exception as e:
+            log.info("памятка %s не доставлена: %s", u, e)
+            continue                      # человек не нажимал /start — попробуем в следующий раз
+        await flag_once(f"welcome:{u}")
+        await asyncio.sleep(0.2)
+
+
 async def norm_worker():
     log.info("Воркер норматива запущен")
     await init_tables()
@@ -445,6 +473,8 @@ async def norm_worker():
                 if now.hour == wb - 1 and await flag_once(f"dm1:{now.date()}"):
                     await _remind_dm(1)
                 await _remind_excuse_end()
+                if wa <= now.hour < wb and now.minute % 10 == 0 and await flag_once(f"welcome_run:{now.strftime('%Y%m%d%H%M')}"):
+                    await _send_welcomes()
         except Exception:
             log.exception("norm worker")
         await asyncio.sleep(60)

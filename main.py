@@ -2082,6 +2082,7 @@ async def setup_bot_commands(bot: Bot):
             BotCommand(command="norm", description="📋 Мой норматив по секреткам"),
             BotCommand(command="normtop", description="📊 Норматив: таблица стаффа"),
             BotCommand(command="normrec", description="🏆 Норматив: топ и рекорды"),
+            BotCommand(command="antiraid", description="🛡 Антирейд: настройки и проверка"),
             BotCommand(command="otgul", description="🏖 Отгул от норматива"),
             BotCommand(command="supptop", description="🏆 Топ агентов поддержки (Гл. Админ)"),
             BotCommand(command="sectop", description="🏆 Топ искателей за всё время (Гл. Админ)"),
@@ -14625,6 +14626,7 @@ _CMD_REGISTRY = [
         ("/norm", "мой норматив по секреткам: норма дня, предупреждения"),
         ("/normtop", "таблица норматива всего стаффа"),
         ("/normrec", "топ искателей и рекорды (день, неделя, месяц)"),
+        ("/antiraid", "антирейд: порог входов, автомут, тест оповещения (гл. админ, ЛС или чат стаффа)"),
         ("/otgul", "заявка на отгул от норматива (болезнь, нет випки, поездка)"),
         ("/givetik №", "передать тикет другому хелперу"),
         ("/note текст", "заметка игроку (Reply на тикет/сообщение)"),
@@ -16640,6 +16642,13 @@ async def main():
         logging.info("Модуль норматива секреток подключён.")
     except Exception as e:
         logging.error(f"Модуль норматива не подключён: {e}")
+    try:
+        import antiraid
+        antiraid.setup(dp, bot, get_db, is_main_admin, ADMIN_CHAT_ID, OWNER_ID, build_admin_hidden_pings)
+        await antiraid.init_tables()
+        logging.info("Антирейд подключён.")
+    except Exception as e:
+        logging.error(f"Антирейд не подключён: {e}")
     await web_server()
     await setup_bot_commands(bot)
     await load_emoji_pack_setting()
