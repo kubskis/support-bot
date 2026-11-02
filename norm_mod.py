@@ -133,7 +133,7 @@ async def finders():
 
 async def finds_on(d: date) -> dict:
     a, b = await window()
-    rows = await q(f"SELECT user_id, COUNT(*) FROM secret_posts WHERE {_LOC}::date=%s AND {_WIN_SQL} GROUP BY user_id", (d, a, b), many=True)
+    rows = await q(f"SELECT user_id, COUNT(*) FROM secret_posts WHERE channel_id <> 'manual' AND {_LOC}::date=%s AND {_WIN_SQL} GROUP BY user_id", (d, a, b), many=True)
     res = {u: int(n) for u, n in (rows or [])}
     for u, n in (await q("SELECT user_id, COUNT(*) FROM norm_manual WHERE day=%s GROUP BY user_id", (d,), many=True) or []):
         res[u] = res.get(u, 0) + int(n)
@@ -251,7 +251,7 @@ async def per_user_day(d1: date, d2: date) -> list:
     a, b = await window()
     rows = await q(f"""SELECT user_id, day, SUM(n) FROM (
         SELECT user_id, {_LOC}::date AS day, COUNT(*) AS n FROM secret_posts
-          WHERE {_LOC}::date BETWEEN %s AND %s AND {_WIN_SQL} GROUP BY 1,2
+          WHERE channel_id <> 'manual' AND {_LOC}::date BETWEEN %s AND %s AND {_WIN_SQL} GROUP BY 1,2
         UNION ALL SELECT user_id, day, COUNT(*) FROM norm_manual WHERE day BETWEEN %s AND %s GROUP BY 1,2) t
         GROUP BY 1,2""", (d1, d2, a, b, d1, d2), many=True)
     return [(u, d, int(n)) for u, d, n in (rows or [])]
@@ -320,7 +320,7 @@ async def process_day(d: date):
             if u in warned:
                 continue
             wa, wb = await window()
-            cnt = (await q(f"SELECT COUNT(*) FROM secret_posts WHERE user_id=%s AND {_LOC}::date BETWEEN %s AND %s AND {_WIN_SQL}", (u, d0, d, wa, wb), one=True))[0]
+            cnt = (await q(f"SELECT COUNT(*) FROM secret_posts WHERE channel_id <> 'manual' AND user_id=%s AND {_LOC}::date BETWEEN %s AND %s AND {_WIN_SQL}", (u, d0, d, wa, wb), one=True))[0]
             if cnt:
                 continue
             if any(u in await excused_on(d0 + timedelta(days=i)) for i in range(3)):
@@ -517,7 +517,7 @@ async def _streak_days(uid) -> int:
     start = await _start()
     while n < 30 and d >= start:
         wa, wb = await window()
-        if await q(f"SELECT 1 FROM secret_posts WHERE user_id=%s AND {_LOC}::date=%s AND {_WIN_SQL}", (uid, d, wa, wb), one=True):
+        if await q(f"SELECT 1 FROM secret_posts WHERE channel_id <> 'manual' AND user_id=%s AND {_LOC}::date=%s AND {_WIN_SQL}", (uid, d, wa, wb), one=True):
             break
         if uid in await excused_on(d):
             break

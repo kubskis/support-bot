@@ -27,7 +27,7 @@ _resolve = None      # resolve_user_refs(text) -> (ids, failed)
 _label = None        # get_user_label(uid) -> str
 MAX_N = 200
 MANUAL_CHANNEL = "manual"
-MANUAL_TYPE = "ручная выдача"
+MANUAL_TYPE = None          # без типа: в статистике типов не участвуют
 
 
 class SAdj(StatesGroup):
@@ -220,7 +220,7 @@ async def _ask_confirm(msg, state: FSMContext):
     if mode == "add":
         day = date.fromisoformat(d["day"])
         text = (f"Выдать <b>{n}</b> секр. человеку <b>{html.escape(label)}</b> за <b>{_fmt_day(day)}</b>?\n"
-                "Они попадут в статистику и в норму этого дня.")
+                "Они попадут в общую статистику, но не в норму, рекорды и статистику по типам.")
     else:
         have = await _stat(uid)
         if n > have:
@@ -288,6 +288,20 @@ async def sadj_ok(cb: CallbackQuery, state: FSMContext):
 
 
 # ---------------------------------------------------------------- подключение
+async def init():
+    """Миграция: у уже выданных вручную секреток убираем тип и пересчитываем итоги дней, где они были."""
+    def f(cur):
+        cur.execute("UPDATE secret_posts SET secret_type = NULL WHERE channel_id = %s AND secret_type IS NOT NULL", (MANUAL_CHANNEL,))
+        cur.execute("SELECT DISTINCT (created_at AT TIME ZONE 'Europe/Moscow')::date FROM secret_posts WHERE channel_id = %s", (MANUAL_CHANNEL,))
+        return [r[0] for r in cur.fetchall()]
+    days = await _run(f)
+    try:
+        import norm_mod
+        await norm_mod.refresh_days(days)
+    except Exception as e:
+        log.warning("миграция ручных секреток: %s", e)
+
+
 def setup(dp, get_db, owner_id, resolve_user_refs, get_user_label):
     global _get_db, _owner, _resolve, _label
     _get_db, _owner, _resolve, _label = get_db, owner_id, resolve_user_refs, get_user_label

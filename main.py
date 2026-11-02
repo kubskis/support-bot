@@ -12844,7 +12844,7 @@ async def cmd_sec_stats(message: Message):
                 cur.execute("""
                     SELECT secret_type, COUNT(*) as cnt 
                     FROM secret_posts 
-                    WHERE user_id = %s 
+                    WHERE user_id = %s AND secret_type IS NOT NULL
                     GROUP BY secret_type 
                     ORDER BY cnt DESC LIMIT 1
                 """, (user_id,))
@@ -12966,7 +12966,7 @@ async def cmd_sec_top(message: Message):
                     cur.execute("""
                         SELECT secret_type, COUNT(*) as scnt 
                         FROM secret_posts 
-                        WHERE user_id = %s 
+                        WHERE user_id = %s AND secret_type IS NOT NULL
                         GROUP BY secret_type 
                         ORDER BY scnt DESC LIMIT 1
                     """, (uid,))
@@ -15935,7 +15935,7 @@ _BADGE_TABLES = (("saboteur", "saboteur_servers"), ("farm", "farm_servers"), ("m
 async def _site_publisher_stats(uid: int) -> dict:
     tot = await _db_one(
         "SELECT COUNT(*), COUNT(*) FILTER (WHERE created_at >= CURRENT_TIMESTAMP - INTERVAL '24 hours') FROM secret_posts WHERE user_id = %s", (uid,))
-    types = await _db_all("SELECT secret_type, COUNT(*) FROM secret_posts WHERE user_id = %s GROUP BY secret_type ORDER BY 2 DESC, 1 LIMIT 5", (uid,))
+    types = await _db_all("SELECT secret_type, COUNT(*) FROM secret_posts WHERE user_id = %s AND secret_type IS NOT NULL GROUP BY secret_type ORDER BY 2 DESC, 1 LIMIT 5", (uid,))
     ranks = await _db_all("SELECT user_id, COUNT(*) FROM secret_posts GROUP BY user_id ORDER BY 2 DESC, 1")
     rank = next((i for i, r in enumerate(ranks, 1) if r[0] == uid), None)
     other = {}
@@ -16693,6 +16693,7 @@ async def main():
     try:
         import secret_adjust
         secret_adjust.setup(dp, get_db, OWNER_ID, resolve_user_refs, get_user_label)
+        await secret_adjust.init()
     except Exception as e:
         logging.error(f"Ручные секретки не подключены: {e}")
     try:
