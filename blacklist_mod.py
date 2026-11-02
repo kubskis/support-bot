@@ -319,10 +319,13 @@ SEED = [
 SEED_DEFAULT_REASON = "ускорили"
 
 
-async def run_seed(owner_id: int):
-    """Один раз добавляет стартовый список от главного админа и присылает отчёт. Повторно не запускается."""
+async def run_seed(owner_id: int, force: bool = False):
+    """Один раз добавляет стартовый список от главного админа и присылает отчёт. Повторно не запускается (кроме force)."""
     try:
-        if await q("SELECT 1 FROM bl_flags WHERE key=%s", (SEED_KEY,), one=True):
+        if not force and await q("SELECT 1 FROM bl_flags WHERE key=%s", (SEED_KEY,), one=True):
+            return
+        if not owner_id:
+            log.error("run_seed: ADMIN_ID не задан, импорт пропущен")
             return
         added, skipped, bad = [], [], []
         name = "Главный админ"
@@ -354,8 +357,21 @@ async def run_seed(owner_id: int):
             await _bot.send_message(_chat, txt, parse_mode="HTML", message_thread_id=_topics[-1] if _topics else None)
         except Exception as e:
             log.info("отчёт импорта в чат: %s", e)
-    except Exception:
+    except Exception as e:
         log.exception("run_seed")
+        try:
+            await _bot.send_message(owner_id, f"❌ <b>Импорт чёрного списка не выполнен:</b> {html.escape(str(e))[:300]}\nЗапустить вручную: /blseed", parse_mode="HTML")
+        except Exception:
+            pass
+
+@router.message(Command("blseed"))
+async def bl_seed_cmd(message: Message):
+    """Ручной запуск стартового импорта (только главные админы, в ЛС с ботом)."""
+    if not await _is_main_admin(message.from_user.id):
+        return
+    await message.answer("Запускаю импорт стартового списка…")
+    await run_seed(message.from_user.id, force=True)
+
 
 # ---------------------------------------------------------------- подключение
 def setup(dp, bot, get_db, is_publisher, is_main_admin, lookup_roblox, chat_id, topics):
