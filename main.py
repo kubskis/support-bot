@@ -49,6 +49,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_CHAT_ID = -1003995930989  # ID группы поддержки
 TOPIC_SUPPORT_ID = 2            # ID темы "Поддержка"
 TOPIC_SECRETS_ID = 4            # ID темы "Секретки"
+TOPIC_INFO_ID = 7403            # ID темы "Информация" (сюда же бот дублирует чёрный список)
 TOPIC_APPLICATIONS_ID = 27565   # ID темы "Анкеты" (заявки хелперов и искателей)
 STAFF_DELAY_SECONDS = 30        # 1-я стадия: только стафф (группа)
 PRELINK_DELAY_SECONDS = 30      # 2-я стадия: стафф + «Предссылки» (личка)
@@ -4053,6 +4054,7 @@ def publisher_menu_kb():
         [IB(text="📋 Мои сервера фарма", callback_data="pub_my_farms")],
         [IB(text="📋 Мои бейджи мутатора", callback_data="pub_my_mutators"),
          IB(text="📋 Мои бейджи исследователя", callback_data="pub_my_researchers")],
+        [IB(text="🚫 Внести игрока в ЧС", callback_data="bl_add")],
         [IB(text="📢 Привязать канал", callback_data="pub_bind_channel")]
     ])
 
@@ -6042,6 +6044,11 @@ async def sec_prelink_duration_proc(call: CallbackQuery, state: FSMContext):
         try:
             await bot.send_message(uid, notice, parse_mode="HTML")
             delivered += 1
+            try:
+                import norm_mod
+                await norm_mod.send_welcome(uid)      # памятка по нормативу при каждой выдаче предссылок
+            except Exception as _e:
+                logging.warning(f"Памятка норматива не отправлена {uid}: {_e}")
         except Exception:
             failed.append(uid)
 
@@ -14626,6 +14633,7 @@ _CMD_REGISTRY = [
         ("/norm", "мой норматив по секреткам: норма дня, предупреждения"),
         ("/normtop", "таблица норматива всего стаффа"),
         ("/normrec", "топ искателей и рекорды (день, неделя, месяц)"),
+        ("/blremove ник", "убрать игрока из чёрного списка (гл. админ или тот, кто внёс; внесение: меню секреток → «🚫 Внести игрока в ЧС»)"),
         ("/antiraid", "антирейд: порог, щит, проверка новичков, тест оповещения, права бота (гл. админ, ЛС или чат стаффа)"),
         ("/otgul", "заявка на отгул от норматива (болезнь, нет випки, поездка)"),
         ("/givetik №", "передать тикет другому хелперу"),
@@ -16649,6 +16657,14 @@ async def main():
         logging.info("Антирейд подключён.")
     except Exception as e:
         logging.error(f"Антирейд не подключён: {e}")
+    try:
+        import blacklist_mod
+        blacklist_mod.setup(dp, bot, get_db, is_secret_publisher, is_main_admin, lookup_roblox, ADMIN_CHAT_ID, [TOPIC_SUPPORT_ID, TOPIC_INFO_ID])
+        await blacklist_mod.init_tables()
+        asyncio.create_task(blacklist_mod.rebuild())
+        logging.info("Чёрный список подключён.")
+    except Exception as e:
+        logging.error(f"Чёрный список не подключён: {e}")
     await web_server()
     await setup_bot_commands(bot)
     await load_emoji_pack_setting()

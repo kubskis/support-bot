@@ -439,6 +439,17 @@ async def _welcome_text() -> str:
             "Если вам что-то непонятно — спросите главных админов.")
 
 
+async def send_welcome(uid) -> bool:
+    """Памятка по нормативу конкретному человеку (вызывается при выдаче предссылок). True, если доставлена."""
+    try:
+        await _bot.send_message(uid, await _welcome_text(), parse_mode="HTML")
+        await flag_once(f"welcome:{uid}")
+        return True
+    except Exception as e:
+        log.info("памятка %s не доставлена: %s", uid, e)
+        return False
+
+
 async def _send_welcomes():
     """Каждому искателю один раз присылаем короткую памятку по нормативу (только в часы приёма, чтобы не будить ночью)."""
     txt = None
@@ -756,6 +767,7 @@ async def grant_excuse(uid, hours, reason, by) -> datetime:
 class NormStates(StatesGroup):
     hours = State()
     mnote = State()
+    wreason = State()
 
 
 # ---------------------------------------------------------------- раздел админ-панели
@@ -898,9 +910,73 @@ async def adm_norm_warns(cb: CallbackQuery):
         lines.append(f"<b>{await _nm(u)}</b> — {n}/{lim} (последнее {_fmt(last)})")
         for dd, kind, note in notes or []:
             lines.append(f"   • {html.escape(note or '')[:110]}")
-        btns.append([InlineKeyboardButton(text=f"🗑 Сбросить: {(await _nm(u))[:24]}", callback_data=f"nrmr:{u}")])
+        btns.append([InlineKeyboardButton(text=f"➖ Снять 1: {(await _nm(u))[:16]}", callback_data=f"nrmwd:{u}"),
+                     InlineKeyboardButton(text="🗑 Сбросить все", callback_data=f"nrmr:{u}")])
+    btns.insert(0, [InlineKeyboardButton(text="➕ Выдать предупреждение", callback_data="nrmwa")])
     btns.append([InlineKeyboardButton(text="🔙 К таблице", callback_data="adm_norm")])
     await _edit(cb, "\n".join(lines), _ikb(btns))
+
+
+@router.callback_query(F.data == "nrmwa")
+async def adm_norm_warn_pick(cb: CallbackQuery, state: FSMContext):
+    if not await _guard(cb):
+        return
+    await state.clear()
+    btns, line = [], []
+    for u in (await finders())[:40]:
+        line.append(InlineKeyboardButton(text=(await _nm(u))[:22], callback_data=f"nrmwu:{u}"))
+        if len(line) == 2:
+            btns.append(line)
+            line = []
+    if line:
+        btns.append(line)
+    btns.append([InlineKeyboardButton(text="🔙 Назад", callback_data="nrmw")])
+    await _edit(cb, "➕ <b>Выдать предупреждение вручную</b>\nКому?", _ikb(btns))
+
+
+@router.callback_query(F.data.regexp(r"^nrmwu:\d+$"))
+async def adm_norm_warn_reason(cb: CallbackQuery, state: FSMContext):
+    if not await _guard(cb):
+        return
+    uid = int(cb.data.split(":")[1])
+    await state.set_state(NormStates.wreason)
+    await state.update_data(uid=uid)
+    await cb.message.answer(f"Предупреждение для <b>{await _nm(uid)}</b>.\nНапишите <b>причину</b> (её увидит человек) или <code>-</code>, чтобы выдать без причины.",
+                            parse_mode="HTML", reply_markup=_ikb([[InlineKeyboardButton(text="✖️ Отмена", callback_data="nrmw")]]))
+    await cb.answer()
+
+
+@router.message(NormStates.wreason, F.chat.type == "private")
+async def adm_norm_warn_save(message: Message, state: FSMContext):
+    if not await _is_main_admin(message.from_user.id):
+        return
+    txt = (message.text or "").strip()
+    if txt.startswith("/"):
+        await state.clear()
+        return await message.answer("Выдача предупреждения отменена.")
+    uid = (await state.get_data()).get("uid")
+    await state.clear()
+    reason = "" if txt == "-" else txt[:300]
+    note = f"Выдано вручную: {html.escape(message.from_user.full_name)}." + (f" Причина: {reason}" if reason else "")
+    note = html.unescape(note)
+    n = await add_warn(uid, today_msk(), "manual", note, message.from_user.id)
+    lim = await cfg("max_warns")
+    await message.answer(f"✅ Предупреждение выдано: <b>{await _nm(uid)}</b> — теперь {n}/{lim}." + ("\n🚨 Лимит достигнут, решение отправлено главным админам." if n >= int(lim) else ""),
+                         parse_mode="HTML", reply_markup=_ikb([[InlineKeyboardButton(text="⚠️ К предупреждениям", callback_data="nrmw")]]))
+
+
+@router.callback_query(F.data.regexp(r"^nrmwd:\d+$"))
+async def adm_norm_warn_drop_one(cb: CallbackQuery):
+    if not await _guard(cb):
+        return
+    uid = int(cb.data.split(":")[1])
+    await q("UPDATE norm_warns SET active=FALSE WHERE id=(SELECT id FROM norm_warns WHERE user_id=%s AND active ORDER BY id DESC LIMIT 1)", (uid,))
+    await q("UPDATE norm_state SET alerted=FALSE WHERE user_id=%s", (uid,))
+    try:
+        await _bot.send_message(uid, f"ℹ️ Одно предупреждение по нормативу снято. Сейчас: {await active_warns(uid)}/{await cfg('max_warns')}.")
+    except Exception:
+        pass
+    await adm_norm_warns(cb)
 
 
 @router.callback_query(F.data.regexp(r"^nrmr:\d+$"))
