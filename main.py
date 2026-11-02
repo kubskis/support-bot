@@ -4022,6 +4022,7 @@ def secret_admin_kb():
         [IB(text="🛑 Закрыть чужие посты", callback_data="sec_close_menu")],
         [IB(text="📊 Статистика постов (24ч)", callback_data="sec_stats"),
          IB(text="⏱ Таймер", callback_data="sec_set_timer")],
+        [IB(text="🛠 Секретки вручную (владелец)", callback_data="sadj_menu")],
         [IB(text="🔙 Назад в админку", callback_data="back_to_adm")]
     ])
 
@@ -16689,6 +16690,11 @@ async def main():
         spawn(_supervised(norm_mod.norm_worker))
     except Exception as e:
         logging.error(f"Воркер норматива не запущен: {e}")
+    try:
+        import secret_adjust
+        secret_adjust.setup(dp, get_db, OWNER_ID, resolve_user_refs, get_user_label)
+    except Exception as e:
+        logging.error(f"Ручные секретки не подключены: {e}")
     try:
         import antiraid
         spawn(_supervised(antiraid.worker))
