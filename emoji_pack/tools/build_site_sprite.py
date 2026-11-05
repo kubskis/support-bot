@@ -22,6 +22,12 @@ def body_of(path, name):
     inner = src[i:j]
     inner = re.sub(r'rgb\(100%,\s*100%,\s*100%\)|#fff(?:fff)?\b|\bwhite\b', "currentColor", inner, flags=re.I)
     inner = re.sub(r'<\?xml[^>]*>', "", inner)
+    # Safari не применяет маски (clipPath) из внешнего файла: фигуру из маски кладём обычным путём
+    clips = re.findall(r'<clipPath id="[^"]+">(.*?)</clipPath>', inner, re.S)
+    if clips:
+        shape = [d for d in re.findall(r'<path[^>]*d="([^"]+)"', clips[-1])]
+        if shape:
+            inner = "".join(f'<path d="{d}" fill="currentColor"/>' for d in shape)
     # id внутри пака повторяются (clip-0 и т.д.): делаем их уникальными для каждого символа
     inner = re.sub(r'\bid="([^"]+)"', lambda m: f'id="{name}-{m.group(1)}"', inner)
     inner = re.sub(r'url\(#([^)]+)\)', lambda m: f'url(#{name}-{m.group(1)})', inner)
