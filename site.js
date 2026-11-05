@@ -170,4 +170,17 @@
     new MutationObserver(iconSchedule).observe(document.body,{childList:true,subtree:true,characterData:true});
   }
   if(document.body) iconStart(); else document.addEventListener('DOMContentLoaded',iconStart);
+
+  // лёгкий снегопад: несколько тихих снежинок, отключается, если в системе включено «уменьшение движения»
+  function snowStart(){
+    if(!document.body||matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+    var box=document.createElement('div'); box.className='snow'; box.setAttribute('aria-hidden','true');
+    for(var k=0;k<18;k++){
+      var f=document.createElement('i');
+      f.style.cssText='left:'+(Math.random()*100).toFixed(1)+'%;--s:'+(2+Math.random()*3).toFixed(1)+'px;--d:'+(16+Math.random()*16).toFixed(1)+'s;--l:-'+(Math.random()*30).toFixed(1)+'s';
+      box.appendChild(f);
+    }
+    document.body.appendChild(box);
+  }
+  if(document.body) snowStart(); else document.addEventListener('DOMContentLoaded',snowStart);
 })();

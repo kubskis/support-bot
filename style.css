@@ -334,6 +334,11 @@ button.btn:disabled{opacity:.6;cursor:default}
 /* иконки сайта вместо эмодзи (site.js подменяет текст; цвет = цвет текста) */
 .ei{display:inline-block;width:1.15em;height:1.15em;vertical-align:-.2em;overflow:visible;fill:none;stroke:none;flex:none}
 
+/* снежинки: очень лёгкие, не мешают чтению (site.js) */
+.snow{position:fixed;inset:0;pointer-events:none;overflow:hidden;z-index:1}
+.snow i{position:absolute;top:-14px;width:var(--s);height:var(--s);border-radius:50%;background:var(--muted);opacity:0;animation:snowfall var(--d) linear var(--l) infinite}
+@keyframes snowfall{0%{transform:translate3d(0,0,0);opacity:0}10%{opacity:.45}50%{transform:translate3d(12px,50vh,0)}90%{opacity:.45}100%{transform:translate3d(-8px,110vh,0);opacity:0}}
+
 /* оформление по событию: класс ev-<имя> на <html> из site.js (по данным /api/status) */
 .evbanner{background:linear-gradient(90deg,var(--g2),var(--g1));color:#fff;text-align:center;font-size:14px;padding:7px 14px;font-weight:600;letter-spacing:.01em}
 .evbanner a{color:#fff;text-decoration:underline}
