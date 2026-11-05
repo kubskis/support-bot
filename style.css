@@ -405,3 +405,6 @@ button.btn:disabled{opacity:.6;cursor:default}
 :root.ev-winter .banner{background:linear-gradient(135deg,rgba(201,184,234,.16),rgba(207,227,255,.06))}
 :root.ev-winter .page-head{background:radial-gradient(800px 300px at 50% -10%,rgba(207,227,255,.16) 0%,transparent 70%)}
 :root.ev-winter .err .code{filter:drop-shadow(0 0 24px rgba(207,227,255,.3))}
+:root.ev-winter .step::before{box-shadow:0 0 14px rgba(207,227,255,.35)}
+:root.ev-winter .loginnum{text-shadow:0 0 24px rgba(207,227,255,.4)}
+:root.ev-winter .st-work{border-color:rgba(207,227,255,.5)}
