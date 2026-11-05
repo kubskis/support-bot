@@ -43,9 +43,7 @@
   }
 
   // праздничный режим: оформление и баннер. Последнее состояние запоминается, чтобы страница не мигала при загрузке
-  var EVENTS={halloween:{icon:'🎃',text:'Хэллоуин в Tower of Secrets! Праздничные акции смотрите в разделе «Услуги».'},
-              newyear:{icon:'🎄',text:'С наступающим Новым годом! Праздничные акции смотрите в разделе «Услуги».'},
-              winter:{icon:'❄️',text:'Зима в Tower of Secrets! Праздничные акции смотрите в разделе «Услуги».'}};
+  var EVENTS={winter:{icon:'❄️',text:'Зима в Tower of Secrets! Праздничные акции смотрите в разделе «Услуги».'}};
   function applyEvent(name){
     Object.keys(EVENTS).forEach(function(k){root.classList.remove('ev-'+k)});
     var old=document.querySelector('.evbanner'); if(old) old.remove();

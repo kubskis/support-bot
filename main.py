@@ -2252,7 +2252,7 @@ ALOG_INFO = {
     "toh_update": ("Tower of Hell обновился", "system"),
     "welcome_edit": ("Изменил приветствие бота", "settings"),
     "toh_watch": ("Слежение за обновлением игры", "settings"),
-    "event": ("Праздничный режим", "settings"),
+    "event": ("Оформление сайта", "settings"),
     "rich": ("Богатый формат постов", "settings"),
     "incident": ("Сбой бота", "system"),
     "restart": ("Запуск бота", "system"),
@@ -13884,10 +13884,6 @@ async def adm_chan_stats(call: CallbackQuery):
 # ПРАЗДНИЧНЫЙ РЕЖИМ (Хэллоуин и другие даты): оформление сайта и строка в приветствии бота
 # ----------------------------------------------------------------------
 EVENTS = {
-    "halloween": {"title": "Хэллоуин", "icon": "🎃",
-                  "line": "🎃 <b>Хэллоуин в Tower of Secrets!</b> Ищите праздничные акции в «Платных услугах»."},
-    "newyear": {"title": "Новый год", "icon": "🎄",
-                "line": "🎄 <b>С наступающим Новым годом!</b> Ищите праздничные акции в «Платных услугах»."},
     "winter": {"title": "Зима", "icon": "❄️",
                "line": "❄️ <b>Зима в Tower of Secrets!</b> Ищите праздничные акции в «Платных услугах»."},
 }
@@ -14656,7 +14652,7 @@ _CMD_REGISTRY = [
     ("👑 Главные админы — личка с ботом", True, [
         ("/commands", "этот список"),
         ("/tohwatch [on|off]", "слежение за Tower of Hell"),
-        ("/event [halloween|newyear [дней]|winter|off]", "праздничное оформление (зима без срока)"),
+        ("/theme [winter|off]", "зимнее оформление сайта (включить/выключить)"),
         ("/monitor", "мониторинг/состояние бота"),
     ]),
     ("🔑 Только создатель", None, [
@@ -15038,9 +15034,9 @@ async def cmd_emojipack(message: Message):
         parse_mode="HTML")
 
 
-@router.message(Command("event"), F.chat.type == "private")
-async def cmd_event(message: Message):
-    """/event — статус; /event halloween [дней] | newyear [дней] — включить (по умолчанию на 7 дней); /event off — выключить."""
+@router.message(Command("theme"), F.chat.type == "private")
+async def cmd_theme(message: Message):
+    """/theme — статус; /theme winter — зимнее оформление (без срока); /theme off — вернуть основное."""
     if not await is_main_admin(message.from_user.id):
         return
     parts = (message.text or "").split()[1:]
@@ -15049,39 +15045,25 @@ async def cmd_event(message: Message):
         arg = parts[0].lower()
         if arg in ("off", "stop"):
             await set_setting("event_mode", "")
+            await set_setting("event_until", "0")
             await alog(message.from_user.id, "event", "", "off")
-            note = "Праздничный режим выключен.\n\n"
-        elif arg in EVENTS:
-            days = 7
-            if len(parts) > 1 and parts[1].isdigit() and 1 <= int(parts[1]) <= 60:
-                days = int(parts[1])
-            await set_setting("event_mode", arg)
-            if arg == "winter":                       # зима без срока: выключается только командой /event off
-                await set_setting("event_until", "0")
-                await alog(message.from_user.id, "event", arg, "без срока")
-                note = f"Включено: {EVENTS[arg]['icon']} {EVENTS[arg]['title']} без срока. Выключить: /event off\n\n"
-            else:
-                await set_setting("event_until", str(time.time() + days * 86400))
-                await alog(message.from_user.id, "event", arg, f"{days} дн.")
-                note = f"Включено: {EVENTS[arg]['icon']} {EVENTS[arg]['title']} на {days} дн.\n\n"
+            note = "Зимнее оформление выключено, сайт в основном оформлении.\n\n"
+        elif arg in ("winter", "on"):
+            await set_setting("event_mode", "winter")
+            await set_setting("event_until", "0")
+            await alog(message.from_user.id, "event", "winter", "без срока")
+            note = "Зимнее оформление включено. Выключить: /theme off\n\n"
         else:
-            note = f"{ICON_CROSS} Неизвестный режим.\n\n"
+            note = f"{ICON_CROSS} Неизвестная команда.\n\n"
         _EVENT_CACHE["t"] = 0.0
         _SITE_FLAGS["t"] = 0.0
     ev = await current_event()
-    status = f"{EVENTS[ev]['icon']} включён: <b>{EVENTS[ev]['title']}</b>" if ev else "выключен"
-    until = ""
-    if ev:
-        try:
-            until = ", до " + datetime.fromtimestamp(float(await get_setting("event_until", "0")), MSK_TZ).strftime("%d.%m.%Y %H:%M МСК")
-        except Exception:
-            pass
+    status = "включено: <b>зима</b>" if ev == "winter" else "выключено (основное оформление)"
     await message.answer(
-        f"{note}🎭 <b>Праздничный режим:</b> {status}{until}\n\n"
-        "Меняет оформление сайта (цвета, баннер, значок) и добавляет строку в приветствие бота. Выключается сам по сроку.\n"
-        "<code>/event halloween</code> — на 7 дней, <code>/event halloween 3</code> — на 3 дня\n"
-        "<code>/event newyear</code>, <code>/event winter</code> (зима, без срока), <code>/event off</code>\n\n"
-        "Праздничный промокод создаётся как обычно: «Платные услуги → Промокоды».",
+        f"{note}🎨 <b>Оформление сайта:</b> {status}\n\n"
+        "<code>/theme winter</code> — включить зимнее оформление\n"
+        "<code>/theme off</code> — выключить\n\n"
+        "Зимнее оформление не выключается само, только командой <code>/theme off</code>.",
         parse_mode="HTML")
 
 @router.message(Command("monitor"), F.chat.type == "private")
@@ -16496,18 +16478,9 @@ async def handle_adm_event(request):
     mode = str(body.get("mode", ""))
     if mode and mode not in EVENTS:
         return _jerr(400, "bad_request")
-    days = body.get("days", 7)
-    if not isinstance(days, int) or not (1 <= days <= 60):
-        days = 7
     await set_setting("event_mode", mode)
-    if mode == "winter":
-        await set_setting("event_until", "0")
-        await alog(uid, "event", mode, "без срока (сайт)")
-    elif mode:
-        await set_setting("event_until", str(time.time() + days * 86400))
-        await alog(uid, "event", mode, f"{days} дн. (сайт)")
-    else:
-        await alog(uid, "event", "off", "выключен (сайт)")
+    await set_setting("event_until", "0")
+    await alog(uid, "event", mode or "off", "без срока (сайт)" if mode else "выключен (сайт)")
     _EVENT_CACHE["t"] = 0.0
     _SITE_FLAGS["t"] = 0.0
     return web.json_response({"ok": True}, headers=_NOSTORE)
@@ -16613,7 +16586,7 @@ async def web_server():
     logging.info(f"Health-check сервер запущен на порту {port}")
 
 # Общий обработчик личных сообщений регистрируем ПОСЛЕДНИМ: aiogram берёт первый подходящий обработчик,
-# и если он стоит раньше команд (/monitor, /event, /tohwatch), те никогда не срабатывают.
+# и если он стоит раньше команд (/monitor, /theme, /tohwatch), те никогда не срабатывают.
 router.message.register(user_private_message, F.chat.type == "private")
 
 async def main():

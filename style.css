@@ -332,14 +332,9 @@ button.btn:disabled{opacity:.6;cursor:default}
 .mstat{display:none;align-items:center;gap:8px;padding:12px 0;font-size:14px;color:var(--muted)}
 @media (max-width:360px){.logo{font-size:16px}}
 
-/* праздничный режим: включается классом ev-<имя> на <html> из site.js (по данным /api/status) */
-:root.ev-halloween{--accent:#ff8a1f;--ember:#ffb347;--g1:#e8590c;--g2:#a63d00;--line:#4a2a10;--line2:#a05a1c;--logoglow:rgba(255,138,31,.75)}
-:root.ev-halloween[data-theme="light"]{--accent:#b85200;--ember:#d9591a;--line:#ecd2b8;--line2:#cf9a62}
-:root.ev-newyear{--accent:#4fd1a5;--ember:#9be7ff;--g1:#13946b;--g2:#0b6b4d;--line:#10372f;--line2:#1f7a62;--logoglow:rgba(79,209,165,.7)}
-:root.ev-newyear[data-theme="light"]{--accent:#0b7a58;--ember:#1b8fb0;--line:#cfe8df;--line2:#7fbfa8}
+/* оформление по событию: класс ev-<имя> на <html> из site.js (по данным /api/status) */
 .evbanner{background:linear-gradient(90deg,var(--g2),var(--g1));color:#fff;text-align:center;font-size:14px;padding:7px 14px;font-weight:600;letter-spacing:.01em}
 .evbanner a{color:#fff;text-decoration:underline}
-:root.ev-halloween .logo b{text-shadow:0 0 18px var(--logoglow)}
 
 /* админка на сайте */
 .admwrap{max-width:1040px}
@@ -379,7 +374,7 @@ button.btn:disabled{opacity:.6;cursor:default}
 .adm-tk .chain .h.last{color:var(--accent)}
 .adm-tk .chain .arrow{color:var(--muted,inherit);opacity:.8}
 
-/* зимний режим: включается /event winter в боте (класс ev-winter на <html>) — палитра из зимней обложки */
+/* зимний режим: включается /theme winter в боте (класс ev-winter на <html>) — палитра из зимней обложки */
 .winter-art{display:none}
 :root.ev-winter{--bg:#0b0d12;--bg2:#12151d;--card:#171b25;--card2:#1c2230;--bat:#2a3140;--line:#2d3442;--line2:#6d788d;
   --text:#eef2f8;--muted:#aab3c5;--accent:#c9b8ea;--ember:#cfe3ff;--g1:#5d6d88;--g2:#2b3347;--sel:#3d4a63;--focus:#eef2f8;

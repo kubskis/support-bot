@@ -223,11 +223,10 @@
         r.appendChild(row);
       });
 
-      var e=section('Праздничный режим','Меняет оформление сайта и добавляет строку в приветствие бота. Сейчас: '+(f.event||'выключен')+'.');
-      var sel=el('select'); sel.setAttribute('aria-label','Режим'); [['','Выключить'],['halloween','🎃 Хэллоуин'],['newyear','🎄 Новый год']].forEach(function(o){var op=el('option',null,o[1]); op.value=o[0]; sel.appendChild(op)}); sel.value=f.event||'';
-      var days=el('input'); days.type='number'; days.min=1; days.max=60; days.value=7; days.setAttribute('aria-label','Дней');
-      var row=el('div','adm-form'); row.appendChild(sel); row.appendChild(days); row.appendChild(el('span','tm','дней'));
-      row.appendChild(btn('Применить','btn',function(){api('/api/admin/event',{mode:sel.value,days:parseInt(days.value,10)||7}).then(function(r3){if(fail(r3)) return; if(r3.ok) tabControl(); else alert(errText(r3))})}));
+      var e=section('Зимнее оформление','Меняет оформление сайта и добавляет строку в приветствие бота. Сейчас: '+(f.event==='winter'?'включено':'выключено')+'. Без срока.');
+      var sel=el('select'); sel.setAttribute('aria-label','Режим'); [['','Выключено'],['winter','❄️ Зима']].forEach(function(o){var op=el('option',null,o[1]); op.value=o[0]; sel.appendChild(op)}); sel.value=f.event||'';
+      var row=el('div','adm-form'); row.appendChild(sel);
+      row.appendChild(btn('Применить','btn',function(){api('/api/admin/event',{mode:sel.value}).then(function(r3){if(fail(r3)) return; if(r3.ok) tabControl(); else alert(errText(r3))})}));
       e.appendChild(row);
 
       var o=section('Режимы бота','Технический перерыв: '+(f.maintenance?'включён':'выключен')+'. Тест-режим: '+(f.test_mode?'включён':'выключен')+'. Эти два режима, как и состав главных админов, по-прежнему меняются в боте и только владельцем.');
