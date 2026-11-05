@@ -332,6 +332,9 @@ button.btn:disabled{opacity:.6;cursor:default}
 .mstat{display:none;align-items:center;gap:8px;padding:12px 0;font-size:14px;color:var(--muted)}
 @media (max-width:360px){.logo{font-size:16px}}
 
+/* иконки сайта вместо эмодзи (site.js подменяет текст; цвет = цвет текста) */
+.ei{display:inline-block;width:1.15em;height:1.15em;vertical-align:-.2em;overflow:visible;fill:none;stroke:none;flex:none}
+
 /* оформление по событию: класс ev-<имя> на <html> из site.js (по данным /api/status) */
 .evbanner{background:linear-gradient(90deg,var(--g2),var(--g1));color:#fff;text-align:center;font-size:14px;padding:7px 14px;font-weight:600;letter-spacing:.01em}
 .evbanner a{color:#fff;text-decoration:underline}
