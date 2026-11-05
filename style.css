@@ -397,3 +397,13 @@ button.btn:disabled{opacity:.6;cursor:default}
 @keyframes frost{0%,100%{box-shadow:0 0 0 1px rgba(207,227,255,.5),0 0 40px rgba(201,184,234,.25),0 20px 60px rgba(0,0,0,.6)}
   50%{box-shadow:0 0 0 1px rgba(233,240,255,.8),0 0 64px rgba(207,227,255,.4),0 20px 60px rgba(0,0,0,.6)}}
 @media (prefers-reduced-motion:reduce){:root.ev-winter .winter-art img{animation:none}}
+
+/* зима: без красных подтёков и красных подсветок (всё ледяное) */
+:root.ev-winter section.alt::before{display:none}
+:root.ev-winter .btn{box-shadow:0 6px 22px rgba(201,184,234,.22)}
+:root.ev-winter .btn:hover{box-shadow:0 10px 28px rgba(201,184,234,.38)}
+:root.ev-winter .card:hover{box-shadow:0 0 28px rgba(207,227,255,.14)}
+:root.ev-winter .feed li.open{box-shadow:0 0 18px rgba(207,227,255,.2)}
+:root.ev-winter .banner{background:linear-gradient(135deg,rgba(201,184,234,.16),rgba(207,227,255,.06))}
+:root.ev-winter .page-head{background:radial-gradient(800px 300px at 50% -10%,rgba(207,227,255,.16) 0%,transparent 70%)}
+:root.ev-winter .err .code{filter:drop-shadow(0 0 24px rgba(207,227,255,.3))}

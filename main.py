@@ -14656,7 +14656,7 @@ _CMD_REGISTRY = [
     ("👑 Главные админы — личка с ботом", True, [
         ("/commands", "этот список"),
         ("/tohwatch [on|off]", "слежение за Tower of Hell"),
-        ("/event [halloween|newyear|winter [дней]|off]", "праздничное оформление"),
+        ("/event [halloween|newyear [дней]|winter|off]", "праздничное оформление (зима без срока)"),
         ("/monitor", "мониторинг/состояние бота"),
     ]),
     ("🔑 Только создатель", None, [
@@ -15056,9 +15056,14 @@ async def cmd_event(message: Message):
             if len(parts) > 1 and parts[1].isdigit() and 1 <= int(parts[1]) <= 60:
                 days = int(parts[1])
             await set_setting("event_mode", arg)
-            await set_setting("event_until", str(time.time() + days * 86400))
-            await alog(message.from_user.id, "event", arg, f"{days} дн.")
-            note = f"Включено: {EVENTS[arg]['icon']} {EVENTS[arg]['title']} на {days} дн.\n\n"
+            if arg == "winter":                       # зима без срока: выключается только командой /event off
+                await set_setting("event_until", "0")
+                await alog(message.from_user.id, "event", arg, "без срока")
+                note = f"Включено: {EVENTS[arg]['icon']} {EVENTS[arg]['title']} без срока. Выключить: /event off\n\n"
+            else:
+                await set_setting("event_until", str(time.time() + days * 86400))
+                await alog(message.from_user.id, "event", arg, f"{days} дн.")
+                note = f"Включено: {EVENTS[arg]['icon']} {EVENTS[arg]['title']} на {days} дн.\n\n"
         else:
             note = f"{ICON_CROSS} Неизвестный режим.\n\n"
         _EVENT_CACHE["t"] = 0.0
@@ -15075,7 +15080,7 @@ async def cmd_event(message: Message):
         f"{note}🎭 <b>Праздничный режим:</b> {status}{until}\n\n"
         "Меняет оформление сайта (цвета, баннер, значок) и добавляет строку в приветствие бота. Выключается сам по сроку.\n"
         "<code>/event halloween</code> — на 7 дней, <code>/event halloween 3</code> — на 3 дня\n"
-        "<code>/event newyear</code>, <code>/event winter</code> (зима), <code>/event off</code>\n\n"
+        "<code>/event newyear</code>, <code>/event winter</code> (зима, без срока), <code>/event off</code>\n\n"
         "Праздничный промокод создаётся как обычно: «Платные услуги → Промокоды».",
         parse_mode="HTML")
 
@@ -16495,9 +16500,14 @@ async def handle_adm_event(request):
     if not isinstance(days, int) or not (1 <= days <= 60):
         days = 7
     await set_setting("event_mode", mode)
-    if mode:
+    if mode == "winter":
+        await set_setting("event_until", "0")
+        await alog(uid, "event", mode, "без срока (сайт)")
+    elif mode:
         await set_setting("event_until", str(time.time() + days * 86400))
-    await alog(uid, "event", mode or "off", f"{days} дн. (сайт)" if mode else "выключен (сайт)")
+        await alog(uid, "event", mode, f"{days} дн. (сайт)")
+    else:
+        await alog(uid, "event", "off", "выключен (сайт)")
     _EVENT_CACHE["t"] = 0.0
     _SITE_FLAGS["t"] = 0.0
     return web.json_response({"ok": True}, headers=_NOSTORE)
