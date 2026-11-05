@@ -5,7 +5,7 @@
   function curTheme(){return root.getAttribute('data-theme')==='light'?'light':'dark'}
   function paintTheme(){
     var t=curTheme(), m=document.querySelector('meta[name="theme-color"]');
-    if(m) m.setAttribute('content',t==='light'?'#faf3f0':'#0a0507');
+    if(m) m.setAttribute('content',t==='light'?'#eef1f6':'#0b0d12');
     if(tbtn){var l=t==='light'?'Включить тёмную тему':'Включить светлую тему'; tbtn.textContent=t==='light'?'🌙':'☀️'; tbtn.setAttribute('aria-label',l); tbtn.title=l}
   }
   if(tbtn) tbtn.addEventListener('click',function(){
