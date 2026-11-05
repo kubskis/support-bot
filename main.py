@@ -13888,6 +13888,8 @@ EVENTS = {
                   "line": "🎃 <b>Хэллоуин в Tower of Secrets!</b> Ищите праздничные акции в «Платных услугах»."},
     "newyear": {"title": "Новый год", "icon": "🎄",
                 "line": "🎄 <b>С наступающим Новым годом!</b> Ищите праздничные акции в «Платных услугах»."},
+    "winter": {"title": "Зима", "icon": "❄️",
+               "line": "❄️ <b>Зима в Tower of Secrets!</b> Ищите праздничные акции в «Платных услугах»."},
 }
 _EVENT_CACHE = {"t": 0.0, "name": ""}
 
@@ -14654,7 +14656,7 @@ _CMD_REGISTRY = [
     ("👑 Главные админы — личка с ботом", True, [
         ("/commands", "этот список"),
         ("/tohwatch [on|off]", "слежение за Tower of Hell"),
-        ("/event [halloween|newyear [дней]|off]", "праздничное оформление"),
+        ("/event [halloween|newyear|winter [дней]|off]", "праздничное оформление"),
         ("/monitor", "мониторинг/состояние бота"),
     ]),
     ("🔑 Только создатель", None, [
@@ -15073,7 +15075,7 @@ async def cmd_event(message: Message):
         f"{note}🎭 <b>Праздничный режим:</b> {status}{until}\n\n"
         "Меняет оформление сайта (цвета, баннер, значок) и добавляет строку в приветствие бота. Выключается сам по сроку.\n"
         "<code>/event halloween</code> — на 7 дней, <code>/event halloween 3</code> — на 3 дня\n"
-        "<code>/event newyear</code>, <code>/event off</code>\n\n"
+        "<code>/event newyear</code>, <code>/event winter</code> (зима), <code>/event off</code>\n\n"
         "Праздничный промокод создаётся как обычно: «Платные услуги → Промокоды».",
         parse_mode="HTML")
 
