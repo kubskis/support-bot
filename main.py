@@ -898,7 +898,7 @@ def fmt_prelink_until(dt) -> str:
         return "навсегда"
     return "до " + dt.astimezone(MSK_TZ).strftime("%d.%m.%Y %H:%M") + " МСК"
 
-async def send_prelinks(text: str, photo_id: str = None, exclude_ids=None, delay: int = STAFF_DELAY_SECONDS, ref=None):
+async def send_prelinks(text: str, photo_id: str = None, exclude_ids=None, delay: int = STAFF_DELAY_SECONDS, ref=None, link: str = None):
     """Рассылает пост в личку пользователям из списка «Предссылки» одновременно со стаффом (до публикации в канале).
     ref=(kind, rec_id): копии запоминаются, чтобы их можно было поправить (смена ссылки) и закрыть (пост завершён)."""
     if TEST_MODE_ON:
@@ -919,9 +919,9 @@ async def send_prelinks(text: str, photo_id: str = None, exclude_ids=None, delay
                     with get_db() as conn:
                         with conn.cursor() as cur:
                             cur.execute(
-                                "INSERT INTO prelink_msgs (kind, rec_id, user_id, message_id, has_photo, label, text) "
-                                "VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                                (ref[0], ref[1], uid, mid, bool(photo_id), label, text))
+                                "INSERT INTO prelink_msgs (kind, rec_id, user_id, message_id, has_photo, label, text, link) "
+                                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                                (ref[0], ref[1], uid, mid, bool(photo_id), label, text, link))
                 await asyncio.to_thread(_rec)
         except Exception as e:
             logging.warning(f"Предссылка не доставлена {uid}: {e}")
@@ -936,52 +936,56 @@ async def _prelink_edit_msg(uid, mid, has_photo, text):
         await bot.edit_message_text(chat_id=uid, message_id=mid, text=text, parse_mode="HTML",
                                     link_preview_options=LinkPreviewOptions(is_disabled=True))
 
-async def _prelink_update(kind, rec_id, transform=None, closed=False):
-    """Правит все копии предссылок по записи (секретка / сервер саботера / фарм).
-    transform(text) -> новый текст; closed=True — пометить как завершённые (текст заменяется на «завершено»)."""
+PRELINK_CLOSED_PHRASE = "сервер закрылся по истечении времени"
+
+def _prelink_swap(text: str, old: str, new: str) -> str:
+    """Меняет ссылку в тексте копии (и сырой, и html-экранированный вариант); остальной текст не трогаем."""
+    if not old:
+        return text
+    return text.replace(old, new).replace(html.escape(old, quote=False), html.escape(new, quote=False))
+
+async def _prelink_update(kind, rec_id, make):
+    """Правит все копии предссылок по записи. make(text, link) -> (новый текст, новая ссылка, closed)."""
     def _get():
         with get_db() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT id, user_id, message_id, has_photo, text, label FROM prelink_msgs "
+                cur.execute("SELECT id, user_id, message_id, has_photo, text, link FROM prelink_msgs "
                             "WHERE kind = %s AND rec_id = %s AND closed = FALSE", (kind, rec_id))
                 return cur.fetchall()
     rows = await asyncio.to_thread(_get)
-    for pl_id, uid, mid, has_photo, text, label in rows:
-        if closed:
-            new_text = (f"🔔 <b>ПРЕДССЫЛКА: {label}</b>\n"
-                        "<i>Пост завершён, ссылка больше не действует.</i>")
-        else:
-            new_text = transform(text or "")
-            if new_text == text:
-                continue
-        try:
-            await _prelink_edit_msg(uid, mid, has_photo, new_text)
-        except TelegramBadRequest as tb:
-            if "not modified" not in str(tb).lower() and "message to edit not found" not in str(tb).lower() \
-                    and "message can't be edited" not in str(tb).lower():
-                logging.warning(f"Предссылка #{pl_id}: не удалось обновить у {uid}: {tb}")
-        except Exception as e:
-            logging.warning(f"Предссылка #{pl_id}: не удалось обновить у {uid}: {e}")
-        def _save(pl_id=pl_id, new_text=new_text, closed=closed):
+    for pl_id, uid, mid, has_photo, text, link in rows:
+        new_text, new_link, closed = make(text or "", link)
+        if new_text != text:
+            try:
+                await _prelink_edit_msg(uid, mid, has_photo, new_text)
+            except TelegramBadRequest as tb:
+                low = str(tb).lower()
+                if "not modified" not in low and "message to edit not found" not in low and "message can't be edited" not in low:
+                    logging.warning(f"Предссылка #{pl_id}: не удалось обновить у {uid}: {tb}")
+            except Exception as e:
+                logging.warning(f"Предссылка #{pl_id}: не удалось обновить у {uid}: {e}")
+        def _save(pl_id=pl_id, new_text=new_text, new_link=new_link, closed=closed):
             with get_db() as conn:
                 with conn.cursor() as cur:
-                    cur.execute("UPDATE prelink_msgs SET text = %s, closed = %s WHERE id = %s", (new_text, closed, pl_id))
+                    cur.execute("UPDATE prelink_msgs SET text = %s, link = %s, closed = %s WHERE id = %s",
+                                (new_text, new_link, closed, pl_id))
         await asyncio.to_thread(_save)
         await asyncio.sleep(0.05)
 
 async def _prelink_relink(kind, rec_id, old, new):
-    """Смена ссылки: во всех копиях предссылок старая ссылка заменяется на новую."""
+    """Смена ссылки: во всех копиях старая ссылка заменяется на новую."""
     if not old:
         return
-    old_raw, old_esc = old, html.escape(old, quote=False)
-    new_esc = html.escape(new, quote=False)
-    def _tr(t):
-        return t.replace(old_raw, new).replace(old_esc, new_esc)
-    await _prelink_update(kind, rec_id, transform=_tr)
+    await _prelink_update(kind, rec_id, lambda t, l: (_prelink_swap(t, old, new), new, False))
 
 async def _prelink_close(kind, rec_id):
-    """Пост завершён: во всех копиях предссылок вместо поста — пометка «завершено», ссылка убрана."""
-    await _prelink_update(kind, rec_id, closed=True)
+    """Пост истёк или снят: в копиях вместо ссылки стоит «сервер закрылся по истечении времени», остальной текст прежний."""
+    def _mk(t, l):
+        link = l or _lnk_guess(t)
+        if not link:
+            return t, l, True
+        return _prelink_swap(t, link, PRELINK_CLOSED_PHRASE), link, True
+    await _prelink_update(kind, rec_id, _mk)
 
 def _prelink_header(what: str) -> str:
     return (
@@ -1859,6 +1863,7 @@ def _init_db_sync():
                     text TEXT,
                     closed BOOLEAN DEFAULT FALSE
                 );
+                ALTER TABLE prelink_msgs ADD COLUMN IF NOT EXISTS link TEXT;
                 CREATE INDEX IF NOT EXISTS prelink_msgs_rec ON prelink_msgs (kind, rec_id);
                 ALTER TABLE prelink_users ADD COLUMN IF NOT EXISTS is_test BOOLEAN DEFAULT FALSE;
                 ALTER TABLE prelink_users ADD COLUMN IF NOT EXISTS renew_reminded_for TIMESTAMP WITH TIME ZONE;
@@ -6635,7 +6640,7 @@ async def pub_confirm(call: CallbackQuery, state: FSMContext):
                 # 2.1 Предссылки (одновременно со стаффом), с запоминанием копий
                 spawn(send_prelinks(
                     _prelink_header(f"секретка «{html.escape(stype)}»") + final_txt,
-                    photo_id=data["photo_id"], ref=("sec", post_id)
+                    photo_id=data["photo_id"], ref=("sec", post_id), link=data.get("link")
                 ))
 
                 # 5. Отложенная отправка в канал через 30 секунд
@@ -6995,7 +7000,7 @@ async def _sab_core(user, data, ch_id) -> tuple:
         f"• Метод: <code>{html.escape(data['sab_method'])}</code>\n"
         f"• В друзья: <b>{data['sab_friends']}</b>\n"
         f"• Ссылка: {data['sab_link']}",
-        ref=("sab", srv_id)
+        ref=("sab", srv_id), link=data["sab_link"]
     ))
     staff_sab_text = (
         f"⚡️ <b>ПОИСК САБОТЕРА ДЛЯ СТАФФА (Фора {CHANNEL_DELAY_SECONDS} сек.)</b> ⚡️\n"
@@ -7059,7 +7064,7 @@ async def _farm_core(user, data, ch_id) -> tuple:
         f"• В друзья: <b>{data['farm_friends']}</b>\n"
         f"• Эффекты: <b>{'разрешены' if data.get('farm_effects') else 'нет'}</b>\n"
         f"• Ссылка: {html.escape(data['farm_link'], quote=False)}",
-        ref=("farm", srv_id)
+        ref=("farm", srv_id), link=data["farm_link"]
     ))
     staff_text = (
         f"⚡️ <b>ФАРМ СЕРВЕР ДЛЯ СТАФФА (Фора {CHANNEL_DELAY_SECONDS} сек.)</b> ⚡️\n"
