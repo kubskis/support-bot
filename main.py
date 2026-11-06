@@ -1778,6 +1778,7 @@ def _init_db_sync():
                     added_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
                 );
                 ALTER TABLE prelink_users ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP WITH TIME ZONE;
+                ALTER TABLE secret_posts ADD COLUMN IF NOT EXISTS link TEXT;
                 ALTER TABLE prelink_users ADD COLUMN IF NOT EXISTS is_test BOOLEAN DEFAULT FALSE;
                 ALTER TABLE prelink_users ADD COLUMN IF NOT EXISTS renew_reminded_for TIMESTAMP WITH TIME ZONE;
                 CREATE TABLE IF NOT EXISTS mutator_badges (
@@ -6304,8 +6305,8 @@ async def pub_my_posts(call: CallbackQuery):
         return
     kb_bts = []
     for pid, stype, mid in posts:
-        kb_bts.append([IB(text=f"📌 {stype} (ID: {mid}) — Завершить", callback_data=f"pub_close_{pid}")])
-    await call.message.answer("📋 Ваши активные секретки:\nНажмите, чтобы досрочно удалить ссылку в канале:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_bts))
+        kb_bts.append([IB(text=f"📌 {stype} (ID: {mid})", callback_data=f"lnk_m_sec_{pid}")])
+    await call.message.answer("📋 Ваши активные секретки:\nНажмите на пост, чтобы изменить в нём ссылку или закрыть его:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_bts))
     await call.answer()
 
 @router.callback_query(F.data.startswith("pub_close_"))
@@ -6541,9 +6542,9 @@ async def pub_confirm(call: CallbackQuery, state: FSMContext):
                     with get_db() as conn:
                         with conn.cursor() as cur:
                             cur.execute(
-                                "INSERT INTO secret_posts (user_id, channel_id, message_id, secret_type, base_text, photo_id, created_at) "
-                                "VALUES (%s, %s, 0, %s, %s, %s, CURRENT_TIMESTAMP) RETURNING id",
-                                (call.from_user.id, ch_id, stype, final_txt, data.get("photo_id"))
+                                "INSERT INTO secret_posts (user_id, channel_id, message_id, secret_type, base_text, photo_id, created_at, link) "
+                                "VALUES (%s, %s, 0, %s, %s, %s, CURRENT_TIMESTAMP, %s) RETURNING id",
+                                (call.from_user.id, ch_id, stype, final_txt, data.get("photo_id"), data.get("link"))
                             )
                             return cur.fetchone()[0]
                 
@@ -7310,9 +7311,9 @@ async def pub_my_saboteurs(call: CallbackQuery):
     kb_bts = []
     for s_id, r_nick, meth, p_id in srvs:
         clean_n = re.sub(r'<[^>]+>', '', r_nick)
-        kb_bts.append([IB(text=f"❌ Снять: {clean_n} ({meth})", callback_data=f"sab_del_{s_id}_{p_id}")])
+        kb_bts.append([IB(text=f"🕵️ {clean_n} ({meth})", callback_data=f"lnk_m_sab_{s_id}")])
 
-    await call.message.answer("📋 Ваши активные серверы саботера:\nНажмите на кнопку, чтобы удалить сервер из канала:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_bts))
+    await call.message.answer("📋 Ваши активные серверы саботера:\nНажмите на сервер, чтобы изменить его ссылку или снять его:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_bts))
     await call.answer()
 
 @router.callback_query(F.data.startswith("sab_del_"))
@@ -7746,9 +7747,9 @@ async def pub_my_mutators(call: CallbackQuery):
     kb_rows = []
     for b_id, created in rows:
         when = created.astimezone(MSK_TZ).strftime("%d.%m %H:%M") if created else ""
-        kb_rows.append([IB(text=f"🔒 Завершить пост от {when} (№{b_id})", callback_data=f"mut_close_{b_id}")])
+        kb_rows.append([IB(text=f"🧬 Пост от {when} (№{b_id})", callback_data=f"lnk_m_mut_{b_id}")])
     await call.message.answer(
-        "🧬 <b>Ваши активные бейджи мутатора:</b>\nНажмите, чтобы завершить пост досрочно.",
+        "🧬 <b>Ваши активные бейджи мутатора:</b>\nНажмите на пост, чтобы изменить ссылку или закрыть его.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows), parse_mode="HTML"
     )
     await call.answer()
@@ -7793,6 +7794,218 @@ async def mut_close_proc(call: CallbackQuery):
         pass
     await notify_owner_closed(owner_uid, uid, "бейдж мутатора")
     await call.answer("Пост завершён.")
+
+# ----------------------------------------------------------------------
+# СМЕНА ССЫЛКИ В ПОСТЕ (секретки, мутатор, исследователь, саботёр, фарм)
+# Таймеры не трогаем: они считаются от даты создания поста, а не от ссылки.
+# ----------------------------------------------------------------------
+class LinkEditStates(StatesGroup):
+    waiting_link = State()
+
+_LNK_KINDS = {"sec": "секретка", "mut": "бейдж мутатора", "res": "бейдж исследователя",
+              "sab": "сервер саботёра", "farm": "фарм-сервер"}
+
+def _lnk_norm(s):
+    s = (s or "").strip()
+    if not (s.startswith("https://") or s.startswith("http://")) or any(ch.isspace() for ch in s) or len(s) > 500:
+        return None
+    return s
+
+def _lnk_guess(text):
+    m = re.search(r'https?://[^\s<>"\']+', text or "")
+    return m.group(0) if m else None
+
+async def _lnk_load(kind, rid):
+    """Возвращает dict: channel, mid, link, owner, post_id, active, text (для секреток)."""
+    def _q():
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                if kind == "sec":
+                    cur.execute("SELECT channel_id, message_id, user_id, is_expired, link, base_text FROM secret_posts WHERE id = %s", (rid,))
+                    r = cur.fetchone()
+                    if not r: return None
+                    return {"channel": r[0], "mid": r[1], "owner": r[2], "active": (not r[3]) and bool(r[1]),
+                            "link": r[4] or _lnk_guess(r[5]), "post_id": None, "text": r[5]}
+                if kind == "mut":
+                    cur.execute("SELECT channel_id, message_id, user_id, is_expired, link FROM mutator_badges WHERE id = %s", (rid,))
+                    r = cur.fetchone()
+                    if not r: return None
+                    return {"channel": r[0], "mid": r[1], "owner": r[2], "active": (not r[3]) and bool(r[1]),
+                            "link": r[4], "post_id": None, "text": None}
+                if kind == "res":
+                    cur.execute("SELECT channel_id, message_id, user_id, is_closed, link FROM researcher_badges WHERE id = %s", (rid,))
+                    r = cur.fetchone()
+                    if not r: return None
+                    return {"channel": r[0], "mid": r[1], "owner": r[2], "active": (not r[3]) and bool(r[1]),
+                            "link": r[4], "post_id": None, "text": None}
+                if kind in ("sab", "farm"):
+                    st, pt = ("saboteur_servers", "saboteur_posts") if kind == "sab" else ("farm_servers", "farm_posts")
+                    cur.execute(f"SELECT s.user_id, s.link, s.is_active, s.post_id, p.channel_id, p.message_id, p.is_active "
+                                f"FROM {st} s JOIN {pt} p ON s.post_id = p.id WHERE s.id = %s", (rid,))
+                    r = cur.fetchone()
+                    if not r: return None
+                    return {"channel": r[4], "mid": r[5], "owner": r[0], "active": bool(r[2]) and bool(r[6]),
+                            "link": r[1], "post_id": r[3], "text": None}
+        return None
+    return await asyncio.to_thread(_q)
+
+async def _lnk_allowed(uid, rec):
+    if not rec or not rec["active"]:
+        return False
+    return rec["owner"] == uid or await is_main_admin(uid)
+
+async def _lnk_edit_channel(label, ch_id, mid, text, slot, natural):
+    """Правка поста в канале: юзербот (премиум-эмодзи) или обычный бот как запасной путь."""
+    if userbot:
+        if not userbot.is_connected():
+            await userbot.connect()
+        peer = ch_id
+        if isinstance(peer, str) and (peer.startswith("-100") or peer.lstrip("-").isdigit()):
+            peer = int(peer)
+        parsed, ents = await parse_telethon_custom_emojis(userbot, text)
+        await _ub_edit_text(label, peer, mid, parsed, ents, rich_src=text, slot=slot, natural=natural)
+        return
+    try:
+        await bot.edit_message_caption(chat_id=ch_id, message_id=mid, caption=_bot_tpl(text), parse_mode="HTML")
+    except TelegramBadRequest as tb:
+        low = str(tb).lower()
+        if "no caption" in low or "there is no text" in low:
+            await bot.edit_message_text(chat_id=ch_id, message_id=mid, text=_bot_tpl(text), parse_mode="HTML",
+                                        link_preview_options=LinkPreviewOptions(is_disabled=True))
+        elif "message is not modified" in low:
+            return
+        else:
+            raise
+
+async def _lnk_apply(kind, rid, rec, new):
+    """Меняет ссылку в БД и в посте. Возвращает (ok, причина)."""
+    def _db_set(sql, params):
+        def _w():
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(sql, params)
+        return asyncio.to_thread(_w)
+    old = rec["link"]
+    try:
+        if kind == "mut":
+            text = await render_mutator_active(new)
+            await _lnk_edit_channel("[Мутатор, ссылка]", rec["channel"], rec["mid"], text,
+                                    slot=MUTATOR_PHOTO, natural=True)
+            await _db_set("UPDATE mutator_badges SET link = %s WHERE id = %s", (new, rid))
+        elif kind == "res":
+            text = await render_researcher_active(new)
+            await _lnk_edit_channel("[Исследователь, ссылка]", rec["channel"], rec["mid"], text,
+                                    slot=RESEARCHER_PHOTO, natural=True)
+            await _db_set("UPDATE researcher_badges SET link = %s WHERE id = %s", (new, rid))
+        elif kind == "sec":
+            if not old or old not in (rec["text"] or ""):
+                return False, "не нашёл старую ссылку в тексте поста"
+            new_text = rec["text"].replace(old, new)
+            await _lnk_edit_channel("[Секретка, ссылка]", rec["channel"], rec["mid"], new_text,
+                                    slot=lambda: _secret_photo_bytes(rid), natural=True)
+            await _db_set("UPDATE secret_posts SET base_text = %s, link = %s WHERE id = %s", (new_text, new, rid))
+        elif kind in ("sab", "farm"):
+            tbl = "saboteur_servers" if kind == "sab" else "farm_servers"
+            await _db_set(f"UPDATE {tbl} SET link = %s WHERE id = %s", (new, rid))
+            try:
+                if kind == "sab":
+                    await publish_or_update_saboteur_channel(rec["channel"], rec["post_id"])
+                else:
+                    await publish_or_update_farm_channel(rec["channel"], rec["post_id"])
+            except Exception as e:
+                await _db_set(f"UPDATE {tbl} SET link = %s WHERE id = %s", (old, rid))
+                return False, str(e)
+        else:
+            return False, "неизвестный тип"
+        return True, ""
+    except Exception as e:
+        logging.error(f"Смена ссылки ({kind} #{rid}) не удалась: {e}", exc_info=True)
+        return False, f"{type(e).__name__}: {e}"
+
+@router.callback_query(F.data.startswith("lnk_m_"))
+async def lnk_menu(call: CallbackQuery):
+    uid = call.from_user.id
+    if not await is_main_admin(uid) and not await is_secret_publisher(uid):
+        return
+    try:
+        _, _, kind, rid = call.data.split("_", 3)
+        rid = int(rid)
+    except ValueError:
+        await call.answer()
+        return
+    rec = await _lnk_load(kind, rid)
+    if not await _lnk_allowed(uid, rec):
+        await call.answer("Этот пост уже завершён или это не ваш пост.", show_alert=True)
+        return
+    if kind == "sec":
+        close_cb = f"pub_close_{rid}"
+    elif kind == "mut":
+        close_cb = f"mut_close_{rid}"
+    elif kind == "res":
+        close_cb = f"res_close_{rid}"
+    elif kind == "sab":
+        close_cb = f"sab_del_{rid}_{rec['post_id']}"
+    else:
+        close_cb = f"farm_del_{rid}_{rec['post_id']}"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [IB(text="🔗 Изменить ссылку", callback_data=f"lnk_e_{kind}_{rid}")],
+        [IB(text="⛔ Закрыть пост", callback_data=close_cb)],
+    ])
+    cur_link = html.escape(rec["link"] or "—")
+    await call.message.answer(
+        f"<b>{_LNK_KINDS[kind]}</b> (№{rid})\nСейчас ссылка: {cur_link}\n\nВыберите действие:",
+        reply_markup=kb, parse_mode="HTML")
+    await call.answer()
+
+@router.callback_query(F.data.startswith("lnk_e_"))
+async def lnk_edit_start(call: CallbackQuery, state: FSMContext):
+    uid = call.from_user.id
+    if not await is_main_admin(uid) and not await is_secret_publisher(uid):
+        return
+    try:
+        _, _, kind, rid = call.data.split("_", 3)
+        rid = int(rid)
+    except ValueError:
+        await call.answer()
+        return
+    rec = await _lnk_load(kind, rid)
+    if not await _lnk_allowed(uid, rec):
+        await call.answer("Этот пост уже завершён или это не ваш пост.", show_alert=True)
+        return
+    await state.set_state(LinkEditStates.waiting_link)
+    await state.update_data(lnk_kind=kind, lnk_id=rid)
+    await call.message.answer(
+        f"Пришлите новую ссылку для «{_LNK_KINDS[kind]}» (№{rid}), она должна начинаться с https://\n"
+        "Таймер поста не сбрасывается. Отмена: /cancel")
+    await call.answer()
+
+@router.message(LinkEditStates.waiting_link, F.chat.type == "private")
+async def lnk_edit_apply(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if text.startswith("/"):
+        await state.clear()
+        await message.answer("Смена ссылки отменена.")
+        return
+    new = _lnk_norm(text)
+    if not new:
+        await message.answer(f"{ICON_CROSS} Нужна ссылка, начинающаяся с https://. Пришлите ещё раз или /cancel.", parse_mode="HTML")
+        return
+    d = await state.get_data()
+    kind, rid = d.get("lnk_kind"), d.get("lnk_id")
+    await state.clear()
+    uid = message.from_user.id
+    rec = await _lnk_load(kind, rid)
+    if not await _lnk_allowed(uid, rec):
+        await message.answer("Этот пост уже завершён или это не ваш пост.")
+        return
+    if rec["link"] == new:
+        await message.answer("Эта ссылка уже стоит в посте.")
+        return
+    ok, why = await _lnk_apply(kind, rid, rec, new)
+    if ok:
+        await message.answer(f"{ICON_CHECK} Ссылка в посте изменена, таймер не сброшен.", parse_mode="HTML")
+    else:
+        await message.answer(f"{ICON_CROSS} Не удалось обновить пост, ссылка осталась прежней: {html.escape(why)}", parse_mode="HTML")
 
 # ----------------------------------------------------------------------
 # АДМИНКА: ЗАКРЫТИЕ ЧУЖИХ ПОСТОВ (секретки, саботёр, фарм, мутатор, исследователь)
@@ -7981,9 +8194,9 @@ async def pub_my_researchers(call: CallbackQuery):
     kb_rows = []
     for b_id, link, created in rows:
         when = created.astimezone(MSK_TZ).strftime("%d.%m %H:%M") if created else ""
-        kb_rows.append([IB(text=f"🔒 Закрыть пост от {when} (№{b_id})", callback_data=f"res_close_{b_id}")])
+        kb_rows.append([IB(text=f"🔍 Пост от {when} (№{b_id})", callback_data=f"lnk_m_res_{b_id}")])
     await call.message.answer(
-        "🔍 <b>Ваши активные бейджи исследователя:</b>\nНажмите на пост, чтобы закрыть его в канале.",
+        "🔍 <b>Ваши активные бейджи исследователя:</b>\nНажмите на пост, чтобы изменить ссылку или закрыть его.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows), parse_mode="HTML"
     )
     await call.answer()
@@ -8207,10 +8420,10 @@ async def pub_my_farms(call: CallbackQuery):
     kb_bts = []
     for s_id, r_nick, sec_cnt, p_id in srvs:
         clean_n = re.sub(r'<[^>]+>', '', r_nick or "")
-        kb_bts.append([IB(text=f"❌ Снять: {clean_n} ({sec_cnt} секций)", callback_data=f"farm_del_{s_id}_{p_id}")])
+        kb_bts.append([IB(text=f"🌾 {clean_n} ({sec_cnt} секций)", callback_data=f"lnk_m_farm_{s_id}")])
 
     await call.message.answer(
-        "📋 Ваши активные фарм серверы:\nНажмите на кнопку, чтобы снять сервер из канала:",
+        "📋 Ваши активные фарм серверы:\nНажмите на сервер, чтобы изменить его ссылку или снять его:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_bts)
     )
     await call.answer()
