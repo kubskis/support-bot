@@ -432,7 +432,8 @@ async def process_day(d: date):
             cnt = await _count_user(u, d0, d)
             if cnt:
                 continue
-            if any(u in await excused_on(d0 + timedelta(days=i)) for i in range(3)):
+            excs = [await excused_on(d0 + timedelta(days=i)) for i in range(3)]
+            if any(u in ex for ex in excs):
                 continue
             if await q("SELECT 1 FROM norm_warns WHERE user_id=%s AND day BETWEEN %s AND %s AND kind IN ('day','streak')", (u, d0, d), one=True):
                 continue
