@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
-"""Ручная выдача и снятие секреток в статистике — только владелец бота (ADMIN_ID).
+"""Ручная выдача и снятие зачётов в статистике — только владелец бота (ADMIN_ID).
 Кнопки видны в панели секреток всем главным админам, но для остальных отвечают отказом.
 
-• Выдать: создаёт N записей в secret_posts (без поста в канале, помечены «ручная выдача», скрыты от публикаторов).
-  Можно задним числом: сегодня, вчера или любая дата (ДД.ММ или ДД.ММ.ГГГГ). Время записи — 12:00 МСК.
-• Убрать: удаляет N записей этого человека (старые или новые) только из статистики.
-После любого изменения пересчитываются итоги уже закрытых дней, поэтому рекорд общего числа за день тоже обновляется.
-Сообщения в канале не трогаются."""
+Типы: секретка, саботёр, фарм-сервер, мутатор, исследователь.
+• Выдать: пишет записи в manual_grants (без поста в канале), с датой (сегодня, вчера или ДД.ММ / ДД.ММ.ГГГГ).
+  Секретка, саботёр, фарм и исследователь идут в норму за свой день и в статистику; мутатор — только в статистику.
+• Убрать: удаляет выданные вручную записи выбранного типа (самые старые или новые) — только из статистики.
+  Для секретки дополнительно убираются старые ручные записи (channel 'manual' в secret_posts), если они остались.
+Сообщения в канале и настоящие серверы/бейджи не трогаются. После изменения пересчитываются итоги затронутых дней."""
 import asyncio
 import html
 import logging
@@ -27,11 +28,21 @@ _resolve = None      # resolve_user_refs(text) -> (ids, failed)
 _label = None        # get_user_label(uid) -> str
 MAX_N = 200
 MANUAL_CHANNEL = "manual"
-MANUAL_TYPE = None          # без типа: в статистике типов не участвуют
+
+KINDS = {
+    "sec": "🔮 Секретка",
+    "sab": "🕵 Саботёр",
+    "farm": "🌾 Фарм-сервер",
+    "mut": "🧬 Мутатор",
+    "res": "🔬 Исследователь",
+}
+KIND_NAME = {"sec": "секретка", "sab": "саботёр", "farm": "фарм-сервер", "mut": "мутатор", "res": "исследователь"}
+KIND_NORM_NOTE = {"mut": "В норму мутатор не входит — только в статистику."}
 
 
 class SAdj(StatesGroup):
     user = State()
+    kind = State()
     count = State()
     day = State()
     side = State()
@@ -63,10 +74,31 @@ async def _deny(cb: CallbackQuery) -> bool:
     return False
 
 
-async def _stat(uid) -> int:
+async def _counts(uid) -> dict:
+    """Текущие зачёты человека по типам (секретки = все записи в secret_posts + ручные секретки)."""
     def f(cur):
         cur.execute("SELECT COUNT(*) FROM secret_posts WHERE user_id = %s", (uid,))
-        return cur.fetchone()[0]
+        out = {"sec": cur.fetchone()[0]}
+        cur.execute("SELECT kind, COUNT(*) FROM manual_grants WHERE user_id = %s GROUP BY kind", (uid,))
+        man = dict(cur.fetchall())
+        for k in KINDS:
+            if k != "sec":
+                out[k] = 0
+        for k, v in man.items():
+            out[k] = out.get(k, 0) + int(v)
+        return out
+    return await _run(f)
+
+
+async def _manual_have(uid, kind) -> int:
+    """Сколько ещё можно убрать вручную выданного этого типа."""
+    def f(cur):
+        cur.execute("SELECT COUNT(*) FROM manual_grants WHERE user_id = %s AND kind = %s", (uid, kind))
+        n = cur.fetchone()[0]
+        if kind == "sec":
+            cur.execute("SELECT COUNT(*) FROM secret_posts WHERE user_id = %s AND channel_id = %s", (uid, MANUAL_CHANNEL))
+            n += cur.fetchone()[0]
+        return n
     return await _run(f)
 
 
@@ -93,6 +125,19 @@ def _parse_day(txt: str):
     return None
 
 
+def _kinds_kb(mode):
+    rows, line = [], []
+    for k, title in KINDS.items():
+        line.append(InlineKeyboardButton(text=title, callback_data=f"sadj_kind:{k}"))
+        if len(line) == 2:
+            rows.append(line)
+            line = []
+    if line:
+        rows.append(line)
+    rows.append(_cancel_row())
+    return _kb(rows)
+
+
 # ---------------------------------------------------------------- меню
 @router.callback_query(F.data == "sadj_menu")
 async def sadj_menu(cb: CallbackQuery, state: FSMContext):
@@ -100,12 +145,14 @@ async def sadj_menu(cb: CallbackQuery, state: FSMContext):
         return
     await state.clear()
     await cb.message.answer(
-        "🛠 <b>Секретки вручную</b>\n\n"
-        "➕ <b>Выдать</b> — добавить человеку секретки в статистику (без поста в канале), можно задним числом.\n"
-        "➖ <b>Убрать</b> — вычесть секретки из статистики (например, тестовые).",
+        "🛠 <b>Выдача вручную</b>\n\n"
+        "➕ <b>Выдать</b> — засчитать человеку секретку, саботёра, фарм-сервер, мутатора или исследователя.\n"
+        "Секретка, саботёр, фарм и исследователь идут в норму за свой день и в статистику; мутатор — только в статистику. "
+        "Можно задним числом.\n"
+        "➖ <b>Убрать</b> — вычесть вручную выданные зачёты выбранного типа (например, ошибочные).",
         parse_mode="HTML",
-        reply_markup=_kb([[InlineKeyboardButton(text="➕ Выдать секретки", callback_data="sadj_add"),
-                           InlineKeyboardButton(text="➖ Убрать секретки", callback_data="sadj_del")],
+        reply_markup=_kb([[InlineKeyboardButton(text="➕ Выдать", callback_data="sadj_add"),
+                           InlineKeyboardButton(text="➖ Убрать", callback_data="sadj_del")],
                           _cancel_row()]))
     await cb.answer()
 
@@ -128,7 +175,7 @@ async def sadj_start(cb: CallbackQuery, state: FSMContext):
     await state.clear()
     await state.update_data(mode=mode)
     await state.set_state(SAdj.user)
-    what = "выдать секретки" if mode == "add" else "убрать секретки из статистики"
+    what = "выдать зачёт" if mode == "add" else "убрать выданный вручную зачёт"
     await cb.message.answer(f"Кому {what}?\nПришлите <b>ID</b> или <b>@ник</b> одного человека.",
                             parse_mode="HTML", reply_markup=_kb([_cancel_row()]))
     await cb.answer()
@@ -144,13 +191,29 @@ async def sadj_user(message: Message, state: FSMContext):
         return await message.answer("Нужен один человек: пришлите один ID или один @ник.", reply_markup=_kb([_cancel_row()]))
     uid = ids[0]
     await state.update_data(uid=uid)
-    await state.set_state(SAdj.count)
+    await state.set_state(SAdj.kind)
     label = html.unescape(await _label(uid))
-    mode = (await state.get_data()).get("mode")
-    now_stat = await _stat(uid)
-    await message.answer(f"Человек: <b>{html.escape(label)}</b> ({uid})\nСейчас в статистике: <b>{now_stat}</b> секр.\n\n"
-                         f"Сколько секреток {'выдать' if mode == 'add' else 'убрать'}? Пришлите число (1–{MAX_N}).",
-                         parse_mode="HTML", reply_markup=_kb([_cancel_row()]))
+    c = await _counts(uid)
+    have = "\n".join(f"{KINDS[k]}: <b>{c.get(k, 0)}</b>" for k in KINDS)
+    await message.answer(f"Человек: <b>{html.escape(label)}</b> ({uid})\nСейчас в статистике:\n{have}\n\nКакой тип?",
+                         parse_mode="HTML", reply_markup=_kinds_kb(None))
+
+
+@router.callback_query(SAdj.kind, F.data.startswith("sadj_kind:"))
+async def sadj_kind(cb: CallbackQuery, state: FSMContext):
+    if await _deny(cb):
+        return
+    kind = cb.data.split(":")[1]
+    if kind not in KINDS:
+        return await cb.answer("Неизвестный тип", show_alert=True)
+    await state.update_data(kind=kind)
+    await state.set_state(SAdj.count)
+    d = await state.get_data()
+    verb = "выдать" if d.get("mode") == "add" else "убрать"
+    note = f"\n<i>{KIND_NORM_NOTE[kind]}</i>" if kind in KIND_NORM_NOTE else ""
+    await cb.message.answer(f"Тип: <b>{KINDS[kind]}</b>.{note}\n\nСколько {verb}? Пришлите число (1–{MAX_N}).",
+                            parse_mode="HTML", reply_markup=_kb([_cancel_row()]))
+    await cb.answer()
 
 
 @router.message(SAdj.count, F.text)
@@ -215,20 +278,23 @@ async def sadj_side(cb: CallbackQuery, state: FSMContext):
 
 async def _ask_confirm(msg, state: FSMContext):
     d = await state.get_data()
-    uid, n, mode = d["uid"], d["n"], d["mode"]
+    uid, n, mode, kind = d["uid"], d["n"], d["mode"], d["kind"]
     label = html.unescape(await _label(uid))
     if mode == "add":
         day = date.fromisoformat(d["day"])
-        text = (f"Выдать <b>{n}</b> секр. человеку <b>{html.escape(label)}</b> за <b>{_fmt_day(day)}</b>?\n"
-                "Они попадут в общую статистику, но не в норму, рекорды и статистику по типам.")
+        if kind == "mut":
+            tail = "Засчитается в статистику (в норму мутатор не входит)."
+        else:
+            tail = f"Засчитается в норму за этот день и в статистику."
+        text = (f"Выдать <b>{n}</b> × {KINDS[kind]} человеку <b>{html.escape(label)}</b> за <b>{_fmt_day(day)}</b>?\n{tail}")
     else:
-        have = await _stat(uid)
+        have = await _manual_have(uid, kind)
         if n > have:
             n = have
             await state.update_data(n=n)
         side = "самые старые" if d.get("side") == "old" else "самые новые"
-        text = (f"Убрать <b>{n}</b> секр. ({side}) у <b>{html.escape(label)}</b>?\n"
-                f"Сейчас: {have}, станет: {have - n}.\nЭто только из статистики, сообщения в канале не трогаются.")
+        text = (f"Убрать <b>{n}</b> × {KINDS[kind]} ({side}) у <b>{html.escape(label)}</b>?\n"
+                f"Снимаются только вручную выданные записи этого типа ({have} шт.). Сообщения в канале и серверы не трогаются.")
     await msg.answer(text, parse_mode="HTML",
                      reply_markup=_kb([[InlineKeyboardButton(text="✅ Подтвердить", callback_data="sadj_ok"),
                                         InlineKeyboardButton(text="✖️ Отмена", callback_data="sadj_cancel")]]))
@@ -240,46 +306,61 @@ async def sadj_ok(cb: CallbackQuery, state: FSMContext):
         return
     d = await state.get_data()
     await state.clear()
-    uid, n, mode = d["uid"], d["n"], d["mode"]
+    uid, n, mode, kind = d["uid"], d["n"], d["mode"], d["kind"]
     affected = []
     if mode == "add":
         day = date.fromisoformat(d["day"])
-        stamp = datetime(day.year, day.month, day.day, 12, 0, tzinfo=MSK)
         affected = [day]
 
         def f(cur):
             for _ in range(n):
-                cur.execute("INSERT INTO secret_posts (user_id, channel_id, message_id, secret_type, base_text, is_expired, created_at) "
-                            "VALUES (%s, %s, 0, %s, %s, TRUE, %s)", (uid, MANUAL_CHANNEL, MANUAL_TYPE, f"вручную от {cb.from_user.id}", stamp))
+                cur.execute("INSERT INTO manual_grants (user_id, kind, day, by_id) VALUES (%s, %s, %s, %s)",
+                            (uid, kind, day, cb.from_user.id))
         await _run(f)
-        res = f"✅ Выдано <b>{n}</b> секр. за {_fmt_day(day)}."
+        res = f"✅ Выдано <b>{n}</b> × {KINDS[kind]} за {_fmt_day(day)}."
     else:
         side = "ASC" if d.get("side") == "old" else "DESC"
 
         def pick(cur):
-            cur.execute(f"SELECT id, (created_at AT TIME ZONE 'Europe/Moscow')::date FROM secret_posts WHERE user_id = %s "
-                        f"ORDER BY created_at {side}, id {side} LIMIT %s", (uid, n))
-            return cur.fetchall()
-        rows = await _run(pick)
-        ids = [r[0] for r in rows]
-        affected = [r[1] for r in rows]
+            cur.execute(f"SELECT id, day FROM manual_grants WHERE user_id = %s AND kind = %s "
+                        f"ORDER BY day {side}, id {side} LIMIT %s", (uid, kind, n))
+            rows = cur.fetchall()
+            left = n - len(rows)
+            if kind == "sec" and left > 0:
+                cur.execute(f"SELECT id, (created_at AT TIME ZONE 'Europe/Moscow')::date FROM secret_posts "
+                            f"WHERE user_id = %s AND channel_id = %s ORDER BY created_at {side}, id {side} LIMIT %s",
+                            (uid, MANUAL_CHANNEL, left))
+                legacy = cur.fetchall()
+            else:
+                legacy = []
+            return rows, legacy
+
+        rows, legacy = await _run(pick)
+        g_ids = [r[0] for r in rows]
+        s_ids = [r[0] for r in legacy]
+        affected = [r[1] for r in rows] + [r[1] for r in legacy]
 
         def delete(cur):
-            if not ids:
-                return 0
-            cur.execute("DELETE FROM secret_posts WHERE id = ANY(%s)", (ids,))
-            return cur.rowcount
+            removed = 0
+            if g_ids:
+                cur.execute("DELETE FROM manual_grants WHERE id = ANY(%s)", (g_ids,))
+                removed += cur.rowcount
+            if s_ids:
+                cur.execute("DELETE FROM secret_posts WHERE id = ANY(%s)", (s_ids,))
+                removed += cur.rowcount
+            return removed
         removed = await _run(delete)
-        res = f"✅ Убрано <b>{removed}</b> секр. из статистики."
+        res = f"✅ Убрано <b>{removed}</b> × {KINDS[kind]} из статистики."
 
     try:
         import norm_mod
         await norm_mod.refresh_days(affected)
     except Exception as e:
         log.warning("пересчёт дней: %s", e)
-    total = await _stat(uid)
+    now = await _counts(uid)
     label = html.unescape(await _label(uid))
-    text = f"{res}\nЧеловек: <b>{html.escape(label)}</b> ({uid}). Теперь в статистике: <b>{total}</b>."
+    lines = "\n".join(f"{KINDS[k]}: <b>{now.get(k, 0)}</b>" for k in KINDS)
+    text = f"{res}\nЧеловек: <b>{html.escape(label)}</b> ({uid}). Теперь в статистике:\n{lines}"
     try:
         await cb.message.edit_text(text, parse_mode="HTML")
     except Exception:

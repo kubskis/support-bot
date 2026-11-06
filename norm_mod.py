@@ -55,6 +55,9 @@ CREATE TABLE IF NOT EXISTS norm_state(user_id BIGINT PRIMARY KEY, since DATE, al
 CREATE TABLE IF NOT EXISTS norm_flags(key TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS norm_holidays(day DATE PRIMARY KEY, note TEXT);
 CREATE TABLE IF NOT EXISTS norm_manual(id SERIAL PRIMARY KEY, user_id BIGINT, day DATE, note TEXT, by_id BIGINT, ts TIMESTAMPTZ DEFAULT now());
+CREATE TABLE IF NOT EXISTS manual_grants(id SERIAL PRIMARY KEY, user_id BIGINT NOT NULL, kind TEXT NOT NULL, day DATE NOT NULL,
+                                         by_id BIGINT, ts TIMESTAMPTZ DEFAULT now());
+CREATE INDEX IF NOT EXISTS manual_grants_u ON manual_grants(user_id, kind);
 """
 
 
@@ -250,13 +253,15 @@ _TZ = "'Europe/Moscow'"
 
 async def per_user_day(d1: date, d2: date) -> list:
     """[(user_id, day, n)] за период: секретки в окне приёма + ручные зачёты
-    + фарм и саботёр (сервер, который провели и сняли от часа), + бейджи исследователя (любое время).
+    + фарм и саботёр (сервер, который провели и сняли от часа), + бейджи исследователя (любое время),
+    + выданное главным админом вручную по типу (manual_grants; мутатор в норму не входит).
     Бейджи мутатора в норму не входят."""
     a, b = await window()
     rows = await q(f"""SELECT user_id, day, SUM(n) FROM (
         SELECT user_id, {_LOC}::date AS day, COUNT(*) AS n FROM secret_posts
           WHERE channel_id <> 'manual' AND {_LOC}::date BETWEEN %s AND %s AND {_WIN_SQL} GROUP BY 1,2
         UNION ALL SELECT user_id, day, COUNT(*) FROM norm_manual WHERE day BETWEEN %s AND %s GROUP BY 1,2
+        UNION ALL SELECT user_id, day, COUNT(*) FROM manual_grants WHERE kind <> 'mut' AND day BETWEEN %s AND %s GROUP BY 1,2
         UNION ALL SELECT user_id, (ended_at AT TIME ZONE {_TZ})::date, COUNT(*) FROM saboteur_servers
           WHERE ended_at IS NOT NULL AND ended_at - created_at >= INTERVAL '1 hour'
             AND (ended_at AT TIME ZONE {_TZ})::date BETWEEN %s AND %s GROUP BY 1,2
@@ -265,7 +270,7 @@ async def per_user_day(d1: date, d2: date) -> list:
             AND (ended_at AT TIME ZONE {_TZ})::date BETWEEN %s AND %s GROUP BY 1,2
         UNION ALL SELECT user_id, (created_at AT TIME ZONE {_TZ})::date, COUNT(*) FROM researcher_badges
           WHERE message_id <> 0 AND (created_at AT TIME ZONE {_TZ})::date BETWEEN %s AND %s GROUP BY 1,2
-        ) t GROUP BY 1,2""", (d1, d2, a, b, d1, d2, d1, d2, d1, d2, d1, d2), many=True)
+        ) t GROUP BY 1,2""", (d1, d2, a, b, d1, d2, d1, d2, d1, d2, d1, d2, d1, d2), many=True)
     return [(u, d, int(n)) for u, d, n in (rows or [])]
 
 

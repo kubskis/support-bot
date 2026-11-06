@@ -16239,30 +16239,73 @@ async def _site_helper_stats(uid: int) -> dict:
 
 _BADGE_TABLES = (("saboteur", "saboteur_servers"), ("farm", "farm_servers"), ("mutator", "mutator_badges"), ("researcher", "researcher_badges"))
 
+_MANUAL_KEY = {"sec": "secret", "sab": "saboteur", "farm": "farm", "mut": "mutator", "res": "researcher"}
+
+async def _manual_counts(uid=None) -> dict:
+    """Вручную выданные зачёты (manual_grants) по типу: {kind: (всего, за 24 ч)}. uid=None — по всем."""
+    sql = ("SELECT kind, COUNT(*), COUNT(*) FILTER (WHERE ts >= CURRENT_TIMESTAMP - INTERVAL '24 hours') "
+           "FROM manual_grants" + (" WHERE user_id = %s" if uid is not None else "") + " GROUP BY kind")
+    try:
+        rows = await _db_all(sql, (uid,) if uid is not None else ())
+    except Exception as e:
+        logging.warning(f"Статистика: ручные зачёты: {e}")
+        rows = []
+    return {str(k): (int(t), int(d)) for k, t, d in rows}
+
 async def _site_publisher_stats(uid: int) -> dict:
     tot = await _db_one(
         "SELECT COUNT(*), COUNT(*) FILTER (WHERE created_at >= CURRENT_TIMESTAMP - INTERVAL '24 hours') FROM secret_posts WHERE user_id = %s", (uid,))
     types = await _db_all("SELECT secret_type, COUNT(*) FROM secret_posts WHERE user_id = %s AND secret_type IS NOT NULL GROUP BY secret_type ORDER BY 2 DESC, 1 LIMIT 5", (uid,))
     ranks = await _db_all("SELECT user_id, COUNT(*) FROM secret_posts GROUP BY user_id ORDER BY 2 DESC, 1")
     rank = next((i for i, r in enumerate(ranks, 1) if r[0] == uid), None)
+    manual = await _manual_counts(uid)
+    sec_t, sec_d = manual.get("sec", (0, 0))
+    tot_total, tot_day = int(tot[0]) + sec_t, int(tot[1]) + sec_d
     other = {}
     for key, table in _BADGE_TABLES:
+        mk = next((k for k, v in _MANUAL_KEY.items() if v == key), None)
+        m_t, m_d = manual.get(mk, (0, 0)) if mk else (0, 0)
         try:
             r = await _db_one(
                 f"SELECT COUNT(*), COUNT(*) FILTER (WHERE created_at >= CURRENT_TIMESTAMP - INTERVAL '24 hours') FROM {table} WHERE user_id = %s", (uid,))
-            other[key] = {"total": int(r[0]), "day": int(r[1])}
+            other[key] = {"total": int(r[0]) + m_t, "day": int(r[1]) + m_d}
         except Exception as e:
             logging.warning(f"Кабинет: статистика {table}: {e}")
-            other[key] = {"total": 0, "day": 0}
+            other[key] = {"total": m_t, "day": m_d}
     recent = await _db_all(
         "SELECT secret_type, EXTRACT(EPOCH FROM created_at), is_expired FROM secret_posts WHERE user_id = %s AND message_id > 0 "
         "ORDER BY created_at DESC LIMIT 8", (uid,))
     return {
-        "total": int(tot[0]), "day": int(tot[1]), "rank": rank, "of": len(ranks),
+        "total": tot_total, "day": tot_day, "rank": rank, "of": len(ranks),
         "types": [{"type": str(t[0] or "Секретка")[:40], "count": int(t[1])} for t in types],
         "other": other,
         "recent": [{"type": str(x[0] or "Секретка")[:40], "at": int(x[1]), "expired": bool(x[2])} for x in recent],
     }
+
+async def _people_kind_stats(limit: int = 15) -> list:
+    """Кто сколько провёл по типам: секретки, саботёр, фарм, мутатор, исследователь (с ручными зачётами). Топ по сумме."""
+    per = {}
+    def add(uid, kind, n):
+        per.setdefault(int(uid), {"sec": 0, "sab": 0, "farm": 0, "mut": 0, "res": 0})[kind] += int(n)
+    for uid_, n in await _db_all("SELECT user_id, COUNT(*) FROM secret_posts GROUP BY user_id"):
+        add(uid_, "sec", n)
+    for key, table in (("sab", "saboteur_servers"), ("farm", "farm_servers"), ("mut", "mutator_badges"), ("res", "researcher_badges")):
+        try:
+            for uid_, n in await _db_all(f"SELECT user_id, COUNT(*) FROM {table} GROUP BY user_id"):
+                add(uid_, key, n)
+        except Exception as e:
+            logging.warning(f"Статистика по людям: {table}: {e}")
+    try:
+        for uid_, kind, n in await _db_all("SELECT user_id, kind, COUNT(*) FROM manual_grants GROUP BY user_id, kind"):
+            add(uid_, str(kind), n)
+    except Exception as e:
+        logging.warning(f"Статистика по людям: ручные зачёты: {e}")
+    rows = sorted(per.items(), key=lambda x: -sum(x[1].values()))[:limit]
+    out = []
+    for uid_, c in rows:
+        out.append({"id": uid_, "name": await _plain_name(uid_), "sec": c["sec"], "sab": c["sab"], "farm": c["farm"],
+                    "mut": c["mut"], "res": c["res"], "total": sum(c.values())})
+    return out
 
 async def _site_admin_stats() -> dict:
     """Полная статистика проекта для главных админов. Кэш 60 с (общий для всех админов)."""
@@ -16323,13 +16366,19 @@ async def _site_admin_stats_compute() -> dict:
     sp = await _db_one(
         "SELECT COUNT(*), COUNT(*) FILTER (WHERE created_at >= CURRENT_TIMESTAMP - INTERVAL '24 hours'), "
         "COUNT(*) FILTER (WHERE created_at >= CURRENT_TIMESTAMP - INTERVAL '7 days') FROM secret_posts")
-    published = {"secrets": {"total": int(sp[0]), "day": int(sp[1]), "week": int(sp[2])}}
+    manual = await _manual_counts()
+    m_sec = manual.get("sec", (0, 0))
+    published = {"secrets": {"total": int(sp[0]) + m_sec[0], "day": int(sp[1]) + m_sec[1], "week": int(sp[2])}}
     for key, table in _BADGE_TABLES:
+        mk = next((k for k, v in _MANUAL_KEY.items() if v == key), None)
+        m_t, m_d = manual.get(mk, (0, 0)) if mk else (0, 0)
         try:
             r = await _db_one(f"SELECT COUNT(*), COUNT(*) FILTER (WHERE created_at >= CURRENT_TIMESTAMP - INTERVAL '24 hours') FROM {table}")
-            published[key] = {"total": int(r[0]), "day": int(r[1])}
+            published[key] = {"total": int(r[0]) + m_t, "day": int(r[1]) + m_d}
         except Exception as e:
             logging.warning(f"Кабинет: статистика {table}: {e}")
+            published[key] = {"total": m_t, "day": m_d}
+    out["people"] = await _people_kind_stats()
     out["published"] = published
     pay = {}
     for key, interval in (("week", "7 days"), ("month", "30 days")):

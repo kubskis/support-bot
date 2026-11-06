@@ -186,6 +186,16 @@
       pb.appendChild(el('h3','cab-sub','Топ публикаторов секреток'));
       var u3=el('ul','tlist trank'); a.publishers.forEach(function(x,i){var li=el('li'); li.appendChild(el('span','medal',MEDAL[i]||String(i+1)+'.')); li.appendChild(el('span','tc',x.name)); li.appendChild(el('b',null,String(x.count))); li.appendChild(el('span','tm','за 24 ч: '+x.day)); u3.appendChild(li)}); pb.appendChild(u3);
     }
+    if(a.people&&a.people.length){
+      pb.appendChild(el('h3','cab-sub','Кто что провёл (по людям)'));
+      var u4=el('ul','tlist trank'); a.people.forEach(function(x,i){
+        var li=el('li'); li.appendChild(el('span','medal',MEDAL[i]||String(i+1)+'.')); li.appendChild(el('span','tc',x.name));
+        li.appendChild(el('b',null,String(x.total)));
+        li.appendChild(el('span','tm','секр. '+x.sec+' · саботёр '+x.sab+' · фарм '+x.farm+' · мутатор '+x.mut+' · исслед. '+x.res));
+        u4.appendChild(li);
+      });
+      pb.appendChild(u4);
+    }
     var py=a.payments||{};
     pb.appendChild(el('h3','cab-sub','Оплаты и заявки'));
     pb.appendChild(tiles([[(py.week||{}).count||0,'оплат за 7 дней'],[((py.week||{}).stars||0)+' ⭐','сумма за 7 дней'],[(py.month||{}).count||0,'оплат за 30 дней'],[((py.month||{}).stars||0)+' ⭐','сумма за 30 дней'],[(a.apps||{}).helper||0,'заявок хелперов'],[(a.apps||{}).secret||0,'заявок искателей'],[(a.recruit_subs||{}).helper||0,'ждут набора хелперов'],[(a.recruit_subs||{}).secret||0,'ждут набора искателей']]));
