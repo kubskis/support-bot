@@ -728,55 +728,189 @@ def _kb(rows):
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+OWN_REASON_BTN = "✏️ Своя причина"
+_EXCUSE_MAX_DAYS = 14
+
+
 @router.message(Command("otgul"))
 async def cmd_otgul(message: Message):
     if not await _allowed(message.from_user.id):
         return
     uid = message.from_user.id
-    await message.reply(f"{html.escape(message.from_user.full_name)}, причина отгула от норматива:\n<i>Кнопки доступны только вам.</i>", parse_mode="HTML",
-                        reply_markup=_kb([[InlineKeyboardButton(text=t, callback_data=f"nrm:r:{k}:{uid}")] for k, t in REASONS.items()]))
+    rows = [[InlineKeyboardButton(text=t, callback_data=f"nrm:r:{k}:{uid}")] for k, t in REASONS.items()]
+    rows.append([InlineKeyboardButton(text=OWN_REASON_BTN, callback_data=f"nrm:r:own:{uid}")])
+    await message.reply(f"{html.escape(message.from_user.full_name)}, причина отгула от норматива:\n<i>Кнопки доступны только вам.</i>",
+                        parse_mode="HTML", reply_markup=_kb(rows))
 
 
 def _not_owner(cb: CallbackQuery, owner: int) -> bool:
     return cb.from_user.id != owner
 
 
+def _day_kb(kind, owner):
+    return _kb([
+        [InlineKeyboardButton(text="📅 Сегодня", callback_data=f"nrm:d:{kind}:0:{owner}"),
+         InlineKeyboardButton(text="📅 Завтра", callback_data=f"nrm:d:{kind}:1:{owner}")],
+        [InlineKeyboardButton(text="✏️ Своя дата", callback_data=f"nrm:c:{kind}:{owner}")],
+    ])
+
+
+def _parse_excuse_day(txt: str):
+    """ДД.ММ или ДД.ММ.ГГГГ (не раньше сегодня) → date. None, если не разобрано."""
+    today = datetime.now(MSK).date()
+    for fmt in ("%d.%m.%Y", "%d.%m"):
+        try:
+            d = datetime.strptime(txt.strip(), fmt).date()
+        except ValueError:
+            continue
+        if fmt == "%d.%m":
+            d = d.replace(year=today.year)
+            if d < today - timedelta(days=180):
+                d = d.replace(year=today.year + 1)
+        return d if d >= today else None
+    return None
+
+
+def _parse_excuse_range(txt: str):
+    """«ДД.ММ» или «ДД.ММ-ДД.ММ» → (d1, d2) или None."""
+    parts = [p for p in re.split(r"\s*[-–—]\s*", (txt or "").strip()) if p]
+    if len(parts) == 1:
+        d1 = d2 = _parse_excuse_day(parts[0])
+    elif len(parts) == 2:
+        d1, d2 = _parse_excuse_day(parts[0]), _parse_excuse_day(parts[1])
+    else:
+        return None
+    if not d1 or not d2 or d2 < d1 or (d2 - d1).days + 1 > _EXCUSE_MAX_DAYS:
+        return None
+    return d1, d2
+
+
+async def _excuse_reply(target, text, kb=None):
+    if isinstance(target, CallbackQuery):
+        try:
+            return await target.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+        except Exception:
+            return await target.message.answer(text, parse_mode="HTML", reply_markup=kb)
+    return await target.answer(text, parse_mode="HTML", reply_markup=kb)
+
+
+async def _submit_excuse(target, uid, reason, d1: date, d2: date, vip: bool):
+    """Отгул = целые нормативные дни: с d1 06:00 (начало окна) по d2+1 06:00, то есть до утра после последнего дня."""
+    n = (d2 - d1).days + 1
+    if vip and n > 7:
+        return await _excuse_reply(target, "Нет випки — отгул не больше 7 дней.")
+    a, _ = await window()
+    t0 = datetime(d1.year, d1.month, d1.day, tzinfo=MSK) + timedelta(hours=a)
+    t1 = datetime(d2.year, d2.month, d2.day, tzinfo=MSK) + timedelta(days=1, hours=a)
+    await q("UPDATE norm_excuse SET status='no' WHERE user_id=%s AND status='pending'", (uid,))
+    rid = (await q("INSERT INTO norm_excuse(user_id,from_ts,to_ts,reason) VALUES(%s,%s,%s,%s) RETURNING id", (uid, t0, t1, reason), one=True))[0]
+    span = _fmt(d1) if d1 == d2 else f"{_fmt(d1)}–{_fmt(d2)}"
+    await _excuse_reply(target, f"🕓 Заявка на отгул ({span}, {n} дн.) отправлена главным админам.")
+    kb = _kb([[InlineKeyboardButton(text="✅ Одобрить", callback_data=f"nrm:ok:{rid}"), InlineKeyboardButton(text="❌ Отклонить", callback_data=f"nrm:no:{rid}")]])
+    await _dm_main_admins(f"🏖 <b>Заявка на отгул от норматива</b>\n{await _mention(uid)}: {html.escape(reason)}\n"
+                          f"Нормативные дни {span} ({n} дн.): с {fmt_dt(t0)} по {fmt_dt(t1)} МСК", kb)
+
+
 @router.callback_query(F.data.regexp(r"^nrm:r:\w+:\d+$"))
-async def cb_reason(cb: CallbackQuery):
+async def cb_reason(cb: CallbackQuery, state: FSMContext):
     _, _, kind, owner = cb.data.split(":")
     if _not_owner(cb, int(owner)):
         return await cb.answer("Это заявка другого человека — вызовите /otgul сами.", show_alert=True)
-    opts = [1, 2, 3, 5, 7] + ([] if kind == "vip" else [10, 14])
-    rows = [[InlineKeyboardButton(text=f"{n} дн.", callback_data=f"nrm:d:{kind}:{n}:{owner}") for n in opts[i:i + 4]] for i in range(0, len(opts), 4)]
-    await cb.message.edit_text(f"{REASONS.get(kind, '')}\nНа сколько дней?", reply_markup=_kb(rows))
+    if kind == "own":
+        await state.clear()
+        await state.set_state(NormStates.own_reason)
+        await state.update_data(owner=int(owner))
+        await cb.message.edit_text("✏️ Напишите причину одним сообщением (до 200 символов).\n<i>Чтобы отменить — /cancel</i>", parse_mode="HTML")
+        return await cb.answer()
+    if kind not in REASONS:
+        return await cb.answer("Кнопка устарела — вызовите /otgul заново.", show_alert=True)
+    await state.clear()
+    await cb.message.edit_text(f"{REASONS[kind]}\nНа какой день отгул?", reply_markup=_day_kb(kind, owner))
     await cb.answer()
+
+
+@router.message(NormStates.own_reason)
+async def own_reason_text(message: Message, state: FSMContext):
+    data = await state.get_data()
+    if message.from_user.id != data.get("owner"):
+        return
+    txt = (message.text or "").strip()
+    if txt.startswith("/"):
+        await state.clear()
+        return await message.answer("Заявка на отгул отменена.")
+    if not txt:
+        return await message.answer("Напишите причину текстом.")
+    reason = txt[:200]
+    await state.set_state(None)
+    await state.update_data(reason=reason, kind="own")
+    await message.answer(f"Причина: {html.escape(reason)}\nНа какой день отгул?", parse_mode="HTML",
+                         reply_markup=_day_kb("own", message.from_user.id))
+
+
+@router.callback_query(F.data.regexp(r"^nrm:d:\w+:\d+:\d+$"))
+async def cb_days(cb: CallbackQuery, state: FSMContext):
+    _, _, kind, key, owner = cb.data.split(":")
+    if _not_owner(cb, int(owner)):
+        return await cb.answer("Это заявка другого человека — вызовите /otgul сами.", show_alert=True)
+    uid = cb.from_user.id
+    if not await _allowed(uid):
+        return await cb.answer("Нет доступа", show_alert=True)
+    if kind == "own":
+        reason = (await state.get_data()).get("reason")
+        if not reason:
+            return await cb.answer("Заявка устарела — вызовите /otgul заново.", show_alert=True)
+    else:
+        reason = REASONS.get(kind)
+        if not reason:
+            return await cb.answer("Кнопка устарела — вызовите /otgul заново.", show_alert=True)
+    d = datetime.now(MSK).date() + timedelta(days=int(key))
+    await state.clear()
+    await _submit_excuse(cb, uid, reason, d, d, vip=(kind == "vip"))
+    await cb.answer()
+
+
+@router.callback_query(F.data.regexp(r"^nrm:c:\w+:\d+$"))
+async def cb_custom_day(cb: CallbackQuery, state: FSMContext):
+    _, _, kind, owner = cb.data.split(":")
+    if _not_owner(cb, int(owner)):
+        return await cb.answer("Это заявка другого человека — вызовите /otgul сами.", show_alert=True)
+    data = await state.get_data()
+    if kind == "own" and not data.get("reason"):
+        return await cb.answer("Заявка устарела — вызовите /otgul заново.", show_alert=True)
+    await state.update_data(kind=kind, owner=int(owner))
+    await state.set_state(NormStates.xday)
+    await cb.message.edit_text("📅 Напишите дату: <code>ДД.ММ</code> или <code>ДД.ММ.ГГГГ</code>.\n"
+                               "Можно промежуток: <code>12.11-14.11</code> (до 14 дней).\n"
+                               "<i>Отгул покроет эти нормативные дни целиком, с 06:00 первого до 06:00 после последнего.</i>",
+                               parse_mode="HTML")
+    await cb.answer()
+
+
+@router.message(NormStates.xday)
+async def xday_text(message: Message, state: FSMContext):
+    data = await state.get_data()
+    if message.from_user.id != data.get("owner"):
+        return
+    txt = (message.text or "").strip()
+    if txt.startswith("/"):
+        await state.clear()
+        return await message.answer("Заявка на отгул отменена.")
+    rng = _parse_excuse_range(txt)
+    if not rng:
+        return await message.answer("Не разобрал дату. Напишите <code>ДД.ММ</code>, <code>ДД.ММ.ГГГГ</code> или промежуток "
+                                    "<code>ДД.ММ-ДД.ММ</code> (не раньше сегодня, до 14 дней).", parse_mode="HTML")
+    kind = data.get("kind")
+    reason = data.get("reason") if kind == "own" else REASONS.get(kind)
+    if not reason:
+        await state.clear()
+        return await message.answer("Заявка устарела — вызовите /otgul заново.")
+    await state.clear()
+    await _submit_excuse(message, message.from_user.id, reason, rng[0], rng[1], vip=(kind == "vip"))
 
 
 @router.callback_query(F.data.regexp(r"^nrm:r:\w+$|^nrm:d:\w+:\d+$"))
 async def cb_old_buttons(cb: CallbackQuery):
     await cb.answer("Кнопка устарела — вызовите /otgul заново.", show_alert=True)
-
-
-@router.callback_query(F.data.regexp(r"^nrm:d:\w+:\d+:\d+$"))
-async def cb_days(cb: CallbackQuery):
-    _, _, kind, n, owner = cb.data.split(":")
-    if _not_owner(cb, int(owner)):
-        return await cb.answer("Это заявка другого человека — вызовите /otgul сами.", show_alert=True)
-    n = int(n)
-    if kind == "vip":
-        n = min(n, 7)
-    uid = cb.from_user.id
-    if not await _allowed(uid):
-        return await cb.answer("Нет доступа", show_alert=True)
-    t0 = datetime.now(MSK)
-    t1 = t0 + timedelta(days=n)
-    await q("UPDATE norm_excuse SET status='no' WHERE user_id=%s AND status='pending'", (uid,))
-    rid = (await q("INSERT INTO norm_excuse(user_id,from_ts,to_ts,reason) VALUES(%s,%s,%s,%s) RETURNING id", (uid, t0, t1, REASONS[kind]), one=True))[0]
-    await cb.message.edit_text(f"🕓 Заявка на отгул ({n} дн.) отправлена главным админам.")
-    kb = _kb([[InlineKeyboardButton(text="✅ Одобрить", callback_data=f"nrm:ok:{rid}"), InlineKeyboardButton(text="❌ Отклонить", callback_data=f"nrm:no:{rid}")]])
-    await _dm_main_admins(f"🏖 <b>Заявка на отгул от норматива</b>\n{await _mention(uid)}: {html.escape(REASONS[kind])}\n"
-                          f"С {fmt_dt(t0)} по {fmt_dt(t1)} МСК ({n} дн.)", kb)
-    await cb.answer()
 
 
 @router.callback_query(F.data.regexp(r"^nrm:(ok|no):\d+$"))
@@ -897,6 +1031,8 @@ class NormStates(StatesGroup):
     hours = State()
     mnote = State()
     wreason = State()
+    own_reason = State()
+    xday = State()
 
 
 # ---------------------------------------------------------------- раздел админ-панели
