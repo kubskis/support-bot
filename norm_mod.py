@@ -28,6 +28,16 @@ log = logging.getLogger("norm")
 router = Router()
 MSK = timezone(timedelta(hours=3))
 
+
+class NormStates(StatesGroup):
+    holi = State()
+    hours = State()
+    mnote = State()
+    wreason = State()
+    own_reason = State()
+    xday = State()
+
+
 _bot = None
 _get_db = None
 _is_main_admin = None
@@ -55,6 +65,8 @@ CREATE TABLE IF NOT EXISTS norm_state(user_id BIGINT PRIMARY KEY, since DATE, al
 CREATE TABLE IF NOT EXISTS norm_flags(key TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS norm_holidays(day DATE PRIMARY KEY, note TEXT);
 CREATE TABLE IF NOT EXISTS norm_manual(id SERIAL PRIMARY KEY, user_id BIGINT, day DATE, note TEXT, by_id BIGINT, ts TIMESTAMPTZ DEFAULT now());
+CREATE INDEX IF NOT EXISTS secret_posts_created ON secret_posts(created_at);
+CREATE INDEX IF NOT EXISTS secret_posts_user_created ON secret_posts(user_id, created_at);
 CREATE TABLE IF NOT EXISTS manual_grants(id SERIAL PRIMARY KEY, user_id BIGINT NOT NULL, kind TEXT NOT NULL, day DATE NOT NULL,
                                          by_id BIGINT, ts TIMESTAMPTZ DEFAULT now());
 CREATE INDEX IF NOT EXISTS manual_grants_u ON manual_grants(user_id, kind);
@@ -420,20 +432,21 @@ async def process_day(d: date):
     warned, streak_warned = [], []
     for u in elig:
         if finds.get(u, 0) == 0 and not met:
+            if await q("SELECT 1 FROM norm_warns WHERE user_id=%s AND day=%s AND kind='day'", (u, d), one=True):
+                warned.append(u)
+                continue
             await add_warn(u, d, "day", f"{_fmt(d)}: не найдено ни одной секретки, общая норма дня не выполнена ({total}/{req}).")
             warned.append(u)
     # серия: 3 дня подряд без секреток и без «дневных» предупреждений
     d0 = d - timedelta(days=2)
     if d0 >= await _start() and not await _has_holiday(d0, d):
+        counted = {u for u, _, n in await per_user_day(d0, d) if n > 0}
+        excs = [await excused_on(d0 + timedelta(days=i)) for i in range(3)]
+        excused = set().union(*excs)
         for u in elig:
             if u in warned:
                 continue
-            wa, wb = await window()
-            cnt = await _count_user(u, d0, d)
-            if cnt:
-                continue
-            excs = [await excused_on(d0 + timedelta(days=i)) for i in range(3)]
-            if any(u in ex for ex in excs):
+            if u in counted or u in excused:
                 continue
             if await q("SELECT 1 FROM norm_warns WHERE user_id=%s AND day BETWEEN %s AND %s AND kind IN ('day','streak')", (u, d0, d), one=True):
                 continue
@@ -1025,15 +1038,6 @@ async def grant_excuse(uid, hours, reason, by) -> datetime:
     except Exception:
         pass
     return t1
-
-
-class NormStates(StatesGroup):
-    holi = State()
-    hours = State()
-    mnote = State()
-    wreason = State()
-    own_reason = State()
-    xday = State()
 
 
 # ---------------------------------------------------------------- раздел админ-панели
