@@ -898,23 +898,90 @@ def fmt_prelink_until(dt) -> str:
         return "навсегда"
     return "до " + dt.astimezone(MSK_TZ).strftime("%d.%m.%Y %H:%M") + " МСК"
 
-async def send_prelinks(text: str, photo_id: str = None, exclude_ids=None, delay: int = STAFF_DELAY_SECONDS):
-    """Рассылает пост в личку пользователям из списка «Предссылки» одновременно со стаффом (до публикации в канале)."""
+async def send_prelinks(text: str, photo_id: str = None, exclude_ids=None, delay: int = STAFF_DELAY_SECONDS, ref=None):
+    """Рассылает пост в личку пользователям из списка «Предссылки» одновременно со стаффом (до публикации в канале).
+    ref=(kind, rec_id): копии запоминаются, чтобы их можно было поправить (смена ссылки) и закрыть (пост завершён)."""
     if TEST_MODE_ON:
         return
     exclude = set(exclude_ids or [])
     await asyncio.sleep(delay)  # сначала приоритет у стаффа
+    label = _PRELINK_LABEL.get(ref[0], "") if ref else ""
     for uid in await get_prelink_user_ids():
         if uid in exclude:
             continue
         try:
             if photo_id:
-                await bot.send_photo(uid, photo=photo_id, caption=text, parse_mode="HTML")
+                m = await bot.send_photo(uid, photo=photo_id, caption=text, parse_mode="HTML")
             else:
-                await bot.send_message(uid, text, parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
+                m = await bot.send_message(uid, text, parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
+            if ref:
+                def _rec(mid=m.message_id, uid=uid):
+                    with get_db() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "INSERT INTO prelink_msgs (kind, rec_id, user_id, message_id, has_photo, label, text) "
+                                "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                                (ref[0], ref[1], uid, mid, bool(photo_id), label, text))
+                await asyncio.to_thread(_rec)
         except Exception as e:
             logging.warning(f"Предссылка не доставлена {uid}: {e}")
         await asyncio.sleep(0.05)
+
+_PRELINK_LABEL = {"sec": "секретка", "sab": "поиск саботера", "farm": "фарм сервер"}
+
+async def _prelink_edit_msg(uid, mid, has_photo, text):
+    if has_photo:
+        await bot.edit_message_caption(chat_id=uid, message_id=mid, caption=text, parse_mode="HTML")
+    else:
+        await bot.edit_message_text(chat_id=uid, message_id=mid, text=text, parse_mode="HTML",
+                                    link_preview_options=LinkPreviewOptions(is_disabled=True))
+
+async def _prelink_update(kind, rec_id, transform=None, closed=False):
+    """Правит все копии предссылок по записи (секретка / сервер саботера / фарм).
+    transform(text) -> новый текст; closed=True — пометить как завершённые (текст заменяется на «завершено»)."""
+    def _get():
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id, user_id, message_id, has_photo, text, label FROM prelink_msgs "
+                            "WHERE kind = %s AND rec_id = %s AND closed = FALSE", (kind, rec_id))
+                return cur.fetchall()
+    rows = await asyncio.to_thread(_get)
+    for pl_id, uid, mid, has_photo, text, label in rows:
+        if closed:
+            new_text = (f"🔔 <b>ПРЕДССЫЛКА: {label}</b>\n"
+                        "<i>Пост завершён, ссылка больше не действует.</i>")
+        else:
+            new_text = transform(text or "")
+            if new_text == text:
+                continue
+        try:
+            await _prelink_edit_msg(uid, mid, has_photo, new_text)
+        except TelegramBadRequest as tb:
+            if "not modified" not in str(tb).lower() and "message to edit not found" not in str(tb).lower() \
+                    and "message can't be edited" not in str(tb).lower():
+                logging.warning(f"Предссылка #{pl_id}: не удалось обновить у {uid}: {tb}")
+        except Exception as e:
+            logging.warning(f"Предссылка #{pl_id}: не удалось обновить у {uid}: {e}")
+        def _save(pl_id=pl_id, new_text=new_text, closed=closed):
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("UPDATE prelink_msgs SET text = %s, closed = %s WHERE id = %s", (new_text, closed, pl_id))
+        await asyncio.to_thread(_save)
+        await asyncio.sleep(0.05)
+
+async def _prelink_relink(kind, rec_id, old, new):
+    """Смена ссылки: во всех копиях предссылок старая ссылка заменяется на новую."""
+    if not old:
+        return
+    old_raw, old_esc = old, html.escape(old, quote=False)
+    new_esc = html.escape(new, quote=False)
+    def _tr(t):
+        return t.replace(old_raw, new).replace(old_esc, new_esc)
+    await _prelink_update(kind, rec_id, transform=_tr)
+
+async def _prelink_close(kind, rec_id):
+    """Пост завершён: во всех копиях предссылок вместо поста — пометка «завершено», ссылка убрана."""
+    await _prelink_update(kind, rec_id, closed=True)
 
 def _prelink_header(what: str) -> str:
     return (
@@ -1779,6 +1846,20 @@ def _init_db_sync():
                 );
                 ALTER TABLE prelink_users ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP WITH TIME ZONE;
                 ALTER TABLE secret_posts ADD COLUMN IF NOT EXISTS link TEXT;
+                ALTER TABLE saboteur_servers ADD COLUMN IF NOT EXISTS ended_at TIMESTAMP WITH TIME ZONE;
+                ALTER TABLE farm_servers ADD COLUMN IF NOT EXISTS ended_at TIMESTAMP WITH TIME ZONE;
+                CREATE TABLE IF NOT EXISTS prelink_msgs (
+                    id SERIAL PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    rec_id BIGINT NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    message_id BIGINT NOT NULL,
+                    has_photo BOOLEAN DEFAULT FALSE,
+                    label TEXT,
+                    text TEXT,
+                    closed BOOLEAN DEFAULT FALSE
+                );
+                CREATE INDEX IF NOT EXISTS prelink_msgs_rec ON prelink_msgs (kind, rec_id);
                 ALTER TABLE prelink_users ADD COLUMN IF NOT EXISTS is_test BOOLEAN DEFAULT FALSE;
                 ALTER TABLE prelink_users ADD COLUMN IF NOT EXISTS renew_reminded_for TIMESTAMP WITH TIME ZONE;
                 CREATE TABLE IF NOT EXISTS mutator_badges (
@@ -2370,7 +2451,10 @@ async def _pause_skip_new_post(kind: str, post_id: int, deactivate: bool):
     try:
         users = [r[0] for r in await _db_all(f"SELECT DISTINCT user_id FROM {table} WHERE post_id = %s AND is_active = TRUE", (post_id,))]
         if deactivate:
-            await _db_exec(f"UPDATE {table} SET is_active = FALSE WHERE post_id = %s AND is_active = TRUE", (post_id,))
+            ids = [r[0] for r in await _db_all(f"SELECT id FROM {table} WHERE post_id = %s AND is_active = TRUE", (post_id,))]
+            await _db_exec(f"UPDATE {table} SET is_active = FALSE, ended_at = CURRENT_TIMESTAMP WHERE post_id = %s AND is_active = TRUE", (post_id,))
+            for sid in ids:
+                await _prelink_close(kind, sid)
     except Exception as e:
         logging.error(f"Остановка публикаций: не удалось обработать {table} #{post_id}: {e}")
         users = []
@@ -2923,6 +3007,10 @@ async def expire_secret_post(bot: Bot, post_id: int, channel_id: str, message_id
             with conn.cursor() as cur:
                 cur.execute("UPDATE secret_posts SET is_expired = TRUE WHERE id = %s", (post_id,))
     await asyncio.to_thread(_mark)
+    try:
+        await _prelink_close("sec", post_id)
+    except Exception as e:
+        logging.error(f"Секретка #{post_id}: не удалось закрыть предссылки: {e}")
 
     if not message_id:
         logging.warning(f"Секретка №{post_id}: поста в канале нет (публикация не удалась), правка истёкшего поста пропущена.")
@@ -6522,12 +6610,6 @@ async def pub_confirm(call: CallbackQuery, state: FSMContext):
                     )
                     await plog("secret", call.from_user.id, _sc.message_id)
 
-                # 2.1 Предссылки (одновременно со стаффом)
-                spawn(send_prelinks(
-                    _prelink_header(f"секретка «{html.escape(stype)}»") + final_txt,
-                    photo_id=data["photo_id"]
-                ))
-
                 # 3. Пуш-созыв стаффа
                 call_msg = (
                     f"<b>ВНИМАНИЕ ВСЕМ АДМИНИСТРАТОРАМ!</b> 🔔\n\n"
@@ -6549,6 +6631,12 @@ async def pub_confirm(call: CallbackQuery, state: FSMContext):
                             return cur.fetchone()[0]
                 
                 post_id = await asyncio.to_thread(_save)
+
+                # 2.1 Предссылки (одновременно со стаффом), с запоминанием копий
+                spawn(send_prelinks(
+                    _prelink_header(f"секретка «{html.escape(stype)}»") + final_txt,
+                    photo_id=data["photo_id"], ref=("sec", post_id)
+                ))
 
                 # 5. Отложенная отправка в канал через 30 секунд
                 spawn(
@@ -6899,14 +6987,15 @@ async def _sab_core(user, data, ch_id) -> tuple:
                         VALUES (%s, %s, %s, %s, %s, %s, %s, TRUE) RETURNING id
                     """, (post_id, user.id, data["sab_nick"], data["sab_tg"], data["sab_link"], data["sab_method"], data["sab_friends"]))
                     return cur.fetchone()[0]
-        await asyncio.to_thread(_save_srv)
+        srv_id = await asyncio.to_thread(_save_srv)
 
     spawn(send_prelinks(
         _prelink_header("поиск саботера") +
         f"• Ник Roblox: {data['sab_nick']}\n"
         f"• Метод: <code>{html.escape(data['sab_method'])}</code>\n"
         f"• В друзья: <b>{data['sab_friends']}</b>\n"
-        f"• Ссылка: {data['sab_link']}"
+        f"• Ссылка: {data['sab_link']}",
+        ref=("sab", srv_id)
     ))
     staff_sab_text = (
         f"⚡️ <b>ПОИСК САБОТЕРА ДЛЯ СТАФФА (Фора {CHANNEL_DELAY_SECONDS} сек.)</b> ⚡️\n"
@@ -6961,7 +7050,7 @@ async def _farm_core(user, data, ch_id) -> tuple:
                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, TRUE) RETURNING id
                     """, (post_id, user.id, data["farm_nick"], data["farm_tg"], data["farm_sections"], data["farm_link"], data["farm_friends"], bool(data.get("farm_effects"))))
                     return cur.fetchone()[0]
-        await asyncio.to_thread(_save_srv)
+        srv_id = await asyncio.to_thread(_save_srv)
 
     spawn(send_prelinks(
         _prelink_header("фарм сервер") +
@@ -6969,7 +7058,8 @@ async def _farm_core(user, data, ch_id) -> tuple:
         f"• Секций: <b>{data['farm_sections']}</b>\n"
         f"• В друзья: <b>{data['farm_friends']}</b>\n"
         f"• Эффекты: <b>{'разрешены' if data.get('farm_effects') else 'нет'}</b>\n"
-        f"• Ссылка: {html.escape(data['farm_link'], quote=False)}"
+        f"• Ссылка: {html.escape(data['farm_link'], quote=False)}",
+        ref=("farm", srv_id)
     ))
     staff_text = (
         f"⚡️ <b>ФАРМ СЕРВЕР ДЛЯ СТАФФА (Фора {CHANNEL_DELAY_SECONDS} сек.)</b> ⚡️\n"
@@ -7330,7 +7420,7 @@ async def pub_saboteur_del_proc(call: CallbackQuery):
             with get_db() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
-                        "UPDATE saboteur_servers SET is_active = FALSE "
+                        "UPDATE saboteur_servers SET is_active = FALSE, ended_at = CURRENT_TIMESTAMP "
                         "WHERE id = %s AND post_id = %s AND (user_id = %s OR %s) AND is_active = TRUE RETURNING user_id",
                         (s_id, post_id, uid, is_adm)
                     )
@@ -7349,6 +7439,10 @@ async def pub_saboteur_del_proc(call: CallbackQuery):
             await call.answer("⚠️ Сервер уже снят, не найден или это не ваш сервер!", show_alert=True)
             return
         rem_count, ch_id, owner_uid = _res
+        try:
+            await _prelink_close("sab", s_id)
+        except Exception as e:
+            logging.error(f"Саботёр #{s_id}: не удалось закрыть предссылку: {e}")
 
         try:
             await publish_or_update_saboteur_channel(ch_id, post_id)
@@ -7904,6 +7998,7 @@ async def _lnk_apply(kind, rid, rec, new):
             await _lnk_edit_channel("[Секретка, ссылка]", rec["channel"], rec["mid"], new_text,
                                     slot=lambda: _secret_photo_bytes(rid), natural=True)
             await _db_set("UPDATE secret_posts SET base_text = %s, link = %s WHERE id = %s", (new_text, new, rid))
+            await _prelink_relink("sec", rid, old, new)
         elif kind in ("sab", "farm"):
             tbl = "saboteur_servers" if kind == "sab" else "farm_servers"
             await _db_set(f"UPDATE {tbl} SET link = %s WHERE id = %s", (new, rid))
@@ -7915,6 +8010,7 @@ async def _lnk_apply(kind, rid, rec, new):
             except Exception as e:
                 await _db_set(f"UPDATE {tbl} SET link = %s WHERE id = %s", (old, rid))
                 return False, str(e)
+            await _prelink_relink(kind, rid, old, new)
         else:
             return False, "неизвестный тип"
         return True, ""
@@ -8443,7 +8539,7 @@ async def pub_farm_del_proc(call: CallbackQuery):
                 with conn.cursor() as cur:
                     # Снять можно свой активный сервер; главный админ может снять любой
                     cur.execute(
-                        "UPDATE farm_servers SET is_active = FALSE "
+                        "UPDATE farm_servers SET is_active = FALSE, ended_at = CURRENT_TIMESTAMP "
                         "WHERE id = %s AND post_id = %s AND (user_id = %s OR %s) AND is_active = TRUE RETURNING user_id",
                         (s_id, post_id, uid, is_adm)
                     )
@@ -8463,6 +8559,10 @@ async def pub_farm_del_proc(call: CallbackQuery):
             await call.answer("⚠️ Сервер уже снят, не найден или это не ваш сервер!", show_alert=True)
             return
         rem_count, ch_id, owner_uid = res
+        try:
+            await _prelink_close("farm", s_id)
+        except Exception as e:
+            logging.error(f"Фарм #{s_id}: не удалось закрыть предссылку: {e}")
 
         # Оставшиеся серверы перенумеруются при рендере; если осталось 0 и поста в канале
         # ещё нет, publish_or_update_farm_channel ничего не отправит (пункт 3)
