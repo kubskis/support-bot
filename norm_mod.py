@@ -1050,7 +1050,7 @@ async def _nm(uid) -> str:
     if n:
         return n
     try:
-        ch = await _bot.get_chat(uid)
+        ch = await asyncio.wait_for(_bot.get_chat(uid), 4)
         n = html.escape(ch.full_name or str(uid))
         if ch.username:
             n += f" (@{ch.username})"
@@ -1109,14 +1109,17 @@ async def overview(page=0):
              f"Приём секреток: {await window_label()} · {html.escape(await _time_note(d))}", "",
              f"<b>Общая норма:</b> {total_all}/{req} · {perc}%  {_bar(total_all, req)}",
              f"Искателей в учёте: {len(pool)} из {len(fs)} · отгул: {len([u for u in fs if u in exc])} · норма {pct}%", ""]
+    warn_cnt = {int(a): int(b) for a, b in (await q("SELECT user_id, COUNT(*) FROM norm_warns WHERE active GROUP BY user_id", many=True) or [])}
     rows = []
     for u in fs:
-        n = await active_warns(u)
+        n = warn_cnt.get(u, 0)
         rows.append((u, finds.get(u, 0), n, u in exc, u in pool))
     rows.sort(key=lambda r: (-r[1], r[2], r[0]))
     pages = max(1, math.ceil(len(rows) / PAGE))
     page = max(0, min(page, pages - 1))
-    for u, f, n, e, inpool in rows[page * PAGE:(page + 1) * PAGE]:
+    page_rows = rows[page * PAGE:(page + 1) * PAGE]
+    await asyncio.gather(*[_nm(r[0]) for r in page_rows], return_exceptions=True)   # имена параллельно и в кэш
+    for u, f, n, e, inpool in page_rows:
         if e:
             mark, pc = "🏖", "отгул"
         elif not inpool:

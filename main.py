@@ -721,7 +721,7 @@ async def _mention_html(uid: int) -> str:
         return cached[0]
     m = f'<a href="tg://user?id={uid}">админ</a>'
     try:
-        ci = await bot.get_chat(uid)
+        ci = await asyncio.wait_for(bot.get_chat(uid), 4)
         if ci.username:
             m = f"@{ci.username}"
         elif ci.full_name:
@@ -5564,21 +5564,16 @@ async def sec_stats(call: CallbackQuery):
         if u_id not in user_posts_map:
             user_posts_map[u_id] = []
         user_posts_map[u_id].append((ch_id, mid, stype, c_time))
+    # имена всех авторов — параллельно и из кэша (раньше был последовательный get_chat на каждого)
+    _uids = list(user_posts_map.keys())
+    _names_list = await asyncio.gather(*[_plain_name(int(x)) for x in _uids], return_exceptions=True)
+    _names_map = {x: (n if isinstance(n, str) else "Неизвестно") for x, n in zip(_uids, _names_list)}
 
     text = f"{ICON_BALL} <b>Статистика публикаций за последние 24 часа (МСК):</b>\n\n"
     
     pub_index = 1
     for u_id, p_list in user_posts_map.items():
-        name_display = "Неизвестно"
-        try:
-            chat_info = await bot.get_chat(u_id)
-            if chat_info.username:
-                name_display = f"@{chat_info.username}"
-            elif chat_info.full_name:
-                name_display = html.escape(chat_info.full_name)
-        except Exception:
-            pass
-            
+        name_display = html.escape(_names_map.get(u_id, "Неизвестно"))
         posts_count = len(p_list)
         text += f"{pub_index}. <a href='tg://openmessage?user_id={u_id}'>{u_id}</a> - {name_display} - <b>{posts_count} пост(ов)</b>:\n"
         
@@ -16176,7 +16171,7 @@ async def _plain_name(uid: int) -> str:
         return c[0]
     name = f"ID {uid}"
     try:
-        ci = await bot.get_chat(uid)
+        ci = await asyncio.wait_for(bot.get_chat(uid), 4)
         if ci.username:
             name = "@" + ci.username
         elif ci.full_name:
