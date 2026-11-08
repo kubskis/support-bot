@@ -82,6 +82,7 @@ if not DATABASE_URL and not DB_HOST:
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 bot = Bot(token=BOT_TOKEN)
+import counters   # дневные счётчики публикаций (см. counters.py)
 dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 
@@ -14196,12 +14197,13 @@ async def channel_analytics(force: bool = False) -> dict:
     return data
 
 # ---------------------------------------------------------------- статистика (один раздел, периоды)
-_ST_PERIODS = {"d": "Сутки", "w": "Неделя", "a": "Всё время"}
-_ST_LABEL = {"d": "за сутки", "w": "за неделю", "a": "за всё время"}
+_ST_PERIODS = {"d": "Сегодня", "w": "Неделя", "a": "Всё время"}
+_ST_LABEL = {"d": "за сегодня", "w": "за неделю", "a": "за всё время"}
+_CH_LABEL = {"d": "за сутки", "w": "за неделю", "a": "за всё время"}   # у канала окно скользящее
 
 def _since_dt(p):
-    if p == "d":
-        return datetime.now(timezone.utc) - timedelta(hours=24)
+    if p == "d":   # сегодня = с 00:00 МСК
+        return datetime.now(MSK_TZ).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
     if p == "w":
         return datetime.now(timezone.utc) - timedelta(days=7)
     return None
@@ -14222,7 +14224,7 @@ def _chan_text(d: dict, p: str = "d") -> str:
     if d.get("error"):
         return f"📈 <b>Аналитика канала</b>\n\n{ICON_CROSS} {html.escape(d['error'])}"
     def sg(n): return f"{n:+d}"
-    L = [f"📈 <b>Аналитика канала {html.escape(SUB_CHANNEL)}</b> · {_ST_LABEL[p]}", ""]
+    L = [f"📈 <b>Аналитика канала {html.escape(SUB_CHANNEL)}</b> · {_CH_LABEL[p]}", ""]
     L.append(f"👥 Подписчиков: <b>{d['subs'] if d['subs'] is not None else '—'}</b>")
     if d["growth"]:
         L.append("Рост: " + ", ".join(f"за {k} дн. <b>{sg(v)}</b>" for k, v in sorted(d["growth"].items())))
@@ -14231,7 +14233,7 @@ def _chan_text(d: dict, p: str = "d") -> str:
     pp = (d.get("per") or {}).get(p) or {}
     L.append("")
     note = f" (в Telegram доступны последние {d.get('fetched', 0)} постов)" if p == "a" else ""
-    L.append(f"📝 Постов {_ST_LABEL[p]}: <b>{pp.get('posts', 0)}</b>{note}")
+    L.append(f"📝 Постов {_CH_LABEL[p]}: <b>{pp.get('posts', 0)}</b>{note}")
     L.append(f"👁 Средние просмотры: <b>{pp.get('avg_views', 0)}</b>, пересылки: <b>{pp.get('avg_fwd', 0)}</b>")
     if pp.get("best_hours"):
         L.append("")
@@ -14242,7 +14244,7 @@ def _chan_text(d: dict, p: str = "d") -> str:
         L.append("📅 Лучшие дни: " + ", ".join(f"{n} ({v})" for n, v, _ in pp["best_days"]))
     if pp.get("top"):
         L.append("")
-        L.append(f"🏆 <b>Лучшие посты {_ST_LABEL[p]}:</b>")
+        L.append(f"🏆 <b>Лучшие посты {_CH_LABEL[p]}:</b>")
         for t in pp["top"]:
             L.append(f'• <a href="{t["url"]}">{t["date"]}</a>: {t["views"]} просмотров, {t["forwards"]} пересылок')
     L.append("")
@@ -14323,7 +14325,9 @@ async def _pst_text(p):
         if len(text) > 4000:
             text = text[:3900].rsplit("\n", 1)[0] + "\n... <i>(список сокращен)</i>"
         return text
-    total, rows = await asyncio.to_thread(_query_counts)
+    per = await counters.per_user(p)
+    total = sum(c["sec"] for c in per.values())
+    rows = sorted(((u, c["sec"]) for u, c in per.items() if c["sec"]), key=lambda x: -x[1])[:30]
     if not rows:
         return head + "За этот период постов не было."
     names = await asyncio.gather(*[_plain_name(int(r[0])) for r in rows], return_exceptions=True)
@@ -14348,7 +14352,7 @@ def _prs_table_html(rows, p) -> str:
 
 async def _prs_text(p):
     """Запасной вариант, если rich-таблица не ушла: моноширинная таблица в обычном сообщении."""
-    rows = await _people_kind_stats(limit=30, since=_since_dt(p))
+    rows = await _people_kind_stats(limit=30, period=p)
     head = f"👤 <b>Публикаторы по людям · {_ST_LABEL[p]}</b>\n\n"
     if not rows:
         return head + "За этот период никто ничего не провёл."
@@ -14408,7 +14412,7 @@ async def stv_view(call: CallbackQuery):
     parts = call.data.split(":")
     screen, p = parts[1], parts[2]
     if screen == "prs":
-        rows = await _people_kind_stats(limit=30, since=_since_dt(p))
+        rows = await _people_kind_stats(limit=30, period=p)
         kb = InlineKeyboardMarkup(inline_keyboard=[_period_row("prs", p),
                                                    [IB(text="🔙 К статистике", callback_data="adm_stats")]])
         res = await _send_rich_raw(call.message.chat.id, {"html": _prs_table_html(rows, p)},
@@ -16556,28 +16560,10 @@ async def _site_publisher_stats(uid: int) -> dict:
         "recent": [{"type": str(x[0] or "Секретка")[:40], "at": int(x[1]), "expired": bool(x[2])} for x in recent],
     }
 
-async def _people_kind_stats(limit: int = 15, since=None) -> list:
-    """Кто сколько провёл по типам: секретки, саботёр, фарм, мутатор, исследователь (с ручными зачётами).
-    since — только за период, None — за всё время. Топ по сумме."""
-    per = {}
-    def add(uid, kind, n):
-        per.setdefault(int(uid), {"sec": 0, "sab": 0, "farm": 0, "mut": 0, "res": 0})[kind] += int(n)
-    w = " WHERE created_at >= %s" if since else ""
-    ps = (since,) if since else ()
-    for uid_, n in await _db_all(f"SELECT user_id, COUNT(*) FROM secret_posts{w} GROUP BY user_id", ps):
-        add(uid_, "sec", n)
-    for key, table in (("sab", "saboteur_servers"), ("farm", "farm_servers"), ("mut", "mutator_badges"), ("res", "researcher_badges")):
-        try:
-            for uid_, n in await _db_all(f"SELECT user_id, COUNT(*) FROM {table}{w} GROUP BY user_id", ps):
-                add(uid_, key, n)
-        except Exception as e:
-            logging.warning(f"Статистика по людям: {table}: {e}")
-    try:
-        mw = " WHERE ts >= %s" if since else ""
-        for uid_, kind, n in await _db_all(f"SELECT user_id, kind, COUNT(*) FROM manual_grants{mw} GROUP BY user_id, kind", ps):
-            add(uid_, str(kind), n)
-    except Exception as e:
-        logging.warning(f"Статистика по людям: ручные зачёты: {e}")
+async def _people_kind_stats(limit: int = 15, period: str = "a") -> list:
+    """Кто сколько провёл по типам (секретки, саботёр, фарм, мутатор, исследователь) с ручными зачётами.
+    Берётся из дневных счётчиков: period 'd' — сегодня, 'w' — неделя, 'a' — всё время. Топ по сумме."""
+    per = await counters.per_user(period)
     rows = sorted(per.items(), key=lambda x: -sum(x[1].values()))[:limit]
     out = []
     for uid_, c in rows:
@@ -16656,7 +16642,7 @@ async def _site_admin_stats_compute() -> dict:
         except Exception as e:
             logging.warning(f"Кабинет: статистика {table}: {e}")
             published[key] = {"total": m_t, "day": m_d}
-    out["people"] = await _people_kind_stats()
+    out["people"] = await _people_kind_stats(period="a")
     out["published"] = published
     pay = {}
     for key, interval in (("week", "7 days"), ("month", "30 days")):
@@ -17318,6 +17304,8 @@ async def main():
     try:
         import norm_mod
         spawn(_supervised(norm_mod.norm_worker))
+        counters.setup(get_db)
+        spawn(_supervised(counters.worker))
     except Exception as e:
         logging.error(f"Воркер норматива не запущен: {e}")
     try:
