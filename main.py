@@ -14093,6 +14093,7 @@ def stats_root_kb():
         [IB(text="📊 Поддержка", callback_data="stv:sup:d"), IB(text="👥 Хелперы", callback_data="stv:hlp:d")],
         [IB(text="📈 Канал", callback_data="stv:chn:d"), IB(text="🧾 Посты", callback_data="stv:pst:d")],
         [IB(text="👤 Публикаторы по людям", callback_data="stv:prs:d")],
+        [IB(text="🛠 Вручную (владелец)", callback_data="sadj_menu")],
         [IB(text="🔙 Назад", callback_data="back_to_adm")],
     ])
 

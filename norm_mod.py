@@ -273,7 +273,7 @@ async def per_user_day(d1: date, d2: date) -> list:
         SELECT user_id, {_LOC}::date AS day, COUNT(*) AS n FROM secret_posts
           WHERE channel_id <> 'manual' AND {_LOC}::date BETWEEN %s AND %s AND {_WIN_SQL} GROUP BY 1,2
         UNION ALL SELECT user_id, day, COUNT(*) FROM norm_manual WHERE day BETWEEN %s AND %s GROUP BY 1,2
-        UNION ALL SELECT user_id, day, COUNT(*) FROM manual_grants WHERE kind <> 'mut' AND day BETWEEN %s AND %s GROUP BY 1,2
+        UNION ALL SELECT user_id, day, COUNT(*) FROM manual_grants WHERE kind NOT IN ('mut', 'sec') AND day BETWEEN %s AND %s GROUP BY 1,2
         UNION ALL SELECT user_id, (ended_at AT TIME ZONE {_TZ})::date, COUNT(*) FROM saboteur_servers
           WHERE ended_at IS NOT NULL AND ended_at - created_at >= INTERVAL '1 hour'
             AND (ended_at AT TIME ZONE {_TZ})::date BETWEEN %s AND %s GROUP BY 1,2
@@ -1139,7 +1139,7 @@ async def overview(page=0):
         nav.append(InlineKeyboardButton(text="▶️", callback_data=f"nrmp:{page + 1}"))
     kb = _ikb([nav,
                [InlineKeyboardButton(text="⚠️ Предупреждения", callback_data="nrmw"), InlineKeyboardButton(text="📅 История", callback_data="nrmh")],
-               [InlineKeyboardButton(text="🏖 Отгулы", callback_data="nrme"), InlineKeyboardButton(text="✍️ Ручная выдача", callback_data="sadj_menu")],
+               [InlineKeyboardButton(text="🏖 Отгулы", callback_data="nrme"), InlineKeyboardButton(text="✍️ Ручная правка", callback_data="nrmm")],
                [InlineKeyboardButton(text="🎉 Праздники", callback_data="nrmholi"), InlineKeyboardButton(text="⚙️ Настройки", callback_data="nrms")],
                [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_adm")]])
     return "\n".join(lines), kb
