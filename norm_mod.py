@@ -1139,7 +1139,7 @@ async def overview(page=0):
         nav.append(InlineKeyboardButton(text="▶️", callback_data=f"nrmp:{page + 1}"))
     kb = _ikb([nav,
                [InlineKeyboardButton(text="⚠️ Предупреждения", callback_data="nrmw"), InlineKeyboardButton(text="📅 История", callback_data="nrmh")],
-               [InlineKeyboardButton(text="🏖 Отгулы", callback_data="nrme"), InlineKeyboardButton(text="✍️ Ручная правка", callback_data="nrmm")],
+               [InlineKeyboardButton(text="🏖 Отгулы", callback_data="nrme"), InlineKeyboardButton(text="✍️ Ручная выдача", callback_data="sadj_menu")],
                [InlineKeyboardButton(text="🎉 Праздники", callback_data="nrmholi"), InlineKeyboardButton(text="⚙️ Настройки", callback_data="nrms")],
                [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_adm")]])
     return "\n".join(lines), kb

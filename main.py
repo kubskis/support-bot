@@ -2499,23 +2499,39 @@ async def get_all_users_count() -> int:
     except Exception:
         return 0
 
-async def get_tickets_stats():
+async def get_tickets_stats(since=None):
+    """(всего, закрыто, отклонено, средняя оценка). since — только за период; None — за всё время."""
     def _query():
         with get_db() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*) FROM tickets")
+                ps = (since,) if since else ()
+                cw = " AND updated_at >= %s" if since else ""
+                if since:
+                    cur.execute("SELECT COUNT(*) FROM tickets WHERE created_at >= %s", ps)
+                else:
+                    cur.execute("SELECT COUNT(*) FROM tickets")
                 total = cur.fetchone()[0]
-                cur.execute("SELECT COUNT(*) FROM tickets WHERE status = 'closed'")
+                cur.execute("SELECT COUNT(*) FROM tickets WHERE status = 'closed'" + cw, ps)
                 closed = cur.fetchone()[0]
-                cur.execute("SELECT COUNT(*) FROM tickets WHERE status = 'rejected'")
+                cur.execute("SELECT COUNT(*) FROM tickets WHERE status = 'rejected'" + cw, ps)
                 rejected = cur.fetchone()[0]
-                cur.execute("""
-                    SELECT COALESCE(AVG(score), 0) 
-                    FROM ratings 
-                    WHERE user_id != %s 
-                      AND user_id NOT IN (SELECT admin_id FROM main_admins)
-                      AND user_id NOT IN (SELECT admin_id FROM admin_agents)
-                """, (OWNER_ID,))
+                if since:
+                    cur.execute("""
+                        SELECT COALESCE(AVG(r.score), 0)
+                        FROM ratings r JOIN tickets t ON t.ticket_id = r.ticket_id
+                        WHERE r.user_id != %s
+                          AND r.user_id NOT IN (SELECT admin_id FROM main_admins)
+                          AND r.user_id NOT IN (SELECT admin_id FROM admin_agents)
+                          AND t.updated_at >= %s
+                    """, (OWNER_ID, since))
+                else:
+                    cur.execute("""
+                        SELECT COALESCE(AVG(score), 0)
+                        FROM ratings
+                        WHERE user_id != %s
+                          AND user_id NOT IN (SELECT admin_id FROM main_admins)
+                          AND user_id NOT IN (SELECT admin_id FROM admin_agents)
+                    """, (OWNER_ID,))
                 avg_rating = cur.fetchone()[0]
                 return total, closed, rejected, round(float(avg_rating), 2)
     try:
@@ -2523,26 +2539,29 @@ async def get_tickets_stats():
     except Exception:
         return 0, 0, 0, 0.0
 
-async def get_admin_list_stats():
+async def get_admin_list_stats(since=None):
+    """Закрытые тикеты и средняя оценка по админам. since — за период (по времени закрытия), None — за всё время."""
     def _query():
         with get_db() as conn:
             with conn.cursor() as cur:
+                cw = " AND t.updated_at >= %s" if since else ""
+                params = (OWNER_ID,) + ((since,) if since else ())
                 cur.execute("""
                     SELECT t.admin_id, COUNT(*) as closed_count,
-                           COALESCE(AVG(CASE 
-                               WHEN r.user_id != %s 
-                                AND r.user_id NOT IN (SELECT admin_id FROM main_admins) 
-                                AND r.user_id NOT IN (SELECT admin_id FROM admin_agents) 
-                               THEN r.score 
-                               ELSE NULL 
+                           COALESCE(AVG(CASE
+                               WHEN r.user_id != %s
+                                AND r.user_id NOT IN (SELECT admin_id FROM main_admins)
+                                AND r.user_id NOT IN (SELECT admin_id FROM admin_agents)
+                               THEN r.score
+                               ELSE NULL
                            END), 0) as avg_score,
                            a.agent_number
                     FROM tickets t
                     LEFT JOIN ratings r ON t.ticket_id = r.ticket_id
                     LEFT JOIN admin_agents a ON t.admin_id = a.admin_id
-                    WHERE t.admin_id IS NOT NULL AND t.status = 'closed'
+                    WHERE t.admin_id IS NOT NULL AND t.status = 'closed'""" + cw + """
                     GROUP BY t.admin_id, a.agent_number
-                """, (OWNER_ID,))
+                """, params)
                 return cur.fetchall()
     try:
         return await filter_in_admin_chat(await asyncio.to_thread(_query))
@@ -4065,16 +4084,29 @@ async def main_keyboard(user_id: int):
 
 async def admin_panel_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [IB(text="📊 Статистика поддержки", callback_data="adm_stats"),
-         IB(text="👥 Статистика хелперов", callback_data="adm_list_stats")],
+        [IB(text="📊 Статистика", callback_data="adm_stats"),
+         IB(text="🔮 Секретки", callback_data="adm_secret_panel")],
+        [IB(text="📋 Норматив секреток", callback_data="adm_norm"),
+         IB(text="👥 Доступ", callback_data="adm_access")],
+        [IB(text="💎 Платное и рефералка", callback_data="adm_pay"),
+         IB(text="⚙️ Система", callback_data="adm_system")],
+    ])
+
+def access_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [IB(text="👥 Публикаторы секреток", callback_data="sec_manage_pubs")],
+        [IB(text="🔔 Предссылки и личные пинги", callback_data="adm_sec_people")],
         [IB(text="📝 Наборы и друзья", callback_data="adm_recruit")],
-        [IB(text="🔮 Секретки", callback_data="adm_secret_panel")],
-        [IB(text="📋 Норматив секреток", callback_data="adm_norm")],
-        [IB(text="📈 Аналитика канала", callback_data="adm_chan_stats")],
+        [IB(text="👑 Главные админы", callback_data="manage_main_admins")],
+        [IB(text="🚫 Внести игрока в ЧС", callback_data="bl_add")],
+        [IB(text="🔙 Назад", callback_data="back_to_adm")],
+    ])
+
+def pay_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
         [IB(text="💎 Платные услуги (Stars)", callback_data="shopa_menu")],
         [IB(text="👥 Рефералка", callback_data="refa_menu")],
-        [IB(text="🧪 Тест", callback_data="adm_test")],
-        [IB(text="⚙️ Система и доступ", callback_data="adm_system")],
+        [IB(text="🔙 Назад", callback_data="back_to_adm")],
     ])
 
 async def recruit_kb():
@@ -4090,33 +4122,28 @@ async def recruit_kb():
         [IB(text=f"{hc} Набор в хелперы: {hw}", callback_data="toggle_helper")],
         [IB(text=f"{sc} Искатели секреток: {sw}", callback_data="toggle_secret")],
         [IB(text="✏ Ник для друзей", callback_data="change_friend_nick")],
-        [IB(text="🔙 Назад", callback_data="back_to_adm")],
+        [IB(text="🔙 Назад", callback_data="adm_access")],
     ])
 
 async def system_kb():
     maint_icon, maint_word = ("🔴", "ВКЛЮЧЁН") if MAINTENANCE_ON else ("🟢", "Выкл")
-    test_word = "ВКЛЮЧЁН" if TEST_MODE_ON else "Выкл"
     ds_on = (await get_setting("daily_summary", "true")) == "true"
     return InlineKeyboardMarkup(inline_keyboard=[
         [IB(text=f"{maint_icon} Тех. перерыв: {maint_word}", callback_data="toggle_maintenance")],
         [IB(text=f"{'🟢' if ds_on else '🔴'} Ежедневная сводка: {'Вкл' if ds_on else 'Выкл'}", callback_data="toggle_daily_summary"),
          IB(text="📨 Сводка сейчас", callback_data="daily_summary_now")],
-        [IB(text="👥 Публикаторы секреток", callback_data="sec_manage_pubs")],
         [IB(text="👋 Приветствие бота", callback_data="adm_welcome")],
-        [IB(text="👑 Главные админы поддержки", callback_data="manage_main_admins")],
-        [IB(text="🔙 Назад", callback_data="back_to_adm")],
+        [IB(text="🧪 Тест (владелец)", callback_data="adm_test")],
+        [IB(text="🔙 Назад", callback_data="back_to_adm")]
     ])
 
 def secret_admin_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [IB(text="▶️ Возобновить публикацию" if PUBLISH_PAUSED else "⏸ Остановить публикацию", callback_data="toggle_publish_pause")],
-        [IB(text="🔔 Предссылки и уведомления", callback_data="adm_sec_people")],
         [IB(text="📝 Шаблоны постов", callback_data="sec_templates")],
         [IB(text="🧩 Типы секреток", callback_data="adm_sec_types")],
         [IB(text="🛑 Закрыть чужие посты", callback_data="sec_close_menu")],
-        [IB(text="📊 Статистика постов (24ч)", callback_data="sec_stats"),
-         IB(text="⏱ Таймер", callback_data="sec_set_timer")],
-        [IB(text="🛠 Секретки вручную (владелец)", callback_data="sadj_menu")],
+        [IB(text="⏱ Таймер", callback_data="sec_set_timer")],
         [IB(text="🔙 Назад в админку", callback_data="back_to_adm")]
     ])
 
@@ -4126,7 +4153,7 @@ async def sec_people_kb():
         [IB(text="🔔 Предссылки", callback_data="sec_prelinks")],
         [IB(text=f"{'🟢' if calldm else '🔴'} Личные пинги стаффу: {'Вкл' if calldm else 'Выкл'}", callback_data="sec_toggle_calldm")],
         [IB(text="📣 Команда для бота-зазывалы", callback_data="sec_call_cmd")],
-        [IB(text="🔙 Назад", callback_data="adm_secret_panel")]
+        [IB(text="🔙 Назад", callback_data="adm_access")]
     ])
 
 SEC_TYPES_KB = InlineKeyboardMarkup(inline_keyboard=[
@@ -4797,52 +4824,6 @@ async def open_admin_panel(message: Message, state: FSMContext):
     kb = await admin_panel_kb()
     await message.answer("<tg-emoji emoji-id='5877260593903177342'>⚙️</tg-emoji> <b>Панель администратора</b>", reply_markup=kb, parse_mode="HTML")
 
-@router.callback_query(F.data == "adm_stats")
-async def callback_stats(call: CallbackQuery):
-    if not await is_main_admin(call.from_user.id):
-        await call.answer("❌ Нет доступа", show_alert=True)
-        return
-    users_count = await get_all_users_count()
-    total, closed, rejected, avg_rating = await get_tickets_stats()
-
-    stats_text = (
-        "<tg-emoji emoji-id='5913702317667913862'>📊</tg-emoji> <b>Общая статистика поддержки:</b>\n\n"
-        f"{ICON_USERS} Активных пользователей: <code>{users_count}</code>\n"
-        f"<tg-emoji emoji-id='5346024704765347251'>🎫</tg-emoji> Всего тикетов: <code>{total}</code>\n"
-        f"{ICON_CHECK} Успешно закрыто: <code>{closed}</code>\n"
-        f"{ICON_CROSS} Отклонено: <code>{rejected}</code>\n"
-        f"{ICON_STAR} Общая оценка саппорта: <code>{avg_rating} / 5.0</code>"
-    )
-    kb = await admin_panel_kb()
-    await call.message.edit_text(stats_text, reply_markup=kb, parse_mode="HTML")
-    await call.answer()
-
-@router.callback_query(F.data == "adm_list_stats")
-async def callback_admin_list_stats(call: CallbackQuery):
-    if not await is_main_admin(call.from_user.id):
-        await call.answer("❌ Нет доступа", show_alert=True)
-        return
-    
-    rows = await get_admin_list_stats()
-    if not rows:
-        text = f"{ICON_USERS} <b>Статистика по администраторам:</b>\n\nПока нет закрытых тикетов у админов."
-    else:
-        text = f"{ICON_USERS} <b>Статистика по администраторам:</b>\n\n"
-        for admin_id, closed_cnt, avg_score, agent_no in rows:
-            try:
-                chat_member = await bot.get_chat(admin_id)
-                name = chat_member.full_name
-            except Exception:
-                name = f"ID: {admin_id}"
-            agent_str = f" [Агент #{agent_no}]" if agent_no else ""
-            text += f"{ICON_USERS} <b>{html.escape(name)}</b>{agent_str} (<code>{admin_id}</code>)\n"
-            text += f"   • Закрыто тикетов: <code>{closed_cnt}</code>\n"
-            text += f"   • Средняя оценка: <code>{round(float(avg_score), 2)} / 5.0</code>\n\n"
-
-    back_kb = InlineKeyboardMarkup(inline_keyboard=[[IB(text="🔙 Назад", callback_data="back_to_adm")]])
-    await call.message.edit_text(text, reply_markup=back_kb, parse_mode="HTML")
-    await call.answer()
-
 @router.callback_query(F.data == "back_to_adm")
 async def back_to_admin_panel(call: CallbackQuery):
     if not await is_main_admin(call.from_user.id): return
@@ -4865,7 +4846,7 @@ async def adm_recruit_screen(call: CallbackQuery):
 async def adm_system_screen(call: CallbackQuery):
     if not await is_main_admin(call.from_user.id): return
     await call.message.edit_text(
-        "⚙️ <b>Система и доступ</b>\n\nТех. перерыв, тест режим, публикаторы и главные админы. Тех. режимы и главные админы доступны только создателю бота.",
+        "⚙️ <b>Система</b>\n\nТех. перерыв, ежедневная сводка и приветствие. Тест — только создателю бота.",
         reply_markup=await system_kb(), parse_mode="HTML"
     )
     await call.answer()
@@ -4893,7 +4874,7 @@ async def manage_main_admins_callback(call: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [IB(text="➕ Добавить главного админа", callback_data="add_main_admin_start")],
         [IB(text="➖ Удалить главного админа", callback_data="del_main_admin_start")],
-        [IB(text="🔙 Назад", callback_data="adm_system")]
+        [IB(text="🔙 Назад", callback_data="adm_access")]
     ])
     await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     await call.answer()
@@ -5467,16 +5448,9 @@ async def sec_manage_pubs(call: CallbackQuery):
     pubs = await asyncio.to_thread(_query)
     text = f"{ICON_USERS} <b>Список публикаторов секреток:</b>\n\n"
     if pubs:
-        for idx, p_id in enumerate(pubs, 1):
-            name_display = "Неизвестно"
-            try:
-                chat_info = await bot.get_chat(p_id)
-                if chat_info.username:
-                    name_display = f"@{chat_info.username}"
-                elif chat_info.full_name:
-                    name_display = html.escape(chat_info.full_name)
-            except Exception:
-                pass
+        names = await asyncio.gather(*[_plain_name(int(p)) for p in pubs], return_exceptions=True)
+        for idx, (p_id, nm) in enumerate(zip(pubs, names), 1):
+            name_display = html.escape(nm) if isinstance(nm, str) else "Неизвестно"
             text += f"{idx}. <a href='tg://openmessage?user_id={p_id}'>{p_id}</a> - {name_display}\n"
     else:
         text += "<i>Список пуст (кнопка 'Секретки' никому не видна).</i>\n"
@@ -5484,7 +5458,7 @@ async def sec_manage_pubs(call: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [IB(text="➕ Добавить публикатора", callback_data="sec_add_pub")],
         [IB(text="➖ Удалить публикатора", callback_data="sec_del_pub")],
-        [IB(text="🔙 Назад", callback_data="adm_system")]
+        [IB(text="🔙 Назад", callback_data="adm_access")]
     ])
     await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
     await call.answer()
@@ -5536,72 +5510,6 @@ async def sec_del_pub_proc(message: Message, state: FSMContext):
         await message.answer(f"{ICON_CHECK} Пользователь <code>{t_id}</code> удален из публикаторов.", reply_markup=kb, parse_mode="HTML")
     except ValueError:
         await message.answer(f"{ICON_CROSS} " + USER_NOT_FOUND_TEXT, parse_mode="HTML")
-
-@router.callback_query(F.data == "sec_stats")
-async def sec_stats(call: CallbackQuery):
-    if not await is_main_admin(call.from_user.id): return
-    def _query():
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT user_id, channel_id, message_id, secret_type, created_at
-                    FROM secret_posts
-                    WHERE created_at >= CURRENT_TIMESTAMP - INTERVAL '24 hours'
-                    ORDER BY created_at DESC
-                """)
-                return cur.fetchall()
-                
-    posts = await asyncio.to_thread(_query)
-    
-    if not posts:
-        kb = InlineKeyboardMarkup(inline_keyboard=[[IB(text="🔙 Назад", callback_data="adm_secret_panel")]])
-        await call.message.edit_text(f"{ICON_BALL} <b>Статистика публикаций за последние 24 часа:</b>\n\n<i>За последние 24 часа постов не публиковалось.</i>", reply_markup=kb, parse_mode="HTML")
-        await call.answer()
-        return
-
-    user_posts_map = {}
-    for u_id, ch_id, mid, stype, c_time in posts:
-        if u_id not in user_posts_map:
-            user_posts_map[u_id] = []
-        user_posts_map[u_id].append((ch_id, mid, stype, c_time))
-    # имена всех авторов — параллельно и из кэша (раньше был последовательный get_chat на каждого)
-    _uids = list(user_posts_map.keys())
-    _names_list = await asyncio.gather(*[_plain_name(int(x)) for x in _uids], return_exceptions=True)
-    _names_map = {x: (n if isinstance(n, str) else "Неизвестно") for x, n in zip(_uids, _names_list)}
-
-    text = f"{ICON_BALL} <b>Статистика публикаций за последние 24 часа (МСК):</b>\n\n"
-    
-    pub_index = 1
-    for u_id, p_list in user_posts_map.items():
-        name_display = html.escape(_names_map.get(u_id, "Неизвестно"))
-        posts_count = len(p_list)
-        text += f"{pub_index}. <a href='tg://openmessage?user_id={u_id}'>{u_id}</a> - {name_display} - <b>{posts_count} пост(ов)</b>:\n"
-        
-        for post_idx, (ch_id, mid, stype, c_time) in enumerate(p_list, 1):
-            msk_time = c_time.astimezone(MSK_TZ)
-            time_str = msk_time.strftime("%H:%M:%S %d.%m.%Y")
-            
-            post_url = _channel_post_link(ch_id, mid)
-            if not post_url:
-                clean_ch = str(ch_id or "").replace("@", "")
-                if clean_ch.startswith("https://t.me/"):
-                    post_url = f"{clean_ch}/{mid}"
-                elif clean_ch.lstrip("-").isdigit() and mid:
-                    post_url = f"https://t.me/c/{clean_ch.lstrip('-')}/{mid}"
-            if post_url:
-                text += f"   {post_idx}. {time_str} ({html.escape(stype)}) — <a href='{post_url}'>ссылка</a>\n"
-            else:
-                text += f"   {post_idx}. {time_str} ({html.escape(stype)}) — <i>ссылки нет</i>\n"
-            
-        text += "\n"
-        pub_index += 1
-
-    if len(text) > 4000:
-        text = text[:3900].rsplit("\n", 1)[0] + "\n... <i>(список сокращен)</i>"
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[[IB(text="🔙 Назад", callback_data="adm_secret_panel")]])
-    await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
-    await call.answer()
 
 @router.callback_query(F.data == "sec_set_timer")
 async def sec_set_timer(call: CallbackQuery, state: FSMContext):
@@ -14142,56 +14050,263 @@ async def channel_analytics(force: bool = False) -> dict:
             older = [r for r in rows if r[0] <= target]
             if older:
                 growth[days] = int(subs) - int(older[0][1])
-    data = {"subs": subs, "growth": growth, "posts_30": len(d30), "posts_7": len(d7),
+    per = {}
+    for pk, span in (("d", timedelta(days=1)), ("w", timedelta(days=7)), ("a", None)):
+        lst = [m for m in posts if span is None or (now_dt - m.date) < span]
+        mat_p = [m for m in lst if (now_dt - m.date).total_seconds() > 86400]
+        ph, pdy = {}, {}
+        for m in mat_p:
+            loc = m.date.astimezone(MSK_TZ)
+            ph.setdefault(loc.hour, []).append(m.views or 0)
+            pdy.setdefault(loc.weekday(), []).append(m.views or 0)
+        tops = sorted(lst, key=lambda m: -(m.views or 0))[:3]
+        per[pk] = {
+            "posts": len(lst), "avg_views": avg(lst, "views"), "avg_fwd": avg(lst, "forwards"),
+            "best_hours": [] if pk == "d" else sorted(((h_, round(sum(v) / len(v)), len(v)) for h_, v in ph.items() if len(v) >= 2), key=lambda x: -x[1])[:3],
+            "best_days": [] if pk == "d" else sorted(((_DOW[d_], round(sum(v) / len(v)), len(v)) for d_, v in pdy.items() if len(v) >= 2), key=lambda x: -x[1])[:3],
+            "top": [{"url": f"https://t.me/{uname}/{m.id}", "views": m.views or 0, "forwards": m.forwards or 0,
+                     "date": m.date.astimezone(MSK_TZ).strftime("%d.%m %H:%M")} for m in tops],
+        }
+    data = {"subs": subs, "growth": growth, "per": per, "fetched": len(posts), "posts_30": len(d30), "posts_7": len(d7),
             "avg_views_30": avg(d30, "views"), "avg_fwd_30": avg(d30, "forwards"),
             "best_hours": best_hours, "best_days": best_days, "top": top_posts,
             "snap_days": len(rows), "updated": datetime.now(MSK_TZ).strftime("%d.%m %H:%M МСК")}
     _CHAN_CACHE.update(ts=now, data=data)
     return data
 
-def _chan_text(d: dict) -> str:
+# ---------------------------------------------------------------- статистика (один раздел, периоды)
+_ST_PERIODS = {"d": "Сутки", "w": "Неделя", "a": "Всё время"}
+_ST_LABEL = {"d": "за сутки", "w": "за неделю", "a": "за всё время"}
+
+def _since_dt(p):
+    if p == "d":
+        return datetime.now(timezone.utc) - timedelta(hours=24)
+    if p == "w":
+        return datetime.now(timezone.utc) - timedelta(days=7)
+    return None
+
+def _period_row(screen, p):
+    return [IB(text=("✅ " if p == k else "") + lbl, callback_data=f"stv:{screen}:{k}") for k, lbl in _ST_PERIODS.items()]
+
+def stats_root_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [IB(text="📊 Поддержка", callback_data="stv:sup:d"), IB(text="👥 Хелперы", callback_data="stv:hlp:d")],
+        [IB(text="📈 Канал", callback_data="stv:chn:d"), IB(text="🧾 Посты", callback_data="stv:pst:d")],
+        [IB(text="👤 Публикаторы по людям", callback_data="stv:prs:d")],
+        [IB(text="🔙 Назад", callback_data="back_to_adm")],
+    ])
+
+def _chan_text(d: dict, p: str = "d") -> str:
     if d.get("error"):
         return f"📈 <b>Аналитика канала</b>\n\n{ICON_CROSS} {html.escape(d['error'])}"
     def sg(n): return f"{n:+d}"
-    L = [f"📈 <b>Аналитика канала {html.escape(SUB_CHANNEL)}</b>", ""]
+    L = [f"📈 <b>Аналитика канала {html.escape(SUB_CHANNEL)}</b> · {_ST_LABEL[p]}", ""]
     L.append(f"👥 Подписчиков: <b>{d['subs'] if d['subs'] is not None else '—'}</b>")
     if d["growth"]:
         L.append("Рост: " + ", ".join(f"за {k} дн. <b>{sg(v)}</b>" for k, v in sorted(d["growth"].items())))
     else:
         L.append("Рост: данных пока мало, снимок делается раз в сутки.")
+    pp = (d.get("per") or {}).get(p) or {}
     L.append("")
-    L.append(f"📝 Постов за 7 дней: <b>{d['posts_7']}</b>, за 30 дней: <b>{d['posts_30']}</b>")
-    L.append(f"👁 Средние просмотры (30 дн.): <b>{d['avg_views_30']}</b>, пересылки: <b>{d['avg_fwd_30']}</b>")
-    if d["best_hours"]:
+    note = f" (в Telegram доступны последние {d.get('fetched', 0)} постов)" if p == "a" else ""
+    L.append(f"📝 Постов {_ST_LABEL[p]}: <b>{pp.get('posts', 0)}</b>{note}")
+    L.append(f"👁 Средние просмотры: <b>{pp.get('avg_views', 0)}</b>, пересылки: <b>{pp.get('avg_fwd', 0)}</b>")
+    if pp.get("best_hours"):
         L.append("")
         L.append("🕒 <b>Лучшие часы публикации (МСК):</b>")
-        for h, v, n in d["best_hours"]:
+        for h, v, n in pp["best_hours"]:
             L.append(f"• {h:02d}:00 — в среднем {v} просмотров ({n} постов)")
-    if d["best_days"]:
-        L.append("📅 Лучшие дни: " + ", ".join(f"{n} ({v})" for n, v, _ in d["best_days"]))
-    if d["top"]:
+    if pp.get("best_days"):
+        L.append("📅 Лучшие дни: " + ", ".join(f"{n} ({v})" for n, v, _ in pp["best_days"]))
+    if pp.get("top"):
         L.append("")
-        L.append("🏆 <b>Лучшие посты за 30 дней:</b>")
-        for t in d["top"]:
+        L.append(f"🏆 <b>Лучшие посты {_ST_LABEL[p]}:</b>")
+        for t in pp["top"]:
             L.append(f'• <a href="{t["url"]}">{t["date"]}</a>: {t["views"]} просмотров, {t["forwards"]} пересылок')
     L.append("")
     L.append(f"<i>Обновлено: {d['updated']}</i>")
     return "\n".join(L)
+
+async def _sup_text(p):
+    total, closed, rejected, avg_r = await get_tickets_stats(_since_dt(p))
+    head = f"📊 <b>Поддержка · {_ST_LABEL[p]}</b>\n\n"
+    extra = f"{ICON_USERS} Пользователей всего: <code>{await get_all_users_count()}</code>\n" if p == "a" else ""
+    return head + extra + (
+        f"Тикетов создано: <code>{total}</code>\n"
+        f"{ICON_CHECK} Закрыто: <code>{closed}</code>\n"
+        f"{ICON_CROSS} Отклонено: <code>{rejected}</code>\n"
+        f"{ICON_STAR} Средняя оценка: <code>{avg_r} / 5.0</code>")
+
+async def _hlp_text(p):
+    rows = await get_admin_list_stats(_since_dt(p))
+    head = f"👥 <b>Хелперы · {_ST_LABEL[p]}</b>\n\n"
+    if not rows:
+        return head + "За этот период закрытых тикетов нет."
+    names = await asyncio.gather(*[_plain_name(int(r[0])) for r in rows], return_exceptions=True)
+    lines = []
+    for (admin_id, closed_cnt, avg_score, agent_no), nm in zip(rows, names):
+        name = html.escape(nm if isinstance(nm, str) else f"ID {admin_id}")
+        agent = f" [Агент #{agent_no}]" if agent_no else ""
+        lines.append(f"<b>{name}</b>{agent} (<code>{admin_id}</code>)\n"
+                     f"   • Закрыто тикетов: <code>{closed_cnt}</code>\n"
+                     f"   • Средняя оценка: <code>{round(float(avg_score), 2)} / 5.0</code>")
+    return head + "\n\n".join(lines)
+
+async def _pst_text(p):
+    since = _since_dt(p)
+    head = f"🧾 <b>Посты · {_ST_LABEL[p]}</b>\n\n"
+    def _query_detail():
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT user_id, channel_id, message_id, secret_type, created_at FROM secret_posts "
+                            "WHERE created_at >= %s ORDER BY created_at DESC", (since,))
+                return cur.fetchall()
+    def _query_counts():
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                w = " WHERE created_at >= %s" if since else ""
+                ps = (since,) if since else ()
+                cur.execute(f"SELECT COUNT(*) FROM secret_posts{w}", ps)
+                total = cur.fetchone()[0]
+                cur.execute(f"SELECT user_id, COUNT(*) FROM secret_posts{w} GROUP BY user_id ORDER BY 2 DESC, 1 LIMIT 30", ps)
+                return total, cur.fetchall()
+    if p == "d":
+        posts = await asyncio.to_thread(_query_detail)
+        if not posts:
+            return head + "За сутки постов не публиковалось."
+        by_user = {}
+        for u_id, ch_id, mid, stype, c_time in posts:
+            by_user.setdefault(u_id, []).append((ch_id, mid, stype, c_time))
+        names = await asyncio.gather(*[_plain_name(int(x)) for x in by_user], return_exceptions=True)
+        name_map = dict(zip(by_user.keys(), names))
+        text = head
+        for i, (u_id, plist) in enumerate(by_user.items(), 1):
+            nm = name_map.get(u_id)
+            nm = html.escape(nm if isinstance(nm, str) else "Неизвестно")
+            text += f"{i}. <a href='tg://openmessage?user_id={u_id}'>{u_id}</a> - {nm} - <b>{len(plist)} пост(ов)</b>:\n"
+            for idx, (ch_id, mid, stype, c_time) in enumerate(plist, 1):
+                time_str = c_time.astimezone(MSK_TZ).strftime("%H:%M:%S %d.%m.%Y")
+                post_url = _channel_post_link(ch_id, mid)
+                if not post_url:
+                    clean_ch = str(ch_id or "").replace("@", "")
+                    if clean_ch.startswith("https://t.me/"):
+                        post_url = f"{clean_ch}/{mid}"
+                    elif clean_ch.lstrip("-").isdigit() and mid:
+                        post_url = f"https://t.me/c/{clean_ch.lstrip('-')}/{mid}"
+                if post_url:
+                    text += f"   {idx}. {time_str} ({html.escape(stype)}) — <a href='{post_url}'>ссылка</a>\n"
+                else:
+                    text += f"   {idx}. {time_str} ({html.escape(stype)}) — <i>ссылки нет</i>\n"
+            text += "\n"
+        if len(text) > 4000:
+            text = text[:3900].rsplit("\n", 1)[0] + "\n... <i>(список сокращен)</i>"
+        return text
+    total, rows = await asyncio.to_thread(_query_counts)
+    if not rows:
+        return head + "За этот период постов не было."
+    names = await asyncio.gather(*[_plain_name(int(r[0])) for r in rows], return_exceptions=True)
+    lines = [f"{i}. {html.escape(nm if isinstance(nm, str) else 'ID')} (<code>{u}</code>) — <b>{n}</b>"
+             for i, ((u, n), nm) in enumerate(zip(rows, names), 1)]
+    return head + f"Всего постов: <b>{total}</b>\n\n" + "\n".join(lines)
+
+async def _prs_text(p):
+    rows = await _people_kind_stats(limit=30, since=_since_dt(p))
+    head = (f"👤 <b>Публикаторы по людям · {_ST_LABEL[p]}</b>\n"
+            "Секретки · саботёр · фарм · мутатор · исследователь\n\n")
+    if not rows:
+        return head + "За этот период никто ничего не провёл."
+    lines = [f"{i}. <b>{html.escape(r['name'])}</b> (<code>{r['id']}</code>) — <b>{r['total']}</b>: "
+             f"{r['sec']} · {r['sab']} · {r['farm']} · {r['mut']} · {r['res']}"
+             for i, r in enumerate(rows, 1)]
+    return head + "\n".join(lines)
+
+async def _stat_view(screen, p, force=False):
+    if screen == "sup":
+        text = await _sup_text(p)
+    elif screen == "hlp":
+        text = await _hlp_text(p)
+    elif screen == "chn":
+        text = _chan_text(await channel_analytics(force=force), p)
+    elif screen == "pst":
+        text = await _pst_text(p)
+    else:
+        text = await _prs_text(p)
+    rows = [_period_row(screen, p)]
+    if screen == "chn":
+        rows.append([IB(text="🔄 Обновить", callback_data=f"stv_r:chn:{p}")])
+    rows.append([IB(text="🔙 К статистике", callback_data="adm_stats")])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+async def _stv_show(call: CallbackQuery, screen: str, p: str, force: bool = False):
+    await call.answer()   # один раз и сразу: аналитика канала может собираться долго
+    text, kb = await _stat_view(screen, p, force)
+    try:
+        await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML",
+                                     link_preview_options=LinkPreviewOptions(is_disabled=True))
+    except Exception as e:
+        if "not modified" not in str(e).lower():
+            logging.info(f"Статистика: экран не обновлён ({e})")
+
+@router.callback_query(F.data == "adm_stats")
+async def callback_stats(call: CallbackQuery):
+    if not await is_main_admin(call.from_user.id):
+        await call.answer("❌ Нет доступа", show_alert=True)
+        return
+    await call.message.edit_text(
+        "📊 <b>Статистика</b>\n\nВыберите раздел. В каждом можно переключить период: сутки, неделя или всё время.",
+        reply_markup=stats_root_kb(), parse_mode="HTML")
+    await call.answer()
+
+@router.callback_query(F.data.regexp(r"^stv(_r)?:(sup|hlp|chn|pst|prs):(d|w|a)$"))
+async def stv_view(call: CallbackQuery):
+    if not await is_main_admin(call.from_user.id):
+        await call.answer("❌ Нет доступа", show_alert=True)
+        return
+    parts = call.data.split(":")
+    await _stv_show(call, parts[1], parts[2], force=parts[0] == "stv_r")
+
+# старые кнопки из прошлых сообщений ведут в новые экраны
+@router.callback_query(F.data == "adm_list_stats")
+async def callback_admin_list_stats(call: CallbackQuery):
+    if not await is_main_admin(call.from_user.id):
+        await call.answer("❌ Нет доступа", show_alert=True)
+        return
+    await _stv_show(call, "hlp", "d")
+
+@router.callback_query(F.data == "sec_stats")
+async def sec_stats(call: CallbackQuery):
+    if not await is_main_admin(call.from_user.id):
+        await call.answer("❌ Нет доступа", show_alert=True)
+        return
+    await _stv_show(call, "pst", "d")
 
 @router.callback_query(F.data.in_({"adm_chan_stats", "adm_chan_stats_refresh"}))
 async def adm_chan_stats(call: CallbackQuery):
     if not await is_main_admin(call.from_user.id):
         await call.answer("❌ Нет доступа", show_alert=True)
         return
-    await call.answer("Собираю данные…")
-    d = await channel_analytics(force=(call.data == "adm_chan_stats_refresh"))
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [IB(text="🔄 Обновить", callback_data="adm_chan_stats_refresh")],
-        [IB(text="🔙 Назад", callback_data="back_to_adm")]])
-    try:
-        await call.message.edit_text(_chan_text(d), reply_markup=kb, parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
-    except Exception as e:
-        logging.info(f"Аналитика канала: сообщение не обновлено ({e})")
+    await _stv_show(call, "chn", "d", force=(call.data == "adm_chan_stats_refresh"))
+
+# ---------------------------------------------------------------- разделы «Доступ» и «Платное»
+@router.callback_query(F.data == "adm_access")
+async def adm_access_screen(call: CallbackQuery):
+    if not await is_main_admin(call.from_user.id):
+        await call.answer("❌ Нет доступа", show_alert=True)
+        return
+    await call.message.edit_text(
+        "👥 <b>Доступ</b>\n\nКто публикует секретки, кому видны предссылки, наборы, главные админы и чёрный список.",
+        reply_markup=access_kb(), parse_mode="HTML")
+    await call.answer()
+
+@router.callback_query(F.data == "adm_pay")
+async def adm_pay_screen(call: CallbackQuery):
+    if not await is_main_admin(call.from_user.id):
+        await call.answer("❌ Нет доступа", show_alert=True)
+        return
+    await call.message.edit_text(
+        "💎 <b>Платное и рефералка</b>\n\nПлатные услуги за Stars и реферальная программа.",
+        reply_markup=pay_kb(), parse_mode="HTML")
+    await call.answer()
 
 # ----------------------------------------------------------------------
 # ПРАЗДНИЧНЫЙ РЕЖИМ (Хэллоуин и другие даты): оформление сайта и строка в приветствии бота
@@ -14511,6 +14626,8 @@ TEST_TMPL_CANCEL_KB = InlineKeyboardMarkup(inline_keyboard=[[IB(text="❌ Отм
 @router.callback_query(F.data == "adm_test")
 async def adm_test_screen(call: CallbackQuery):
     if not await is_main_admin(call.from_user.id): return
+    if OWNER_ID and call.from_user.id != OWNER_ID:
+        return await call.answer("🧪 Тест доступен только создателю бота.", show_alert=True)
     await _test_show(call)
     await call.answer()
 
@@ -16277,21 +16394,25 @@ async def _site_publisher_stats(uid: int) -> dict:
         "recent": [{"type": str(x[0] or "Секретка")[:40], "at": int(x[1]), "expired": bool(x[2])} for x in recent],
     }
 
-async def _people_kind_stats(limit: int = 15) -> list:
-    """Кто сколько провёл по типам: секретки, саботёр, фарм, мутатор, исследователь (с ручными зачётами). Топ по сумме."""
+async def _people_kind_stats(limit: int = 15, since=None) -> list:
+    """Кто сколько провёл по типам: секретки, саботёр, фарм, мутатор, исследователь (с ручными зачётами).
+    since — только за период, None — за всё время. Топ по сумме."""
     per = {}
     def add(uid, kind, n):
         per.setdefault(int(uid), {"sec": 0, "sab": 0, "farm": 0, "mut": 0, "res": 0})[kind] += int(n)
-    for uid_, n in await _db_all("SELECT user_id, COUNT(*) FROM secret_posts GROUP BY user_id"):
+    w = " WHERE created_at >= %s" if since else ""
+    ps = (since,) if since else ()
+    for uid_, n in await _db_all(f"SELECT user_id, COUNT(*) FROM secret_posts{w} GROUP BY user_id", ps):
         add(uid_, "sec", n)
     for key, table in (("sab", "saboteur_servers"), ("farm", "farm_servers"), ("mut", "mutator_badges"), ("res", "researcher_badges")):
         try:
-            for uid_, n in await _db_all(f"SELECT user_id, COUNT(*) FROM {table} GROUP BY user_id"):
+            for uid_, n in await _db_all(f"SELECT user_id, COUNT(*) FROM {table}{w} GROUP BY user_id", ps):
                 add(uid_, key, n)
         except Exception as e:
             logging.warning(f"Статистика по людям: {table}: {e}")
     try:
-        for uid_, kind, n in await _db_all("SELECT user_id, kind, COUNT(*) FROM manual_grants GROUP BY user_id, kind"):
+        mw = " WHERE ts >= %s" if since else ""
+        for uid_, kind, n in await _db_all(f"SELECT user_id, kind, COUNT(*) FROM manual_grants{mw} GROUP BY user_id, kind", ps):
             add(uid_, str(kind), n)
     except Exception as e:
         logging.warning(f"Статистика по людям: ручные зачёты: {e}")
