@@ -1606,12 +1606,115 @@ async def _save_username(uid: int, uname: str):
     except Exception as e:
         logging.warning(f"Не удалось запомнить юзернейм {uid}: {e}")
 
+# ---------------------------------------------------------------- сценарии: выход в меню, «Назад» и «Отмена»
+from aiogram.methods import SendMessage as _SendMessage
+from aiogram.fsm.storage.base import StorageKey as _StorageKey
+
+_FLOW_EXCLUDE = ("NormStates:", "SAdj:", "BlStates:")   # у них свои кнопки отмены
+_FLOW_HIST = {}     # uid -> стек предыдущих состояний сценария
+_FLOW_PROMPT = {}   # (uid, состояние) -> последний вопрос (текст, parse_mode), чтобы «Назад» его показал снова
+
+def _is_flow_state(st) -> bool:
+    return bool(st) and not str(st).startswith(_FLOW_EXCLUDE)
+
+def _menu_texts() -> set:
+    names = [BTN_COMPLAINT, BTN_APPEAL, BTN_FRIENDS, BTN_QUESTION, BTN_HELPER_APPLY, BTN_SECRET_APPLY,
+             BTN_ADMIN_PANEL, BTN_REFRESH, BTN_SECRETS, BTN_SHOP, BTN_REF]
+    out = set()
+    for n in names:
+        out.update(btn_texts(n))
+    return out
+
+def _flow_kb(existing=None):
+    nav = [IB(text="🔙 Назад", callback_data="flow_back"),
+           IB(text="❌ Отмена", style="danger", callback_data="flow_cancel")]
+    rows = list(existing.inline_keyboard) if isinstance(existing, InlineKeyboardMarkup) else []
+    return InlineKeyboardMarkup(inline_keyboard=rows + [nav])
+
+class FlowMiddleware(BaseMiddleware):
+    """Пока человек в сценарии: кнопка меню или команда выходят из сценария, а переходы между вопросами
+    записываются, чтобы «Назад» знал, куда вернуться."""
+    async def __call__(self, handler, event, data):
+        st = data.get("state")
+        user = data.get("event_from_user")
+        if st is None or user is None:
+            return await handler(event, data)
+        chat = event.chat if isinstance(event, Message) else (event.message.chat if event.message else None)
+        if chat is None or chat.type != "private":
+            return await handler(event, data)
+        uid = user.id
+        if isinstance(event, CallbackQuery) and event.data in ("flow_back", "flow_cancel"):
+            return await handler(event, data)
+        if isinstance(event, Message) and event.text and (event.text in _menu_texts() or event.text.startswith("/")):
+            if await st.get_state():
+                await st.clear()
+            _FLOW_HIST.pop(uid, None)
+            return await handler(event, data)
+        before = await st.get_state()
+        res = await handler(event, data)
+        after = await st.get_state()
+        if before != after and _is_flow_state(before):
+            if after is None:
+                _FLOW_HIST.pop(uid, None)
+            else:
+                _FLOW_HIST.setdefault(uid, []).append(before)
+        return res
+
+class FlowButtonsMiddleware(BaseRequestMiddleware):
+    """Вопросы в сценарии получают строку «Назад» и «Отмена». Свои кнопки (например «Пропустить») сохраняются."""
+    async def __call__(self, make_request, bot, method):
+        if isinstance(method, _SendMessage) and isinstance(method.chat_id, int) and method.chat_id > 0:
+            try:
+                key = _StorageKey(bot_id=bot.id, chat_id=method.chat_id, user_id=method.chat_id)
+                st = await dp.storage.get_state(key)
+            except Exception:
+                st = None
+            if _is_flow_state(st):
+                if method.text:
+                    _FLOW_PROMPT[(method.chat_id, st)] = (method.text, method.parse_mode)
+                rm = method.reply_markup
+                if rm is None or isinstance(rm, InlineKeyboardMarkup):
+                    method = method.model_copy(update={"reply_markup": _flow_kb(rm)})
+        return await make_request(bot, method)
+
+@router.callback_query(F.data == "flow_cancel")
+async def flow_cancel(cb: CallbackQuery, state: FSMContext):
+    uid = cb.from_user.id
+    await state.clear()
+    _FLOW_HIST.pop(uid, None)
+    try:
+        await cb.message.edit_text("❌ Заявка отменена. Выберите нужный раздел в меню.", reply_markup=None)
+    except Exception:
+        pass
+    await cb.message.answer("Меню:", reply_markup=await main_keyboard(uid))
+    await cb.answer()
+
+@router.callback_query(F.data == "flow_back")
+async def flow_back(cb: CallbackQuery, state: FSMContext):
+    uid = cb.from_user.id
+    hist = _FLOW_HIST.get(uid) or []
+    if not hist:
+        return await flow_cancel(cb, state)
+    prev = hist.pop()
+    await state.set_state(prev)
+    text, pm = _FLOW_PROMPT.get((uid, prev), (None, None))
+    try:
+        await cb.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await cb.message.answer(text or "Вернулись к предыдущему вопросу. Отправьте ответ.", parse_mode=pm,
+                            reply_markup=_flow_kb(None))
+    await cb.answer()
+
 dp.message.middleware(UsernameTrackerMiddleware())
 dp.callback_query.middleware(UsernameTrackerMiddleware())
 dp.message.middleware(MaintenanceMiddleware())
 dp.callback_query.middleware(MaintenanceMiddleware())
 dp.message.middleware(ThrottlingMiddleware(limit=0.6))
 dp.callback_query.middleware(ThrottlingMiddleware(limit=0.6))
+dp.message.middleware(FlowMiddleware())
+dp.callback_query.middleware(FlowMiddleware())
+bot.session.middleware(FlowButtonsMiddleware())
 dp.include_router(router)
 
 # ----------------------------------------------------------------------
