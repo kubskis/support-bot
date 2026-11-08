@@ -1193,7 +1193,7 @@ async def adm_holi_add(cb: CallbackQuery, state: FSMContext):
         return
     await state.set_state(NormStates.holi)
     await cb.message.answer("Напишите даты через пробел: <code>ДД.ММ</code> или <code>ДД.ММ.ГГГГ</code>, например <code>04.11 07.11</code>.",
-                            parse_mode="HTML", reply_markup=_ikb([[InlineKeyboardButton(text="✖️ Отмена", callback_data="nrmholi")]]))
+                            parse_mode="HTML", reply_markup=_ikb([[InlineKeyboardButton(style="danger", text="✖️ Отмена", callback_data="nrmholi")]]))
     await cb.answer()
 
 
@@ -1285,7 +1285,7 @@ async def adm_norm_warn_reason(cb: CallbackQuery, state: FSMContext):
     await state.set_state(NormStates.wreason)
     await state.update_data(uid=uid)
     await cb.message.answer(f"Предупреждение для <b>{await _nm(uid)}</b>.\nНапишите <b>причину</b> (её увидит человек) или <code>-</code>, чтобы выдать без причины.",
-                            parse_mode="HTML", reply_markup=_ikb([[InlineKeyboardButton(text="✖️ Отмена", callback_data="nrmw")]]))
+                            parse_mode="HTML", reply_markup=_ikb([[InlineKeyboardButton(style="danger", text="✖️ Отмена", callback_data="nrmw")]]))
     await cb.answer()
 
 
@@ -1421,7 +1421,7 @@ async def adm_norm_pick(cb: CallbackQuery, state: FSMContext):
     await state.update_data(uid=uid)
     await cb.message.answer(f"Отгул для <b>{await _nm(uid)}</b>.\nНапишите <b>количество часов</b> числом (например <code>24</code>, месяц — <code>720</code>) "
                             "и, если нужно, причину через пробел: <code>72 болеет</code>.\nМожно выражением: <code>24*30</code>.",
-                            parse_mode="HTML", reply_markup=_ikb([[InlineKeyboardButton(text="✖️ Отмена", callback_data="nrme")]]))
+                            parse_mode="HTML", reply_markup=_ikb([[InlineKeyboardButton(style="danger", text="✖️ Отмена", callback_data="nrme")]]))
     await cb.answer()
 
 
@@ -1510,7 +1510,7 @@ async def adm_norm_manual_note(cb: CallbackQuery, state: FSMContext):
     await state.update_data(uid=int(uid), day=d)
     await cb.message.answer(f"Засчитать секретку <b>{await _nm(int(uid))}</b> за {_fmt(date.fromisoformat(d))}.\n"
                             "Напишите <b>пометку</b> (например, «нашёл, но бот не увидел») или <code>-</code> без пометки.",
-                            parse_mode="HTML", reply_markup=_ikb([[InlineKeyboardButton(text="✖️ Отмена", callback_data="nrmm")]]))
+                            parse_mode="HTML", reply_markup=_ikb([[InlineKeyboardButton(style="danger", text="✖️ Отмена", callback_data="nrmm")]]))
     await cb.answer()
 
 

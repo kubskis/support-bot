@@ -210,7 +210,7 @@ async def resolve(raw: str):
 
 
 def _cancel_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✖️ Отмена", callback_data="bl_cancel")]])
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(style="danger", text="✖️ Отмена", callback_data="bl_cancel")]])
 
 
 async def _allowed(uid) -> bool:
@@ -277,7 +277,7 @@ async def bl_reason(message: Message, state: FSMContext):
     await state.update_data(reason=txt[:300])
     await state.set_state(BlStates.confirm)
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Внести в ЧС", callback_data="bl_ok"),
-                                                InlineKeyboardButton(text="✖️ Отмена", callback_data="bl_cancel")]])
+                                                InlineKeyboardButton(style="danger", text="✖️ Отмена", callback_data="bl_cancel")]])
     await message.answer(f"Проверьте запись:\n\n👤 <code>{html.escape(d['nick'])}</code> · <a href=\"{_profile(d['rid'])}\">профиль</a>\n"
                          f"📝 {html.escape(txt[:300])}\n✍️ Внесёт: {html.escape(message.from_user.full_name)}\n\nЗапись появится в темах «Поддержка» и «Информация».",
                          parse_mode="HTML", reply_markup=kb, **_lp())

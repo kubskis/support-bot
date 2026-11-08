@@ -57,7 +57,7 @@ def _kb(rows):
 
 
 def _cancel_row():
-    return [InlineKeyboardButton(text="✖️ Отмена", callback_data="sadj_cancel")]
+    return [InlineKeyboardButton(style="danger", text="✖️ Отмена", callback_data="sadj_cancel")]
 
 
 def _db_run(fn):
@@ -300,7 +300,7 @@ async def _ask_confirm(msg, state: FSMContext):
                 f"Снимаются только вручную выданные записи этого типа ({have} шт.). Сообщения в канале и серверы не трогаются.")
     await msg.answer(text, parse_mode="HTML",
                      reply_markup=_kb([[InlineKeyboardButton(text="✅ Подтвердить", callback_data="sadj_ok"),
-                                        InlineKeyboardButton(text="✖️ Отмена", callback_data="sadj_cancel")]]))
+                                        InlineKeyboardButton(style="danger", text="✖️ Отмена", callback_data="sadj_cancel")]]))
 
 
 @router.callback_query(SAdj.confirm, F.data == "sadj_ok")

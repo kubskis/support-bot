@@ -4726,7 +4726,7 @@ async def welcome_edit(call: CallbackQuery, state: FSMContext):
     if not await is_main_admin(call.from_user.id):
         await call.answer("❌ Нет доступа", show_alert=True); return
     await state.set_state(WelcomeAdminStates.waiting_text)
-    kb = InlineKeyboardMarkup(inline_keyboard=[[IB(text="Отмена", callback_data="adm_welcome")]])
+    kb = InlineKeyboardMarkup(inline_keyboard=[[IB(style="danger", text="Отмена", callback_data="adm_welcome")]])
     await call.message.edit_text(
         "✏️ Отправьте <b>новый текст приветствия одним сообщением</b>.\n\n"
         "• Жирный, курсив, ссылки и эмодзи сохранятся в том виде, как вы их оформили.\n"
@@ -5190,7 +5190,7 @@ async def set_test_channel_prompt(call: CallbackQuery, state: FSMContext):
         await call.answer("❌ Канал тест-режима может задавать только создатель бота!", show_alert=True)
         return
     await state.set_state(SecretAdminStates.test_channel)
-    kb = InlineKeyboardMarkup(inline_keyboard=[[IB(text="❌ Отменить", callback_data="sec_tmpl_cancel")]])
+    kb = InlineKeyboardMarkup(inline_keyboard=[[IB(style="danger", text="❌ Отменить", callback_data="sec_tmpl_cancel")]])
     cur_ch = TEST_CHANNEL_ID or "не задан"
     await call.message.answer(
         "📡 <b>Канал тест-режима</b>\n\n"
@@ -5778,7 +5778,7 @@ async def sec_tmpl_flive_close_proc(message: Message, state: FSMContext):
     await message.answer(f"{ICON_CHECK} Шаблон закрытого поста фарма сохранён!", reply_markup=kb, parse_mode="HTML")
 
 TMPL_CANCEL_KB = InlineKeyboardMarkup(inline_keyboard=[
-    [IB(text="❌ Отменить", callback_data="sec_tmpl_cancel")]
+    [IB(style="danger", text="❌ Отменить", callback_data="sec_tmpl_cancel")]
 ])
 
 @router.callback_query(F.data == "sec_tmpl_cancel")
@@ -5966,7 +5966,7 @@ async def sec_prelinks(call: CallbackQuery, state: FSMContext):
 async def sec_prelink_add(call: CallbackQuery, state: FSMContext):
     if not await is_main_admin(call.from_user.id): return
     await state.set_state(SecretAdminStates.prelink_add)
-    kb = InlineKeyboardMarkup(inline_keyboard=[[IB(text="❌ Отменить", callback_data="sec_prelinks")]])
+    kb = InlineKeyboardMarkup(inline_keyboard=[[IB(style="danger", text="❌ Отменить", callback_data="sec_prelinks")]])
     await call.message.answer(
         "➕ Отправьте <b>ID или @юзернейм</b> пользователя (можно несколько через пробел или с новой строки):",
         reply_markup=kb, parse_mode="HTML"
@@ -5987,7 +5987,7 @@ async def sec_prelink_add_proc(message: Message, state: FSMContext):
          IB(text="🗓 Месяц", callback_data="sec_prelink_dur_month"),
          IB(text="♾ Навсегда", callback_data="sec_prelink_dur_forever")],
     ]
-    dur_rows.append([IB(text="❌ Отменить", callback_data="sec_prelinks")])
+    dur_rows.append([IB(style="danger", text="❌ Отменить", callback_data="sec_prelinks")])
     kb = InlineKeyboardMarkup(inline_keyboard=dur_rows)
     labels = [f"{u} - {await get_user_label(u)}" for u in ids]
     miss = ("\n\n⚠️ Не нашёл: " + ", ".join(html.escape(x) for x in failed) + ". Их не добавлю.") if failed else ""
@@ -6090,7 +6090,7 @@ async def sec_call_cmd(call: CallbackQuery, state: FSMContext):
     if not await is_main_admin(call.from_user.id): return
     cur_cmd = await get_setting("call_command", "") or ""
     await state.set_state(SecretAdminStates.call_command)
-    kb = InlineKeyboardMarkup(inline_keyboard=[[IB(text="❌ Отменить", callback_data="sec_tmpl_cancel")]])
+    kb = InlineKeyboardMarkup(inline_keyboard=[[IB(style="danger", text="❌ Отменить", callback_data="sec_tmpl_cancel")]])
     await call.message.answer(
         "📣 <b>Команда для бота-зазывалы</b>\n\n"
         f"Сейчас: <code>{html.escape(cur_cmd) if cur_cmd else 'не задана'}</code>\n\n"
@@ -6442,7 +6442,7 @@ async def pub_link(message: Message, state: FSMContext):
         
     conf_kb = InlineKeyboardMarkup(inline_keyboard=[[
         IB(text="✅ Опубликовать", callback_data="pub_conf_yes"),
-        IB(text="❌ Отмена", callback_data="pub_conf_no")
+        IB(style="danger", text="❌ Отмена", callback_data="pub_conf_no")
     ]])
     await message.answer("Предпросмотр поста:")
     await message.answer_photo(photo=data["photo_id"], caption=preview, reply_markup=conf_kb, parse_mode="HTML")
@@ -6850,7 +6850,7 @@ async def saboteur_link_proc(message: Message, state: FSMContext):
 
     conf_kb = InlineKeyboardMarkup(inline_keyboard=[[
         IB(text="✅ Опубликовать", callback_data="sab_conf_yes"),
-        IB(text="❌ Отмена", callback_data="sab_conf_no")
+        IB(style="danger", text="❌ Отмена", callback_data="sab_conf_no")
     ]])
     await message.answer(preview_text, reply_markup=conf_kb, parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
     await state.set_state(SaboteurPublisherStates.waiting_for_confirm)
@@ -6867,7 +6867,7 @@ def delay_kb(kind: str):
         [IB(text="⏱ Через 1 минуту", callback_data=f"dly_{kind}_1"),
          IB(text="⏱ Через 3 минуты", callback_data=f"dly_{kind}_3")],
         [IB(text="⏱ Через 5 минут", callback_data=f"dly_{kind}_5")],
-        [IB(text="❌ Отмена", callback_data=f"dly_{kind}_x")],
+        [IB(style="danger", text="❌ Отмена", callback_data=f"dly_{kind}_x")],
     ])
 
 async def _sab_core(user, data, ch_id) -> tuple:
@@ -7248,7 +7248,7 @@ async def delay_choice_proc(call: CallbackQuery, state: FSMContext):
     word = "минуту" if minutes == 1 else ("минуты" if minutes < 5 else "минут")
     await call.message.edit_text(
         f"⏳ <b>Пост выйдет через {minutes} {word}.</b>\nДо этого момента ссылку никто не получит. Передумали, нажмите кнопку ниже.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[IB(text="❌ Отменить публикацию", callback_data=f"dlycancel_{token}")]]),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[IB(style="danger", text="❌ Отменить публикацию", callback_data=f"dlycancel_{token}")]]),
         parse_mode="HTML"
     )
     await call.answer()
@@ -7649,7 +7649,7 @@ async def mutator_link_proc(message: Message, state: FSMContext):
     preview = await render_mutator_active(clean)
     conf_kb = InlineKeyboardMarkup(inline_keyboard=[[
         IB(text="✅ Опубликовать", callback_data="mut_conf_yes"),
-        IB(text="❌ Отмена", callback_data="mut_conf_no")
+        IB(style="danger", text="❌ Отмена", callback_data="mut_conf_no")
     ]])
     await message.answer("Предпросмотр поста:")
     await message.answer(preview, reply_markup=conf_kb, parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
@@ -8160,7 +8160,7 @@ async def researcher_link_proc(message: Message, state: FSMContext):
     preview = await render_researcher_active(clean)
     conf_kb = InlineKeyboardMarkup(inline_keyboard=[[
         IB(text="✅ Опубликовать", callback_data="res_conf_yes"),
-        IB(text="❌ Отмена", callback_data="res_conf_no")
+        IB(style="danger", text="❌ Отмена", callback_data="res_conf_no")
     ]])
     await message.answer("Предпросмотр поста:")
     await message.answer(preview, reply_markup=conf_kb, parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
@@ -8378,7 +8378,7 @@ async def farm_effects_proc(call: CallbackQuery, state: FSMContext):
 
     conf_kb = InlineKeyboardMarkup(inline_keyboard=[[
         IB(text="✅ Опубликовать", callback_data="farm_conf_yes"),
-        IB(text="❌ Отмена", callback_data="farm_conf_no")
+        IB(style="danger", text="❌ Отмена", callback_data="farm_conf_no")
     ]])
     await call.message.edit_text(preview_text, reply_markup=conf_kb, parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
     await state.set_state(FarmPublisherStates.waiting_for_confirm)
@@ -9332,7 +9332,7 @@ async def promo_hold_worker():
             logging.error(f"Ошибка в promo_hold_worker: {err}", exc_info=True)
         await asyncio.sleep(60)
 
-_PROMO_CANCEL_KB = InlineKeyboardMarkup(inline_keyboard=[[IB(text="❌ Отмена", callback_data="shop_promocancel")]])
+_PROMO_CANCEL_KB = InlineKeyboardMarkup(inline_keyboard=[[IB(style="danger", text="❌ Отмена", callback_data="shop_promocancel")]])
 
 @router.message(Command("promocode"), F.chat.type == "private")
 async def cmd_promocode(message: Message, command: CommandObject, state: FSMContext):
@@ -9688,7 +9688,7 @@ async def donate_custom(call: CallbackQuery, state: FSMContext):
     if await is_banned(call.from_user.id):
         await call.answer(); return
     await state.set_state(ShopUserStates.waiting_donate)
-    kb = InlineKeyboardMarkup(inline_keyboard=[[IB(text="🔙 Отмена", callback_data="donate_menu")]])
+    kb = InlineKeyboardMarkup(inline_keyboard=[[IB(style="danger", text="🔙 Отмена", callback_data="donate_menu")]])
     await call.message.edit_text(f"✏️ Введите сумму в звёздах целым числом (от {DONATE_MIN} до {DONATE_MAX}).", reply_markup=kb, parse_mode="HTML")
     await call.answer()
 
@@ -10026,7 +10026,7 @@ async def shopa_service(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 def _shopa_cancel_kb(back: str):
-    return InlineKeyboardMarkup(inline_keyboard=[[IB(text="❌ Отменить", callback_data=back)]])
+    return InlineKeyboardMarkup(inline_keyboard=[[IB(style="danger", text="❌ Отменить", callback_data=back)]])
 
 @router.callback_query(F.data == "shopa_new")
 async def shopa_new(call: CallbackQuery, state: FSMContext):
@@ -10640,7 +10640,7 @@ async def shopp_pct_proc(message: Message, state: FSMContext):
     rows = [[IB(text="🌐 Все услуги", callback_data="shopp_scope_all")]]
     for sv in services:
         rows.append([IB(text=f"💎 {sv[1]}"[:60], callback_data=f"shopp_scope_{sv[0]}")])
-    rows.append([IB(text="❌ Отменить", callback_data="shopp_menu")])
+    rows.append([IB(style="danger", text="❌ Отменить", callback_data="shopp_menu")])
     await message.answer(
         f"Скидка: <b>{int(t)}%</b>\n\nНа что действует промокод?",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML"
@@ -10658,7 +10658,7 @@ def _shopp_dur_kb():
         [IB(text="6 ч", callback_data="shopp_dur_6"), IB(text="1 день", callback_data="shopp_dur_24"), IB(text="3 дня", callback_data="shopp_dur_72")],
         [IB(text="7 дней", callback_data="shopp_dur_168"), IB(text="30 дней", callback_data="shopp_dur_720"), IB(text="♾ Без срока", callback_data="shopp_dur_0")],
         [IB(text="✏ Своё", callback_data="shopp_dur_c")],
-        [IB(text="❌ Отменить", callback_data="shopp_menu")],
+        [IB(style="danger", text="❌ Отменить", callback_data="shopp_menu")],
     ])
 
 _SHOPP_DUR_TEXT = "⏱ <b>Сколько времени действует промокод</b> (до какого момента его можно активировать и использовать)?"
@@ -10667,7 +10667,7 @@ async def _shopp_ask_for(call: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [IB(text="👥 Для всех", callback_data="shopp_for_all")],
         [IB(text="👤 Личный (одному человеку)", callback_data="shopp_for_one")],
-        [IB(text="❌ Отменить", callback_data="shopp_menu")],
+        [IB(style="danger", text="❌ Отменить", callback_data="shopp_menu")],
     ])
     await call.message.edit_text("👥 <b>Кому доступен промокод?</b>\n\nЛичный промокод работает только для одного человека (по ID или @юзернейму) и на одну активацию.", reply_markup=kb, parse_mode="HTML")
 
@@ -10683,7 +10683,7 @@ async def shopp_scope(call: CallbackQuery, state: FSMContext):
         rows = [[IB(text="🧩 Все тарифы услуги", callback_data="shopp_tar_all")]]
         for t in tariffs:
             rows.append([IB(text=f"{t[1]} ({t[2]} ⭐)"[:60], callback_data=f"shopp_tar_{t[0]}")])
-        rows.append([IB(text="❌ Отменить", callback_data="shopp_menu")])
+        rows.append([IB(style="danger", text="❌ Отменить", callback_data="shopp_menu")])
         await call.message.edit_text("🧩 <b>На какие тарифы действует промокод?</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
         await call.answer()
         return
@@ -10747,7 +10747,7 @@ def _shopp_limit_kb():
         [IB(text="1", callback_data="shopp_max_1"), IB(text="5", callback_data="shopp_max_5"), IB(text="10", callback_data="shopp_max_10")],
         [IB(text="50", callback_data="shopp_max_50"), IB(text="100", callback_data="shopp_max_100"), IB(text="♾ Без лимита", callback_data="shopp_max_0")],
         [IB(text="✏ Своё", callback_data="shopp_max_c")],
-        [IB(text="❌ Отменить", callback_data="shopp_menu")],
+        [IB(style="danger", text="❌ Отменить", callback_data="shopp_menu")],
     ])
 
 @router.callback_query(F.data.startswith("shopp_dur_"))
@@ -12664,7 +12664,7 @@ async def process_rating(call: CallbackQuery):
         except TelegramBadRequest:
             pass
 
-_RFB_CANCEL_KB = InlineKeyboardMarkup(inline_keyboard=[[IB(text="Отмена", callback_data="rfbx")]])
+_RFB_CANCEL_KB = InlineKeyboardMarkup(inline_keyboard=[[IB(style="danger", text="Отмена", callback_data="rfbx")]])
 
 @router.callback_query(F.data.regexp(r"^rfb_\d+$"))
 async def rating_feedback_start(call: CallbackQuery, state: FSMContext):
@@ -14662,7 +14662,7 @@ async def _test_show(call: CallbackQuery):
     except Exception:
         await call.message.answer(text, reply_markup=kb, parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
 
-TEST_TMPL_CANCEL_KB = InlineKeyboardMarkup(inline_keyboard=[[IB(text="❌ Отменить", callback_data="test_tmpl_cancel")]])
+TEST_TMPL_CANCEL_KB = InlineKeyboardMarkup(inline_keyboard=[[IB(style="danger", text="❌ Отменить", callback_data="test_tmpl_cancel")]])
 
 @router.callback_query(F.data == "adm_test")
 async def adm_test_screen(call: CallbackQuery):
