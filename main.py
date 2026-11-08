@@ -13114,29 +13114,57 @@ async def cmd_work_tickets(message: Message):
         )
     await _send_long(message, text)
 
+async def _ms_target(message: Message):
+    """Чья статистика нужна: сам автор (без аргумента) или тот, кого указали: @ник, ответ-упоминание или ID."""
+    text = message.text or ""
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2:
+        return message.from_user.id
+    for ent in (message.entities or []):
+        if ent.type == "text_mention" and ent.user:
+            return ent.user.id
+    for ent in (message.entities or []):
+        if ent.type == "mention":
+            raw = text.encode("utf-16-le")[ent.offset * 2:(ent.offset + ent.length) * 2].decode("utf-16-le")
+            return await resolve_username(raw.lstrip("@"))
+    arg = parts[1].strip()
+    if re.fullmatch(r"\d{5,15}", arg):
+        return int(arg)
+    if re.fullmatch(r"@?[A-Za-z0-9_]{3,32}", arg):
+        return await resolve_username(arg)
+    return None
+
+
 @router.message(Command("mystats"), F.chat.id == ADMIN_CHAT_ID)
 async def cmd_my_stats(message: Message):
-    sup, pub = await _ms_roles(message.from_user.id)
-    if not sup and not pub:
-        await message.answer("❌ Статистика доступна агентам поддержки и публикаторам секреток.", parse_mode="HTML")
+    uid = await _ms_target(message)
+    if uid is None:
+        await message.answer("❌ Не нашёл такого игрока. Попробуйте @ник из базы бота или ответьте на его сообщение.", parse_mode="HTML")
         return
-    text, kb = await _ms_render(message.from_user, "sum", sup, pub)
+    sup, pub = await _ms_roles(uid)
+    if not sup and not pub:
+        who = "У вас" if uid == message.from_user.id else "У этого человека"
+        await message.answer(f"❌ {who} нет статистики: это не агент поддержки и не публикатор секреток.", parse_mode="HTML")
+        return
+    text, kb = await _ms_render(uid, "sum", sup, pub)
     await message.answer(text, parse_mode="HTML", reply_markup=kb)
 
 
 @router.callback_query(F.data.startswith("mystat:"))
 async def cb_my_stats(cb: CallbackQuery):
-    screen = cb.data.split(":", 1)[1]
-    sup, pub = await _ms_roles(cb.from_user.id)
+    parts = cb.data.split(":")
+    screen = parts[1]
+    uid = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else cb.from_user.id
+    sup, pub = await _ms_roles(uid)
     if not sup and not pub:
-        await cb.answer("Статистика недоступна для вашей роли", show_alert=True)
+        await cb.answer("Статистика недоступна для этого человека", show_alert=True)
         return
     allowed = {"sum": True, "menu": True, "sup": sup, "sec": pub, "typ": pub}
     if not allowed.get(screen):
-        await cb.answer("Этот раздел вам недоступен", show_alert=True)
+        await cb.answer("Этот раздел недоступен", show_alert=True)
         return
     await cb.answer()
-    text, kb = await _ms_render(cb.from_user, screen, sup, pub)
+    text, kb = await _ms_render(uid, screen, sup, pub)
     try:
         await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
     except TelegramBadRequest:
@@ -13218,20 +13246,21 @@ def _ms_place(ranking: list, uid: int) -> str:
     return "без места"
 
 
-async def _ms_render(user, screen: str, sup: bool, pub: bool) -> tuple:
-    uid = user.id
-    mention = user.mention_html()
+async def _ms_render(uid: int, screen: str, sup: bool, pub: bool) -> tuple:
+    label = await get_user_label(uid)
+    mention = f'<a href="tg://user?id={uid}">{label}</a>'
+
+    def btn(text, data):
+        return IB(text, callback_data=f"mystat:{data}:{uid}")
+
+    def kb(*rows):
+        return InlineKeyboardMarkup(inline_keyboard=[list(r) for r in rows])
+
     d = await asyncio.to_thread(_ms_sync, uid, sup, pub)
     if sup:
         d["ranking_sup"] = await filter_in_admin_chat(d.get("ranking_sup", []))
     if pub:
         d["ranking_sec"] = await filter_in_admin_chat(d.get("ranking_sec", []))
-
-    def btn(text, data):
-        return IB(text, callback_data=data)
-
-    def kb(*rows):
-        return InlineKeyboardMarkup(inline_keyboard=[list(r) for r in rows])
 
     if screen == "sum":
         parts = [f"📊 <b>Ваша статистика</b>\n👤 {mention}"]
@@ -13252,19 +13281,19 @@ async def _ms_render(user, screen: str, sup: bool, pub: bool) -> tuple:
                 f"🏆 Место в топе: <b>{_ms_place(d['ranking_sec'], uid)}</b>"
             )
         parts.append("\n<i>Подробности — кнопка ниже.</i>")
-        return "\n".join(parts), kb([btn("🔍 Подробная статистика", "mystat:menu")])
+        return "\n".join(parts), kb([btn("🔍 Подробная статистика", "menu")])
 
     if screen == "menu":
         rows = []
         if sup:
-            rows.append([btn("🛠 Поддержка", "mystat:sup")])
+            rows.append([btn("🛠 Поддержка", "sup")])
         if pub:
-            rows.append([btn("🔮 Секретки", "mystat:sec")])
-            rows.append([btn("🧩 Типы секреток", "mystat:typ")])
-        rows.append([btn("⬅️ К сводке", "mystat:sum")])
+            rows.append([btn("🔮 Секретки", "sec")])
+            rows.append([btn("🧩 Типы секреток", "typ")])
+        rows.append([btn("⬅️ К сводке", "sum")])
         return "🔍 <b>Подробная статистика</b>\n\nВыберите раздел:", kb(*rows)
 
-    back = [btn("⬅️ К разделам", "mystat:menu")]
+    back = [btn("⬅️ К разделам", "menu")]
 
     if screen == "sup":
         cats = "\n".join(f"   • {_MS_CAT.get(c, html.escape(str(c)))}: <code>{n}</code>" for c, n in d["cats"]) or "   нет закрытых"
