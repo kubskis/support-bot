@@ -13146,7 +13146,7 @@ async def cmd_my_stats(message: Message):
         who = "У вас" if uid == message.from_user.id else "У этого человека"
         await message.answer(f"❌ {who} нет статистики: это не агент поддержки и не публикатор секреток.", parse_mode="HTML")
         return
-    text, kb = await _ms_render(uid, "sum", sup, pub)
+    text, kb = await _ms_render(uid, "sum", sup, pub, message.from_user.id)
     await message.answer(text, parse_mode="HTML", reply_markup=kb)
 
 
@@ -13155,6 +13155,10 @@ async def cb_my_stats(cb: CallbackQuery):
     parts = cb.data.split(":")
     screen = parts[1]
     uid = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else cb.from_user.id
+    invoker = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else uid
+    if cb.from_user.id != invoker:
+        await cb.answer("Это статистику вызвал другой человек. Вызовите свою командой /mystats", show_alert=True)
+        return
     sup, pub = await _ms_roles(uid)
     if not sup and not pub:
         await cb.answer("Статистика недоступна для этого человека", show_alert=True)
@@ -13164,7 +13168,7 @@ async def cb_my_stats(cb: CallbackQuery):
         await cb.answer("Этот раздел недоступен", show_alert=True)
         return
     await cb.answer()
-    text, kb = await _ms_render(uid, screen, sup, pub)
+    text, kb = await _ms_render(uid, screen, sup, pub, invoker)
     try:
         await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
     except TelegramBadRequest:
@@ -13246,12 +13250,12 @@ def _ms_place(ranking: list, uid: int) -> str:
     return "без места"
 
 
-async def _ms_render(uid: int, screen: str, sup: bool, pub: bool) -> tuple:
+async def _ms_render(uid: int, screen: str, sup: bool, pub: bool, invoker: int) -> tuple:
     label = await get_user_label(uid)
     mention = f'<a href="tg://user?id={uid}">{label}</a>'
 
     def btn(text, data):
-        return IB(text, callback_data=f"mystat:{data}:{uid}")
+        return IB(text, callback_data=f"mystat:{data}:{uid}:{invoker}")
 
     def kb(*rows):
         return InlineKeyboardMarkup(inline_keyboard=[list(r) for r in rows])
