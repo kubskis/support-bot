@@ -70,6 +70,7 @@ CREATE INDEX IF NOT EXISTS secret_posts_user_created ON secret_posts(user_id, cr
 CREATE TABLE IF NOT EXISTS manual_grants(id SERIAL PRIMARY KEY, user_id BIGINT NOT NULL, kind TEXT NOT NULL, day DATE NOT NULL,
                                          by_id BIGINT, ts TIMESTAMPTZ DEFAULT now());
 CREATE INDEX IF NOT EXISTS manual_grants_u ON manual_grants(user_id, kind);
+CREATE TABLE IF NOT EXISTS norm_msgs(ref TEXT NOT NULL, chat_id BIGINT NOT NULL, message_id BIGINT NOT NULL, PRIMARY KEY(ref, chat_id));
 """
 
 
@@ -223,8 +224,9 @@ async def add_warn(uid, d, kind, note, by=None):
     return n
 
 
-async def _dm_main_admins(text, kb=None):
-    """Дублирует важное сообщение в личку владельцу и всем главным админам."""
+async def _dm_main_admins(text, kb=None, ref=None):
+    """Дублирует важное сообщение в личку владельцу и всем главным админам.
+    ref — ключ заявки: id копий сохраняются, чтобы решение обновило их у всех."""
     ids = set()
     try:
         owner = int(os.getenv("ADMIN_ID", "0"))
@@ -239,7 +241,9 @@ async def _dm_main_admins(text, kb=None):
         log.warning("main_admins: %s", e)
     for i in ids:
         try:
-            await _bot.send_message(i, text, parse_mode="HTML", reply_markup=kb)
+            m = await _bot.send_message(i, text, parse_mode="HTML", reply_markup=kb)
+            if ref:
+                await q("INSERT INTO norm_msgs(ref, chat_id, message_id) VALUES(%s,%s,%s) ON CONFLICT DO NOTHING", (ref, i, m.message_id))
         except Exception as e:
             log.info("лс главному админу %s не доставлено: %s", i, e)
 
@@ -822,7 +826,7 @@ async def _submit_excuse(target, uid, reason, d1: date, d2: date, vip: bool):
     await _excuse_reply(target, f"🕓 Заявка на отгул ({span}, {n} дн.) отправлена главным админам.")
     kb = _kb([[InlineKeyboardButton(text="✅ Одобрить", callback_data=f"nrm:ok:{rid}"), InlineKeyboardButton(text="❌ Отклонить", callback_data=f"nrm:no:{rid}")]])
     await _dm_main_admins(f"🏖 <b>Заявка на отгул от норматива</b>\n{await _mention(uid)}: {html.escape(reason)}\n"
-                          f"Нормативные дни {span} ({n} дн.): с {fmt_dt(t0)} по {fmt_dt(t1)} МСК", kb)
+                          f"Нормативные дни {span} ({n} дн.): с {fmt_dt(t0)} по {fmt_dt(t1)} МСК", kb, ref=f"excuse:{rid}")
 
 
 @router.callback_query(F.data.regexp(r"^nrm:r:\w+:\d+$"))
@@ -936,13 +940,32 @@ async def cb_decide(cb: CallbackQuery):
     r = await q("UPDATE norm_excuse SET status=%s, decided_by=%s WHERE id=%s AND status='pending' RETURNING user_id, from_ts, to_ts",
                 ("ok" if ok else "no", cb.from_user.id, int(rid)), one=True)
     if not r:
+        row = await q("SELECT status, decided_by FROM norm_excuse WHERE id=%s", (int(rid),), one=True)
+        if row and row[1]:
+            who = html.unescape(await _nm(row[1]))
+            verdict = "одобрена" if row[0] == "ok" else "отклонена"
+            return await cb.answer(f"Заявка уже {verdict}: {who}", show_alert=True)
         return await cb.answer("Уже решено")
-    await cb.message.edit_text(cb.message.html_text + f"\n\n{'✅ Одобрено' if ok else '❌ Отклонено'}: {html.escape(cb.from_user.full_name)}", parse_mode="HTML")
+    line = f"\n\n{'✅ Одобрено' if ok else '❌ Отклонено'}: {html.escape(cb.from_user.full_name)}"
+    base = cb.message.html_text
+    copies = await q("SELECT chat_id, message_id FROM norm_msgs WHERE ref=%s", (f"excuse:{rid}",), many=True) or []
+    done_here = False
+    for chat_id, mid in copies:
+        try:
+            await _bot.edit_message_text(base + line, chat_id=chat_id, message_id=mid, parse_mode="HTML", reply_markup=None)
+            done_here = done_here or (chat_id == cb.message.chat.id and mid == cb.message.message_id)
+        except Exception as e:
+            log.info("отгул %s: копия %s не обновлена: %s", rid, chat_id, e)
+    if not done_here:
+        try:
+            await cb.message.edit_text(base + line, parse_mode="HTML", reply_markup=None)
+        except Exception:
+            pass
     try:
         await _bot.send_message(r[0], f"{'✅ Отгул одобрен' if ok else '❌ Отгул отклонён'} ({fmt_dt(r[1])} — {fmt_dt(r[2])} МСК).")
     except Exception:
         pass
-    await cb.answer()
+    await cb.answer("Решение сохранено" if ok else "Отклонено")
 
 
 # ---------------------------------------------------------------- вылет / прощение

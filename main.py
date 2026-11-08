@@ -12241,7 +12241,19 @@ async def process_a_nickname(message: Message, state: FSMContext):
 
     await state.update_data(a_nickname=official_name, a_profile=formatted_profile)
     await state.set_state(Form.appeal_place)
-    
+
+    # игрок в чёрном списке — предупреждаем и говорим причину; обжалование всё равно принимаем
+    try:
+        import blacklist_mod
+        hit = await blacklist_mod.find_entry(rbx_info["id"] if rbx_info else None, official_name)
+    except Exception as e:
+        logging.warning(f"Обжалование: проверка чёрного списка не сработала: {e}")
+        hit = None
+    if hit:
+        confirm_text += (f"\n\n⛔ <b>Этот игрок внесён в чёрный список</b> ({hit['added']}).\n"
+                         f"<b>Причина:</b> {html.escape(hit['reason'] or '—')}\n"
+                         "<i>Обжалование всё равно принято, но учитывайте это.</i>")
+
     await message.answer(
         f"{ICON_CHECK} Ник зафиксирован: {confirm_text}\n\n"
         f"{NUM_2} <b>На каком сервере произошла блокировка?</b>\n"

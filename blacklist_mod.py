@@ -218,6 +218,19 @@ async def _allowed(uid) -> bool:
     return bool(await _is_publisher(uid) or await _is_main_admin(uid))
 
 
+# ---------------------------------------------------------------- проверка ника (для обжалований)
+async def find_entry(rid, nick):
+    """Активная запись ЧС по ID Roblox, а если ID нет — по нику. None, если игрока нет в списке."""
+    row = None
+    if rid:
+        row = await q("SELECT nick, reason, added_at FROM bl_entries WHERE active AND roblox_id=%s ORDER BY id DESC LIMIT 1", (int(rid),), one=True)
+    if not row and nick:
+        row = await q("SELECT nick, reason, added_at FROM bl_entries WHERE active AND lower(nick)=lower(%s) ORDER BY id DESC LIMIT 1", (nick,), one=True)
+    if not row:
+        return None
+    return {"nick": row[0], "reason": row[1], "added": row[2].astimezone(MSK).strftime("%d.%m.%Y")}
+
+
 # ---------------------------------------------------------------- внесение
 @router.callback_query(F.data == "bl_add")
 async def bl_add(cb: CallbackQuery, state: FSMContext):
