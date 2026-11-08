@@ -2287,8 +2287,7 @@ async def setup_bot_commands(bot: Bot):
 
         admin_commands = [
             BotCommand(command="topic_id", description="🔍 Узнать реальный ID текущей темы"),
-            BotCommand(command="mystats", description="📊 Моя статистика агента"),
-            BotCommand(command="secstats", description="🔮 Моя статистика публикатора"),
+            BotCommand(command="mystats", description="📊 Моя статистика"),
             BotCommand(command="norm", description="📋 Мой норматив по секреткам"),
             BotCommand(command="normtop", description="📊 Норматив: таблица стаффа"),
             BotCommand(command="normrec", description="🏆 Норматив: топ и рекорды"),
@@ -13117,125 +13116,187 @@ async def cmd_work_tickets(message: Message):
 
 @router.message(Command("mystats"), F.chat.id == ADMIN_CHAT_ID)
 async def cmd_my_stats(message: Message):
-    if not await is_support_member(message.from_user.id) and not await is_main_admin(message.from_user.id):
+    sup, pub = await _ms_roles(message.from_user.id)
+    if not sup and not pub:
+        await message.answer("❌ Статистика доступна агентам поддержки и публикаторам секреток.", parse_mode="HTML")
         return
+    text, kb = await _ms_render(message.from_user, "sum", sup, pub)
+    await message.answer(text, parse_mode="HTML", reply_markup=kb)
 
-    admin_id = message.from_user.id
-    agent_no = await get_or_create_agent_number(admin_id)
 
-    def _query_mystats():
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*) FROM tickets WHERE admin_id = %s AND status = 'closed'", (admin_id,))
-                closed_count = cur.fetchone()[0]
+@router.callback_query(F.data.startswith("mystat:"))
+async def cb_my_stats(cb: CallbackQuery):
+    screen = cb.data.split(":", 1)[1]
+    sup, pub = await _ms_roles(cb.from_user.id)
+    if not sup and not pub:
+        await cb.answer("Статистика недоступна для вашей роли", show_alert=True)
+        return
+    allowed = {"sum": True, "menu": True, "sup": sup, "sec": pub, "typ": pub}
+    if not allowed.get(screen):
+        await cb.answer("Этот раздел вам недоступен", show_alert=True)
+        return
+    await cb.answer()
+    text, kb = await _ms_render(cb.from_user, screen, sup, pub)
+    try:
+        await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    except TelegramBadRequest:
+        pass  # текст не изменился или сообщение нельзя править
 
+
+_MS_CAT = {"complaint": "Жалоба", "appeal": "Обжалование", "question": "Вопрос",
+           "friends": "Друзья", "general": "Общее"}
+
+
+async def _ms_roles(uid: int) -> tuple:
+    sup = bool(await is_support_member(uid) or await is_main_admin(uid))
+    pub = bool(await is_secret_publisher(uid) or await is_main_admin(uid))
+    return sup, pub
+
+
+def _ms_sync(uid: int, sup: bool, pub: bool) -> dict:
+    out = {}
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            if sup:
+                cur.execute("SELECT COUNT(*) FROM tickets WHERE admin_id = %s AND status = 'closed'", (uid,))
+                out["closed_all"] = cur.fetchone()[0]
+                cur.execute("""SELECT COUNT(*) FROM tickets WHERE admin_id = %s AND status = 'closed'
+                               AND updated_at >= CURRENT_TIMESTAMP - INTERVAL '24 hours'""", (uid,))
+                out["closed_24h"] = cur.fetchone()[0]
+                cur.execute("""SELECT COUNT(*) FROM tickets WHERE admin_id = %s AND status = 'closed'
+                               AND updated_at >= CURRENT_TIMESTAMP - INTERVAL '7 days'""", (uid,))
+                out["closed_7d"] = cur.fetchone()[0]
+                cur.execute("SELECT COUNT(*) FROM tickets WHERE admin_id = %s AND status = 'rejected'", (uid,))
+                out["rejected"] = cur.fetchone()[0]
+                cur.execute("""SELECT COALESCE(category, 'general'), COUNT(*) FROM tickets
+                               WHERE admin_id = %s AND status = 'closed'
+                               GROUP BY 1 ORDER BY 2 DESC""", (uid,))
+                out["cats"] = cur.fetchall()
                 cur.execute("""
-                    SELECT COALESCE(AVG(score), 0) 
-                    FROM ratings 
-                    WHERE admin_id = %s 
-                      AND user_id != %s 
-                      AND user_id NOT IN (SELECT admin_id FROM main_admins) 
+                    SELECT COALESCE(AVG(score), 0), COUNT(*) FROM ratings
+                    WHERE admin_id = %s AND user_id != %s
+                      AND user_id NOT IN (SELECT admin_id FROM main_admins)
                       AND user_id NOT IN (SELECT admin_id FROM admin_agents)
-                """, (admin_id, OWNER_ID))
-                avg_score = cur.fetchone()[0]
-
+                """, (uid, OWNER_ID))
+                avg, n = cur.fetchone()
+                out["avg"], out["rated"] = round(float(avg), 2), n
                 cur.execute("""
-                    SELECT 
-                        t.admin_id,
-                        COUNT(t.ticket_id) AS cnt,
-                        COALESCE(AVG(CASE 
-                            WHEN r.user_id != %s 
-                             AND r.user_id NOT IN (SELECT admin_id FROM main_admins) 
-                             AND r.user_id NOT IN (SELECT admin_id FROM admin_agents) 
-                            THEN r.score 
-                            ELSE NULL 
-                        END), 0) AS avg_sc
+                    SELECT t.admin_id, COUNT(t.ticket_id) AS cnt,
+                        COALESCE(AVG(CASE WHEN r.user_id != %s
+                                           AND r.user_id NOT IN (SELECT admin_id FROM main_admins)
+                                           AND r.user_id NOT IN (SELECT admin_id FROM admin_agents)
+                                          THEN r.score ELSE NULL END), 0) AS avg_sc
                     FROM tickets t
                     LEFT JOIN ratings r ON t.ticket_id = r.ticket_id
                     WHERE t.admin_id IS NOT NULL AND t.status = 'closed'
                     GROUP BY t.admin_id
                     ORDER BY avg_sc DESC, cnt DESC
                 """, (OWNER_ID,))
-                
-                ranking = cur.fetchall()
-                return closed_count, round(float(avg_score), 2), ranking
+                out["ranking_sup"] = cur.fetchall()
+            if pub:
+                cur.execute("SELECT COUNT(*) FROM secret_posts WHERE user_id = %s", (uid,))
+                out["sec_all"] = cur.fetchone()[0]
+                cur.execute("""SELECT COUNT(*) FROM secret_posts WHERE user_id = %s
+                               AND created_at >= CURRENT_TIMESTAMP - INTERVAL '24 hours'""", (uid,))
+                out["sec_24h"] = cur.fetchone()[0]
+                cur.execute("""SELECT COUNT(*) FROM secret_posts WHERE user_id = %s
+                               AND created_at >= CURRENT_TIMESTAMP - INTERVAL '7 days'""", (uid,))
+                out["sec_7d"] = cur.fetchone()[0]
+                cur.execute("""SELECT secret_type, COUNT(*) AS cnt FROM secret_posts
+                               WHERE user_id = %s AND secret_type IS NOT NULL
+                               GROUP BY secret_type ORDER BY cnt DESC""", (uid,))
+                out["types"] = cur.fetchall()
+                cur.execute("SELECT user_id, COUNT(*) AS cnt FROM secret_posts GROUP BY user_id ORDER BY cnt DESC")
+                out["ranking_sec"] = cur.fetchall()
+    return out
 
-    closed_cnt, avg_sc, ranking = await asyncio.to_thread(_query_mystats)
-    ranking = await filter_in_admin_chat(ranking)
-    user_rank = "Без места"
-    for idx, (a_id, _, _) in enumerate(ranking, 1):
-        if a_id == admin_id:
-            user_rank = f"#{idx} из {len(ranking)}"
-            break
 
-    stats_text = (
-        f"📊 <b>Ваша личная статистика агента:</b>\n\n"
-        f"👤 <b>Агент:</b> {message.from_user.mention_html()} (Агент #{agent_no})\n"
-        f"🔒 Закрыто тикетов: <code>{closed_cnt}</code>\n"
-        f"⭐ Средняя оценка: <code>{avg_sc} / 5.0</code>\n"
-        f"🏆 Место в рейтинге: <b>{user_rank}</b>"
-    )
-    await message.answer(stats_text, parse_mode="HTML")
+def _ms_place(ranking: list, uid: int) -> str:
+    for idx, row in enumerate(ranking, 1):
+        if row[0] == uid:
+            return f"#{idx} из {len(ranking)}"
+    return "без места"
 
-@router.message(Command("secstats"), F.chat.id == ADMIN_CHAT_ID)
-async def cmd_sec_stats(message: Message):
-    user_id = message.from_user.id
-    if not await is_secret_publisher(user_id) and not await is_main_admin(user_id):
-        await message.answer("❌ У вас нет прав публикатора секреток!", parse_mode="HTML")
-        return
 
-    def _query_secstats():
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*) FROM secret_posts WHERE user_id = %s", (user_id,))
-                total_posts = cur.fetchone()[0]
+async def _ms_render(user, screen: str, sup: bool, pub: bool) -> tuple:
+    uid = user.id
+    mention = user.mention_html()
+    d = await asyncio.to_thread(_ms_sync, uid, sup, pub)
+    if sup:
+        d["ranking_sup"] = await filter_in_admin_chat(d.get("ranking_sup", []))
+    if pub:
+        d["ranking_sec"] = await filter_in_admin_chat(d.get("ranking_sec", []))
 
-                cur.execute("""
-                    SELECT COUNT(*) FROM secret_posts 
-                    WHERE user_id = %s AND created_at >= CURRENT_TIMESTAMP - INTERVAL '24 hours'
-                """, (user_id,))
-                posts_24h = cur.fetchone()[0]
+    def btn(text, data):
+        return IB(text, callback_data=data)
 
-                cur.execute("""
-                    SELECT secret_type, COUNT(*) as cnt 
-                    FROM secret_posts 
-                    WHERE user_id = %s AND secret_type IS NOT NULL
-                    GROUP BY secret_type 
-                    ORDER BY cnt DESC LIMIT 1
-                """, (user_id,))
-                fav_row = cur.fetchone()
-                fav_type = f"{fav_row[0]} ({fav_row[1]} шт.)" if fav_row else "Нет данных"
+    def kb(*rows):
+        return InlineKeyboardMarkup(inline_keyboard=[list(r) for r in rows])
 
-                cur.execute("""
-                    SELECT user_id, COUNT(*) as cnt 
-                    FROM secret_posts 
-                    GROUP BY user_id 
-                    ORDER BY cnt DESC
-                """)
-                ranks = cur.fetchall()
-                user_rank = "Без места"
-                for idx, (p_id, _) in enumerate(ranks, 1):
-                    if p_id == user_id:
-                        user_rank = f"#{idx} из {len(ranks)}"
-                        break
+    if screen == "sum":
+        parts = [f"📊 <b>Ваша статистика</b>\n👤 {mention}"]
+        if sup:
+            agent_no = await get_or_create_agent_number(uid)
+            parts.append(
+                f"\n🛠 <b>Поддержка</b> (Агент #{agent_no})\n"
+                f"🔒 Закрыто: <code>{d['closed_all']}</code> · за неделю <code>{d['closed_7d']}</code>\n"
+                f"⭐ Оценка: <code>{d['avg']} / 5</code> ({d['rated']} оц.)\n"
+                f"🏆 Место: <b>{_ms_place(d['ranking_sup'], uid)}</b>"
+            )
+        if pub:
+            fav = f"{html.escape(d['types'][0][0])}" if d["types"] else "нет данных"
+            parts.append(
+                f"\n🔮 <b>Секретки</b>\n"
+                f"📝 Опубликовано: <code>{d['sec_all']}</code> · за сутки <code>{d['sec_24h']}</code>\n"
+                f"🌟 Любимый тип: <b>{fav}</b>\n"
+                f"🏆 Место в топе: <b>{_ms_place(d['ranking_sec'], uid)}</b>"
+            )
+        parts.append("\n<i>Подробности — кнопка ниже.</i>")
+        return "\n".join(parts), kb([btn("🔍 Подробная статистика", "mystat:menu")])
 
-                return total_posts, posts_24h, fav_type, user_rank
+    if screen == "menu":
+        rows = []
+        if sup:
+            rows.append([btn("🛠 Поддержка", "mystat:sup")])
+        if pub:
+            rows.append([btn("🔮 Секретки", "mystat:sec")])
+            rows.append([btn("🧩 Типы секреток", "mystat:typ")])
+        rows.append([btn("⬅️ К сводке", "mystat:sum")])
+        return "🔍 <b>Подробная статистика</b>\n\nВыберите раздел:", kb(*rows)
 
-    try:
-        total_p, p_24, fav_t, rank_str = await asyncio.to_thread(_query_secstats)
-    except Exception as e:
-        await message.answer(f"❌ Ошибка получения статистики: {e}")
-        return
+    back = [btn("⬅️ К разделам", "mystat:menu")]
 
-    text = (
-        f"🔮 <b>Ваша статистика публикатора секреток:</b>\n\n"
-        f"👤 <b>Искатель:</b> {message.from_user.mention_html()}\n"
-        f"📝 Всего опубликовано секреток: <code>{total_p}</code>\n"
-        f"⏱ Публикаций за последние 24ч: <code>{p_24}</code>\n"
-        f"🌟 Любимый тип секретки: <b>{fav_t}</b>\n"
-        f"🏆 Место в топе искателей: <b>{rank_str}</b>"
-    )
-    await message.answer(text, parse_mode="HTML")
+    if screen == "sup":
+        cats = "\n".join(f"   • {_MS_CAT.get(c, html.escape(str(c)))}: <code>{n}</code>" for c, n in d["cats"]) or "   нет закрытых"
+        text = (
+            f"🛠 <b>Поддержка: подробно</b>\n\n"
+            f"🔒 Закрыто тикетов:\n"
+            f"   всего <code>{d['closed_all']}</code> · за сутки <code>{d['closed_24h']}</code> · за неделю <code>{d['closed_7d']}</code>\n"
+            f"❌ Отклонено: <code>{d['rejected']}</code>\n"
+            f"⭐ Средняя оценка: <code>{d['avg']} / 5</code> (оценок: {d['rated']})\n"
+            f"🏆 Место в рейтинге: <b>{_ms_place(d['ranking_sup'], uid)}</b>\n\n"
+            f"📂 Закрытые по категориям:\n{cats}"
+        )
+        return text, kb(back)
+
+    if screen == "sec":
+        text = (
+            f"🔮 <b>Секретки: подробно</b>\n\n"
+            f"📝 Опубликовано:\n"
+            f"   всего <code>{d['sec_all']}</code> · за сутки <code>{d['sec_24h']}</code> · за неделю <code>{d['sec_7d']}</code>\n"
+            f"🏆 Место в топе искателей: <b>{_ms_place(d['ranking_sec'], uid)}</b>"
+        )
+        return text, kb(back)
+
+    if screen == "typ":
+        total = sum(n for _, n in d["types"]) or 1
+        lines = "\n".join(
+            f"• {html.escape(t)} — <code>{n}</code> ({round(n * 100 / total)}%)" for t, n in d["types"]
+        ) or "Пока нет опубликованных секреток."
+        return f"🧩 <b>Типы секреток</b> (за всё время)\n\n{lines}", kb(back)
+
+    return "Раздел не найден.", kb(back)
+
 
 @router.message(Command("supptop"), F.chat.id == ADMIN_CHAT_ID)
 async def cmd_supp_top(message: Message):
@@ -15235,8 +15296,7 @@ _CMD_REGISTRY = [
     ]),
     ("🛠 Чат админов/поддержки (только в рабочей группе)", False, [
         ("/topic_id", "узнать ID текущей темы (любой участник)"),
-        ("/mystats", "моя статистика агента (хелпер/гл. админ)"),
-        ("/secstats", "моя статистика публикатора (публикатор/гл. админ)"),
+        ("/mystats", "моя статистика: поддержка и секретки (агент/публикатор/гл. админ)"),
         ("/norm", "мой норматив по секреткам: норма дня, предупреждения"),
         ("/normtop", "таблица норматива всего стаффа"),
         ("/normrec", "топ искателей и рекорды (день, неделя, месяц)"),
@@ -16446,7 +16506,7 @@ async def _cabinet_data(uid: int) -> dict:
     return data
 
 # ---------- статистика команды для личного кабинета ----------
-# Роли определяются на сервере по тем же правилам, что и в боте (/mystats, /secstats, /supptop):
+# Роли определяются на сервере по тем же правилам, что и в боте (/mystats, /supptop):
 #   хелпер (участник админ-чата) видит свою статистику; публикатор секреток или главный админ видит статистику публикаций;
 #   главный админ видит ещё полную статистику проекта и общий рейтинг команды.
 _NAME_CACHE: Dict[int, tuple] = {}
