@@ -4182,17 +4182,17 @@ def publisher_menu_kb():
 
 def take_ticket_kb(ticket_id: int, nopost: bool = False):
     rows = [[
-        IB(text="🟢 Начать работу", callback_data=f"take_{ticket_id}"),
-        IB(text="🔴 Отклонить тикет", callback_data=f"reject_{ticket_id}")
+        IB(text="🟢 Начать работу", style="success", callback_data=f"take_{ticket_id}"),
+        IB(text="🔴 Отклонить тикет", style="danger", callback_data=f"reject_{ticket_id}")
     ]]
     if nopost:
-        rows.append([IB(text="🚫 Нет такого поста", callback_data=f"nopost_{ticket_id}")])
+        rows.append([IB(text="🟡 Нет такого поста", callback_data=f"nopost_{ticket_id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def close_ticket_kb(ticket_id: int, admin_id: int, nopost: bool = False):
     rows = [[IB(text="🔒 Закрыть тикет", callback_data=f"close_{ticket_id}_{admin_id}")]]
     if nopost:
-        rows.append([IB(text="🚫 Нет такого поста", callback_data=f"nopost_{ticket_id}")])
+        rows.append([IB(text="🟡 Нет такого поста", callback_data=f"nopost_{ticket_id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 async def _ticket_nopost(ticket_id: int) -> bool:
