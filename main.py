@@ -13263,7 +13263,7 @@ async def _ms_render(uid: int, screen: str, sup: bool, pub: bool) -> tuple:
         d["ranking_sec"] = await filter_in_admin_chat(d.get("ranking_sec", []))
 
     if screen == "sum":
-        parts = [f"📊 <b>Ваша статистика</b>\n👤 {mention}"]
+        parts = [f"📊 <b>Статистика</b>\n👤 {mention}"]
         if sup:
             agent_no = await get_or_create_agent_number(uid)
             parts.append(
