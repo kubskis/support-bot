@@ -14210,16 +14210,35 @@ async def _pst_text(p):
              for i, ((u, n), nm) in enumerate(zip(rows, names), 1)]
     return head + f"Всего постов: <b>{total}</b>\n\n" + "\n".join(lines)
 
+_PRS_COLS = ["№", "Человек", "Всего", "Секретки", "Саботёр", "Фарм", "Мутатор", "Исслед."]
+
+def _prs_table_html(rows, p) -> str:
+    """Rich-HTML таблица: кто сколько провёл по типам за период."""
+    head = f"<p><b>Публикаторы по людям · {_ST_LABEL[p]}</b></p>"
+    if not rows:
+        return head + "<p>За этот период никто ничего не провёл.</p>"
+    th = "".join(f"<th>{c}</th>" for c in _PRS_COLS)
+    trs = []
+    for i, r in enumerate(rows, 1):
+        cells = [str(i), f"{html.escape(r['name'])} ({r['id']})", str(r["total"]),
+                 str(r["sec"]), str(r["sab"]), str(r["farm"]), str(r["mut"]), str(r["res"])]
+        trs.append("<tr>" + "".join(f"<td>{c}</td>" for c in cells) + "</tr>")
+    return head + "<table><tr>" + th + "</tr>" + "".join(trs) + "</table>"
+
 async def _prs_text(p):
+    """Запасной вариант, если rich-таблица не ушла: моноширинная таблица в обычном сообщении."""
     rows = await _people_kind_stats(limit=30, since=_since_dt(p))
-    head = (f"👤 <b>Публикаторы по людям · {_ST_LABEL[p]}</b>\n"
-            "Секретки · саботёр · фарм · мутатор · исследователь\n\n")
+    head = f"👤 <b>Публикаторы по людям · {_ST_LABEL[p]}</b>\n\n"
     if not rows:
         return head + "За этот период никто ничего не провёл."
-    lines = [f"{i}. <b>{html.escape(r['name'])}</b> (<code>{r['id']}</code>) — <b>{r['total']}</b>: "
-             f"{r['sec']} · {r['sab']} · {r['farm']} · {r['mut']} · {r['res']}"
-             for i, r in enumerate(rows, 1)]
-    return head + "\n".join(lines)
+    data = [[str(i), (html.escape(r["name"])[:18] + f" ({r['id']})"), str(r["total"]),
+             str(r["sec"]), str(r["sab"]), str(r["farm"]), str(r["mut"]), str(r["res"])]
+            for i, r in enumerate(rows, 1)]
+    widths = [max(len(_PRS_COLS[j]), *(len(line[j]) for line in data)) for j in range(len(_PRS_COLS))]
+    def fmt(line):
+        return "  ".join(str(c).ljust(widths[j]) if j == 1 else str(c).rjust(widths[j]) for j, c in enumerate(line))
+    table = [fmt(_PRS_COLS), "  ".join("-" * w for w in widths)] + [fmt(line) for line in data]
+    return head + "<pre>" + "\n".join(table) + "</pre>"
 
 async def _stat_view(screen, p, force=False):
     if screen == "sup":
@@ -14253,9 +14272,11 @@ async def callback_stats(call: CallbackQuery):
     if not await is_main_admin(call.from_user.id):
         await call.answer("❌ Нет доступа", show_alert=True)
         return
-    await call.message.edit_text(
-        "📊 <b>Статистика</b>\n\nВыберите раздел. В каждом можно переключить период: сутки, неделя или всё время.",
-        reply_markup=stats_root_kb(), parse_mode="HTML")
+    text = "📊 <b>Статистика</b>\n\nВыберите раздел. В каждом можно переключить период: сутки, неделя или всё время."
+    try:
+        await call.message.edit_text(text, reply_markup=stats_root_kb(), parse_mode="HTML")
+    except Exception:
+        await call.message.answer(text, reply_markup=stats_root_kb(), parse_mode="HTML")   # из rich-сообщения редактировать нельзя
     await call.answer()
 
 @router.callback_query(F.data.regexp(r"^stv(_r)?:(sup|hlp|chn|pst|prs):(d|w|a)$"))
@@ -14264,7 +14285,23 @@ async def stv_view(call: CallbackQuery):
         await call.answer("❌ Нет доступа", show_alert=True)
         return
     parts = call.data.split(":")
-    await _stv_show(call, parts[1], parts[2], force=parts[0] == "stv_r")
+    screen, p = parts[1], parts[2]
+    if screen == "prs":
+        rows = await _people_kind_stats(limit=30, since=_since_dt(p))
+        kb = InlineKeyboardMarkup(inline_keyboard=[_period_row("prs", p),
+                                                   [IB(text="🔙 К статистике", callback_data="adm_stats")]])
+        res = await _send_rich_raw(call.message.chat.id, {"html": _prs_table_html(rows, p)},
+                                   reply_markup=kb.model_dump(exclude_none=True))
+        if res.startswith("ok"):
+            await call.answer()
+            try:
+                await call.message.delete()   # старый экран убираем, таблица приходит новым сообщением
+            except Exception:
+                pass
+            return
+        logging.warning(f"Rich-таблица публикаторов не ушла: {res}")
+        # запасной вариант — обычный текст в этом же экране
+    await _stv_show(call, screen, p, force=parts[0] == "stv_r")
 
 # старые кнопки из прошлых сообщений ведут в новые экраны
 @router.callback_query(F.data == "adm_list_stats")
@@ -14360,12 +14397,15 @@ _RICH_TESTS = [
      {"html": "<p>Проверка эмодзи: <tg-emoji emoji-id=\"5346300789558101141\">✅</tg-emoji> и обычный ✅</p>"}),
 ]
 
-async def _send_rich_raw(chat_id, rich_message: dict) -> str:
+async def _send_rich_raw(chat_id, rich_message: dict, reply_markup: dict = None) -> str:
     """Сырой вызов Bot API sendRichMessage (не зависит от версии aiogram). Возвращает 'ok …' или текст ошибки."""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendRichMessage"
+    body = {"chat_id": chat_id, "rich_message": rich_message}
+    if reply_markup:
+        body["reply_markup"] = reply_markup
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as sess:
-            async with sess.post(url, json={"chat_id": chat_id, "rich_message": rich_message}) as r:
+            async with sess.post(url, json=body) as r:
                 data = await r.json(content_type=None)
         if data.get("ok"):
             return f"ok, message_id={data.get('result', {}).get('message_id')}"
