@@ -731,6 +731,24 @@ async def _mention_html(uid: int) -> str:
     _mention_cache[uid] = (m, time.time())
     return m
 
+async def _bl_call_topic(topic_id: int, text_html: str, list_mid=None):
+    """Созыв стаффа в тему чёрного списка (как в предссылках): отметки по 5 в сообщении + ссылка на закреплённый список."""
+    if TEST_MODE_ON:
+        return
+    staff = await get_staff_ids()
+    link = ""
+    if list_mid and str(ADMIN_CHAT_ID).startswith("-100"):
+        link = f'\n\n<a href="https://t.me/c/{str(ADMIN_CHAT_ID)[4:]}/{topic_id}/{list_mid}">📋 Открыть чёрный список</a>'
+    mentions = [await _mention_html(u) for u in staff]
+    chunks = [mentions[i:i + 5] for i in range(0, len(mentions), 5)] or [[]]
+    for idx, chunk in enumerate(chunks):
+        body = (f"🔔 🚫 {text_html}{link}\n\n" if idx == 0 else "") + ("👥 " + " ".join(chunk) if chunk else "")
+        try:
+            await bot.send_message(chat_id=ADMIN_CHAT_ID, text=body.strip(), message_thread_id=topic_id,
+                                   parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
+        except Exception as e:
+            logging.warning(f"Созыв в чёрный список (тема {topic_id}): {e}")
+
 async def call_staff(text_html: str, exclude_ids=None):
     """Созыв стаффа в тему «Секретки»: видимые отметки + личные сообщения + (опц.) команда для бота-зазывалы."""
     if TEST_MODE_ON:
@@ -17272,7 +17290,7 @@ async def main():
         logging.error(f"Антирейд не подключён: {e}")
     try:
         import blacklist_mod
-        blacklist_mod.setup(dp, bot, get_db, is_secret_publisher, is_main_admin, lookup_roblox, ADMIN_CHAT_ID, [TOPIC_SUPPORT_ID, TOPIC_INFO_ID])
+        blacklist_mod.setup(dp, bot, get_db, is_secret_publisher, is_main_admin, lookup_roblox, ADMIN_CHAT_ID, [TOPIC_SUPPORT_ID, TOPIC_INFO_ID], call_fn=_bl_call_topic)
         await blacklist_mod.init_tables()
         asyncio.create_task(blacklist_mod.rebuild())
         asyncio.create_task(blacklist_mod.run_seed(OWNER_ID))

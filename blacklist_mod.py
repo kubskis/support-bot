@@ -28,6 +28,7 @@ router = Router()
 MSK = ZoneInfo("Europe/Moscow")
 
 _bot = _get_db = _is_publisher = _is_main_admin = _lookup = None
+_call = None   # созыв стаффа в тему: async (topic_id, text_html, list_message_id)
 _chat = 0
 _topics = []
 
@@ -301,6 +302,16 @@ async def bl_ok(cb: CallbackQuery, state: FSMContext):
         pass
     await cb.answer()
     await rebuild()
+    if _call:
+        text = (f"В чёрный список внесён игрок <code>{html.escape(d['nick'])}</code>\n"
+                f"Причина: {html.escape(d['reason'] or '—')}\n"
+                f"Внёс: {html.escape(cb.from_user.full_name)}")
+        for topic in _topics:
+            row = await q("SELECT message_id FROM bl_msgs WHERE topic_id=%s AND idx=0", (topic,), one=True)
+            try:
+                await _call(topic, text, row[0] if row else None)
+            except Exception as e:
+                log.warning("bl созыв %s: %s", topic, e)
 
 
 # ---------------------------------------------------------------- удаление
@@ -395,8 +406,9 @@ async def bl_seed_cmd(message: Message):
 
 
 # ---------------------------------------------------------------- подключение
-def setup(dp, bot, get_db, is_publisher, is_main_admin, lookup_roblox, chat_id, topics):
-    global _bot, _get_db, _is_publisher, _is_main_admin, _lookup, _chat, _topics
+def setup(dp, bot, get_db, is_publisher, is_main_admin, lookup_roblox, chat_id, topics, call_fn=None):
+    global _bot, _get_db, _is_publisher, _is_main_admin, _lookup, _chat, _topics, _call
+    _call = call_fn
     _bot, _get_db, _is_publisher, _is_main_admin, _lookup, _chat, _topics = bot, get_db, is_publisher, is_main_admin, lookup_roblox, chat_id, list(topics)
     dp.include_router(router)
     try:
