@@ -17347,24 +17347,11 @@ async def main():
         logging.warning("Бот запущен в режиме ТЕХНИЧЕСКОГО ПЕРЕРЫВА (включён ранее).")
     await _ref_cfg_load()
     try:
-        import iris_mod
-        iris_mod.setup(dp, bot, get_db, is_main_admin, skip_chat_ids=[ADMIN_CHAT_ID])
-        await iris_mod.init_tables()
-        logging.info("Модуль «Надзор» подключён.")
-        try:
-            _st = iris_mod.STATUS
-            _txt = (f"🛡 <b>Надзор запущен</b>, версия <code>{iris_mod.VERSION}</code>\nМодулей: {len(_st['ok'])}, БД: {html.escape(str(_st['db']))}")
-            if _st["fail"]:
-                _txt += "\n❌ Ошибки: " + "; ".join(f"{k}: {html.escape(str(v))[:100]}" for k, v in _st["fail"].items())
-            await bot.send_message(ADMIN_CHAT_ID, _txt, parse_mode="HTML")
-        except Exception as _e:
-            logging.warning(f"Не удалось отправить статус Надзора: {_e}")
+        import punish
+        punish.setup(dp, bot, is_main_admin, resolve_username)
+        logging.info("Ручные наказания (бан/мут) подключены.")
     except Exception as e:
-        logging.error(f"Модуль «Надзор» не подключён: {e}")
-        try:
-            await bot.send_message(ADMIN_CHAT_ID, f"❌ <b>Надзор не подключён:</b> {html.escape(str(e))[:300]}", parse_mode="HTML")
-        except Exception:
-            pass
+        logging.error(f"Ручные наказания не подключены: {e}")
     try:
         import norm_mod
         norm_mod.setup(dp, bot, get_db, is_main_admin, is_secret_publisher, _mention_html, ADMIN_CHAT_ID, TOPIC_SECRETS_ID)

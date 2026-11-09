@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Антирейд: следит за входами и поведением новичков во ВСЕХ чатах, где есть бот (не зависит от +надзор).
+"""Антирейд: следит за входами и поведением новичков во ВСЕХ чатах, где есть бот (работает без всяких настроек по чатам).
 
 Что умеет:
   • считает входы и ловит рейд по порогу; порог сам подстраивается под размер чата и время суток (по истории входов);
@@ -831,7 +831,7 @@ async def _panel():
     en, joins, mins, scale, shield, smin, cap, adapt = [await cfg(k) for k in ("enabled", "joins", "minutes", "scale", "shield", "shield_min", "captcha", "adaptive")]
     chats = await q("SELECT title, last_join, joins_total, alerts FROM ar_chats ORDER BY last_join DESC NULLS LAST LIMIT 8", many=True) or []
     alerts = await q("SELECT title, ts, joins, closed, kind FROM ar_alerts ORDER BY id DESC LIMIT 5", many=True) or []
-    lines = ["🛡 <b>Антирейд</b>", f"Состояние: {'🟢 включён' if en == '1' else '🔴 выключен'} (работает во всех чатах бота, +надзор не нужен)",
+    lines = ["🛡 <b>Антирейд</b>", f"Состояние: {'🟢 включён' if en == '1' else '🔴 выключен'} (работает во всех чатах бота)",
              f"Базовый порог: <b>{joins}</b> входов за <b>{mins}</b> мин." + (f", в больших чатах не меньше {scale}% участников" if int(scale) else ""),
              f"Подстройка под время суток: {_on(adapt)} · Щит ({smin} мин, только текст): {_on(shield)} · Проверка новичков кнопкой: {_on(cap)}",
              "Ловит и спам-атаки новичков (одинаковые сообщения). Оповещения: ЛС главным админам + чат стаффа со скрытым созывом."]
