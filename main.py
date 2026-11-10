@@ -14114,9 +14114,41 @@ _LOG_PRUNE = {"t": 0.0}
 _ERR_TIMES: list = []          # моменты необработанных ошибок в обработчиках (для всплесков)
 _ERR_SPIKE = {"last": 0.0}
 
+_STARTUP = {}   # итоги запуска модулей: имя -> (ок, пояснение)
+
+def _su(name: str, ok: bool, note: str = ""):
+    _STARTUP[name] = (ok, str(note)[:150])
+
+async def _staff_general(text: str, silent: bool = False) -> bool:
+    """Пишет в чат стаффа, в основную тему (General): без message_thread_id."""
+    try:
+        await bot.send_message(ADMIN_CHAT_ID, text, parse_mode="HTML", disable_notification=silent,
+                               link_preview_options=LinkPreviewOptions(is_disabled=True))
+        return True
+    except Exception as e:
+        logging.warning(f"Не удалось написать в основную тему чата стаффа: {e}")
+        return False
+
+async def _startup_report():
+    """Один раз при запуске: что работает, а что нет, в основную тему чата стаффа."""
+    lines = []
+    try:
+        await asyncio.wait_for(_db_one("SELECT 1"), timeout=15)
+        lines.append("✅ База данных")
+    except Exception as e:
+        lines.append(f"❌ База данных: {html.escape(type(e).__name__)}")
+    if userbot is None:
+        lines.append("➖ Юзербот: не настроен")
+    for name, (ok, note) in _STARTUP.items():
+        lines.append(f"{'✅' if ok else '❌'} {html.escape(name)}" + (f": {html.escape(note)}" if note else ""))
+    bad = sum(1 for l in lines if l.startswith("❌"))
+    head = "🟢 <b>Бот запущен</b>" if not bad else f"🟠 <b>Бот запущен, есть проблемы ({bad})</b>"
+    when = datetime.now(MSK_TZ).strftime("%d.%m %H:%M")
+    await _staff_general(f"{head} · {when} МСК\n\n" + "\n".join(lines), silent=not bad)
+
 async def _notify_ops(text: str) -> bool:
-    """Служебное сообщение о сбое: владельцу и всем главным админам. True, если дошло хотя бы до одного."""
-    ok = False
+    """Служебное сообщение о сбое: владельцу и всем главным админам, а также в основную тему чата стаффа. True, если дошло хотя бы до одного."""
+    ok = await _staff_general(text)
     for aid in await get_main_admin_ids():
         try:
             await bot.send_message(aid, text, parse_mode="HTML")
@@ -15765,15 +15797,30 @@ async def emoji_pack_autosync():
     _pack_busy = True
     try:
         rep = await sync_emoji_pack()
-        if _pack_last[0] or _pack_last[1]:
-            await bot.send_message(OWNER_ID, "🔄 Автообновление пака при запуске.\n" + rep, parse_mode="HTML",
+        if await get_setting("emoji_pack_fail_sig", ""):
+            await set_setting("emoji_pack_fail_sig", "")
+        paras = rep.split("\n\n")
+        # подпись ошибок: те же ошибки, что уже присылали, повторно не пишем
+        err_lines = sorted(l for p in paras for l in p.split("\n") if l.startswith("•") or l.startswith(ICON_CROSS))
+        sig = hashlib.sha1("\n".join(err_lines).encode()).hexdigest() if err_lines else ""
+        old_sig = await get_setting("emoji_pack_err_sig", "")
+        new_errors = bool(sig) and sig != old_sig
+        if sig != old_sig:
+            await set_setting("emoji_pack_err_sig", sig)
+        if _pack_last[0] or new_errors:
+            keep = [p for p in paras if "добавлено 0, обновлено 0, удалено 0" not in p or any(l.startswith("•") or l.startswith(ICON_CROSS) for l in p.split("\n"))]
+            await bot.send_message(OWNER_ID, "🔄 Автообновление пака при запуске.\n" + "\n\n".join(keep or paras), parse_mode="HTML",
                                    link_preview_options=LinkPreviewOptions(is_disabled=True))
         else:
-            logging.info("Пак тгп-эмодзи актуален.")
+            logging.info("Пак тгп-эмодзи актуален (изменений и новых ошибок нет).")
     except Exception as e:
         logging.warning(f"Автообновление пака не удалось: {e}")
+        text = f"{ICON_WARN} Автообновление пака эмодзи не удалось: {html.escape(str(e))[:500]}"
         try:
-            await bot.send_message(OWNER_ID, f"{ICON_WARN} Автообновление пака эмодзи не удалось: {html.escape(str(e))[:500]}", parse_mode="HTML")
+            sig = hashlib.sha1(text.encode()).hexdigest()
+            if sig != await get_setting("emoji_pack_fail_sig", ""):
+                await set_setting("emoji_pack_fail_sig", sig)
+                await bot.send_message(OWNER_ID, text, parse_mode="HTML")
         except Exception:
             pass
     finally:
@@ -16340,6 +16387,7 @@ async def global_error_handler(event):
             await bot.send_message(OWNER_ID, f"⚠️ Ошибка в боте:\n<code>{html.escape(repr(exc)[:600])}</code>", parse_mode="HTML")
         except Exception:
             pass
+        await _staff_general(f"⚠️ <b>Ошибка в боте:</b>\n<code>{html.escape(repr(exc)[:600])}</code>")
     return True
 
 _LAST_ERR_ALERT = 0.0
@@ -17452,22 +17500,28 @@ async def main():
         import punish
         punish.setup(dp, bot, is_main_admin, resolve_username)
         logging.info("Ручные наказания (бан/мут) подключены.")
+        _su("Бан и мут командами", True)
     except Exception as e:
         logging.error(f"Ручные наказания не подключены: {e}")
+        _su("Бан и мут командами", False, e)
     try:
         import norm_mod
         norm_mod.setup(dp, bot, get_db, is_main_admin, is_secret_publisher, _mention_html, ADMIN_CHAT_ID, TOPIC_SECRETS_ID)
         await norm_mod.init_tables()
         logging.info("Модуль норматива секреток подключён.")
+        _su("Норматив", True)
     except Exception as e:
         logging.error(f"Модуль норматива не подключён: {e}")
+        _su("Норматив", False, e)
     try:
         import antiraid
         antiraid.setup(dp, bot, get_db, is_main_admin, ADMIN_CHAT_ID, OWNER_ID, build_admin_hidden_pings)
         await antiraid.init_tables()
         logging.info("Антирейд подключён.")
+        _su("Антирейд", True)
     except Exception as e:
         logging.error(f"Антирейд не подключён: {e}")
+        _su("Антирейд", False, e)
     try:
         import blacklist_mod
         blacklist_mod.setup(dp, bot, get_db, is_secret_publisher, is_main_admin, lookup_roblox, ADMIN_CHAT_ID, [TOPIC_SUPPORT_ID, TOPIC_INFO_ID], call_fn=_bl_call_topic)
@@ -17475,8 +17529,10 @@ async def main():
         asyncio.create_task(blacklist_mod.rebuild())
         asyncio.create_task(blacklist_mod.run_seed(OWNER_ID))
         logging.info("Чёрный список подключён.")
+        _su("Чёрный список", True)
     except Exception as e:
         logging.error(f"Чёрный список не подключён: {e}")
+        _su("Чёрный список", False, e)
     await web_server()
     await setup_bot_commands(bot)
     await load_emoji_pack_setting()
@@ -17487,11 +17543,14 @@ async def main():
             await userbot.connect()
             if not await userbot.is_user_authorized():
                 logging.error("Юзербот не авторизован: сессия недействительна. Создайте новую USER_SESSION_STRING. Публикации через юзербота отключены.")
+                _su("Юзербот", False, "сессия недействительна, нужна новая USER_SESSION_STRING")
             else:
                 me = await userbot.get_me()
                 logging.info(f"Premium-юзербот успешно запущен под аккаунтом: {me.first_name} (@{me.username})")
+                _su("Юзербот", True, f"@{me.username}")
         except Exception as e:
             logging.error(f"Не удалось запустить юзербота: {e}")
+            _su("Юзербот", False, e)
             
     spawn(_supervised(reminder_worker))
     spawn(_supervised(daily_summary_worker))
@@ -17502,12 +17561,15 @@ async def main():
         spawn(_supervised(counters.worker))
     except Exception as e:
         logging.error(f"Воркер норматива не запущен: {e}")
+        _su("Воркер норматива и счётчиков", False, e)
     try:
         import secret_adjust
         secret_adjust.setup(dp, get_db, OWNER_ID, resolve_user_refs, get_user_label)
         await secret_adjust.init()
+        _su("Ручные секретки", True)
     except Exception as e:
         logging.error(f"Ручные секретки не подключены: {e}")
+        _su("Ручные секретки", False, e)
     try:
         import antiraid
         spawn(_supervised(antiraid.worker))
@@ -17537,6 +17599,7 @@ async def main():
             await asyncio.sleep(min(5 * _try, 20))
     spawn(_restore_delayed_publishes())
     logging.info("Бот успешно запущен и готов к работе!")
+    spawn(_startup_report())
     
     try:
         _fails = 0
