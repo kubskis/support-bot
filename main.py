@@ -1905,6 +1905,9 @@ def _init_db_sync():
                 CREATE TABLE IF NOT EXISTS secret_publishers (
                     user_id BIGINT PRIMARY KEY
                 );
+                CREATE TABLE IF NOT EXISTS recruiters (
+                    user_id BIGINT PRIMARY KEY
+                );
                 CREATE TABLE IF NOT EXISTS secret_channels (
                     user_id BIGINT PRIMARY KEY,
                     channel_id TEXT
@@ -2337,6 +2340,22 @@ async def is_secret_publisher(user_id: int) -> bool:
         return await asyncio.to_thread(_query)
     except Exception:
         return False
+
+async def is_recruiter(user_id: int) -> bool:
+    try:
+        return bool(await _db_one("SELECT 1 FROM recruiters WHERE user_id = %s", (user_id,)))
+    except Exception:
+        return False
+
+async def can_decide_application(user_id: int) -> bool:
+    """Кто решает анкеты наборов: ответственные по наборам. Пока список пуст, как раньше: главные админы и стафф."""
+    try:
+        any_rec = await _db_one("SELECT 1 FROM recruiters LIMIT 1")
+    except Exception:
+        any_rec = None
+    if any_rec:
+        return await is_recruiter(user_id)
+    return await is_main_admin(user_id) or await is_support_member(user_id)
 
 async def is_support_member(user_id: int) -> bool:
     if await is_main_admin(user_id):
@@ -4135,6 +4154,10 @@ class ShopUserStates(StatesGroup):
     waiting_promo = State()
     waiting_donate = State()
 
+class RecruiterStates(StatesGroup):
+    add_id = State()
+    del_id = State()
+
 class SecretAdminStates(StatesGroup):
     add_publisher_id = State()
     del_publisher_id = State()
@@ -4218,6 +4241,7 @@ def access_kb():
         [IB(text="👥 Публикаторы секреток", callback_data="sec_manage_pubs")],
         [IB(text="🔔 Предссылки и личные пинги", callback_data="adm_sec_people")],
         [IB(text="📝 Наборы и друзья", callback_data="adm_recruit")],
+        [IB(text="🎯 Ответственные по наборам", callback_data="rec_manage")],
         [IB(text="👑 Главные админы", callback_data="manage_main_admins")],
         [IB(text="🚫 Внести игрока в ЧС", callback_data="bl_add")],
         [IB(text="🔙 Назад", callback_data="back_to_adm")],
@@ -5631,6 +5655,78 @@ async def sec_del_pub_proc(message: Message, state: FSMContext):
         await message.answer(f"{ICON_CHECK} Пользователь <code>{t_id}</code> удален из публикаторов.", reply_markup=kb, parse_mode="HTML")
     except ValueError:
         await message.answer(f"{ICON_CROSS} " + USER_NOT_FOUND_TEXT, parse_mode="HTML")
+
+@router.callback_query(F.data == "rec_manage")
+async def rec_manage(call: CallbackQuery):
+    if not await is_main_admin(call.from_user.id):
+        await call.answer("❌ Только главные админы.", show_alert=True)
+        return
+    rows = await _db_all("SELECT user_id FROM recruiters ORDER BY user_id")
+    ids = [r[0] for r in rows]
+    text = "🎯 <b>Ответственные по наборам</b>\n\nТолько они принимают и отклоняют анкеты в наборах (хелперы и искатели секреток).\n\n"
+    if ids:
+        names = await asyncio.gather(*[_plain_name(int(i)) for i in ids], return_exceptions=True)
+        for idx, (uid, nm) in enumerate(zip(ids, names), 1):
+            name_display = html.escape(nm) if isinstance(nm, str) else "Неизвестно"
+            text += f"{idx}. <a href='tg://openmessage?user_id={uid}'>{uid}</a> - {name_display}\n"
+    else:
+        text += "<i>Список пуст: пока анкеты решают главные админы и стафф, как раньше. Как только добавите первого человека, решать смогут только ответственные.</i>\n"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [IB(text="➕ Добавить ответственного", callback_data="rec_add")],
+        [IB(text="➖ Удалить ответственного", callback_data="rec_del")],
+        [IB(text="🔙 Назад", callback_data="adm_access")],
+    ])
+    await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
+    await call.answer()
+
+@router.callback_query(F.data == "rec_add")
+async def rec_add_prompt(call: CallbackQuery, state: FSMContext):
+    if not await is_main_admin(call.from_user.id): return
+    await state.set_state(RecruiterStates.add_id)
+    await call.message.answer("🎯 Введите <b>ID или @юзернейм</b> человека, который будет отвечать на анкеты в наборах:", parse_mode="HTML")
+    await call.answer()
+
+@router.message(RecruiterStates.add_id, F.text)
+async def rec_add_proc(message: Message, state: FSMContext):
+    if not await is_main_admin(message.from_user.id): return
+    try:
+        t_id = await resolve_user_one(message.text)
+    except ValueError:
+        await message.answer(f"{ICON_CROSS} " + USER_NOT_FOUND_TEXT, parse_mode="HTML")
+        return
+    await _db_exec("INSERT INTO recruiters (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING", (t_id,))
+    await alog(message.from_user.id, "recruiter_add", f"ID {t_id}")
+    await state.clear()
+    await message.answer(
+        f"{ICON_CHECK} Пользователь <code>{t_id}</code> теперь отвечает на анкеты в наборах. Остальные нажимать «Принять» и «Отклонить» больше не смогут.",
+        reply_markup=await main_keyboard(message.from_user.id), parse_mode="HTML")
+    try:
+        await bot.send_message(t_id, "🎯 Вас назначили ответственным по наборам: теперь вы принимаете и отклоняете анкеты в теме заявок.", parse_mode="HTML")
+    except Exception:
+        pass
+
+@router.callback_query(F.data == "rec_del")
+async def rec_del_prompt(call: CallbackQuery, state: FSMContext):
+    if not await is_main_admin(call.from_user.id): return
+    await state.set_state(RecruiterStates.del_id)
+    await call.message.answer("🎯 Введите <b>ID или @юзернейм</b> человека, которого нужно снять с ответственных по наборам:", parse_mode="HTML")
+    await call.answer()
+
+@router.message(RecruiterStates.del_id, F.text)
+async def rec_del_proc(message: Message, state: FSMContext):
+    if not await is_main_admin(message.from_user.id): return
+    try:
+        t_id = await resolve_user_one(message.text)
+    except ValueError:
+        await message.answer(f"{ICON_CROSS} " + USER_NOT_FOUND_TEXT, parse_mode="HTML")
+        return
+    await _db_exec("DELETE FROM recruiters WHERE user_id = %s", (t_id,))
+    await alog(message.from_user.id, "recruiter_del", f"ID {t_id}")
+    await state.clear()
+    left = await _db_one("SELECT 1 FROM recruiters LIMIT 1")
+    tail = "" if left else "\n⚠️ Список пуст: анкеты снова решают главные админы и стафф."
+    await message.answer(f"{ICON_CHECK} Пользователь <code>{t_id}</code> снят с ответственных по наборам.{tail}",
+                         reply_markup=await main_keyboard(message.from_user.id), parse_mode="HTML")
 
 @router.callback_query(F.data == "sec_set_timer")
 async def sec_set_timer(call: CallbackQuery, state: FSMContext):
@@ -11180,6 +11276,9 @@ async def process_helper_name(message: Message, state: FSMContext):
 
 @router.message(Form.helper_age, F.text)
 async def process_helper_age(message: Message, state: FSMContext):
+    if not re.fullmatch(r"\d{1,3}", message.text.strip()):
+        await message.answer(f"{ICON_WARN} Возраст нужно написать только цифрами, например: 16", parse_mode="HTML")
+        return
     await state.update_data(helper_age=message.text.strip())
     await state.set_state(Form.helper_time)
     await message.answer(f"{NUM_3} Сколько времени вы готовы уделять на ответы в поддержке?", parse_mode="HTML")
@@ -11299,8 +11398,8 @@ async def _mark_application_decision(call: CallbackQuery, accepted: bool, kind: 
 
 @router.callback_query(F.data.startswith("helper_accept_"))
 async def helper_accept_callback(call: CallbackQuery):
-    if not await is_main_admin(call.from_user.id) and not await is_support_member(call.from_user.id):
-        await call.answer("❌ У вас нет прав!", show_alert=True)
+    if not await can_decide_application(call.from_user.id):
+        await call.answer("❌ Анкеты в наборах решают только ответственные по наборам.", show_alert=True)
         return
     user_id = int(call.data.split("_")[2])
     if not await _mark_application_decision(call, True, "helper", user_id): return
@@ -11312,8 +11411,8 @@ async def helper_accept_callback(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith("helper_reject_"))
 async def helper_reject_callback(call: CallbackQuery):
-    if not await is_main_admin(call.from_user.id) and not await is_support_member(call.from_user.id):
-        await call.answer("❌ У вас нет прав!", show_alert=True)
+    if not await can_decide_application(call.from_user.id):
+        await call.answer("❌ Анкеты в наборах решают только ответственные по наборам.", show_alert=True)
         return
     user_id = int(call.data.split("_")[2])
     if not await _mark_application_decision(call, False, "helper", user_id): return
@@ -11400,6 +11499,9 @@ async def process_secret_name(message: Message, state: FSMContext):
 
 @router.message(Form.secret_age, F.text)
 async def process_secret_age(message: Message, state: FSMContext):
+    if not re.fullmatch(r"\d{1,3}", message.text.strip()):
+        await message.answer(f"{ICON_WARN} Возраст нужно написать только цифрами, например: 16", parse_mode="HTML")
+        return
     await state.update_data(secret_age=message.text.strip())
     await state.set_state(Form.secret_vip)
     kb = InlineKeyboardMarkup(inline_keyboard=[[
@@ -11509,8 +11611,8 @@ async def process_secret_why(message: Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("secret_accept_"))
 async def secret_accept_callback(call: CallbackQuery):
-    if not await is_main_admin(call.from_user.id) and not await is_support_member(call.from_user.id):
-        await call.answer("❌ У вас нет прав!", show_alert=True)
+    if not await can_decide_application(call.from_user.id):
+        await call.answer("❌ Анкеты в наборах решают только ответственные по наборам.", show_alert=True)
         return
     user_id = int(call.data.split("_")[2])
     if not await _mark_application_decision(call, True, "secret", user_id): return
@@ -11522,8 +11624,8 @@ async def secret_accept_callback(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith("secret_reject_"))
 async def secret_reject_callback(call: CallbackQuery):
-    if not await is_main_admin(call.from_user.id) and not await is_support_member(call.from_user.id):
-        await call.answer("❌ У вас нет прав!", show_alert=True)
+    if not await can_decide_application(call.from_user.id):
+        await call.answer("❌ Анкеты в наборах решают только ответственные по наборам.", show_alert=True)
         return
     user_id = int(call.data.split("_")[2])
     if not await _mark_application_decision(call, False, "secret", user_id): return

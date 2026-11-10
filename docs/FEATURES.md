@@ -65,7 +65,7 @@
   - «Добавление в друзья (VIP)» (`BTN_FRIENDS`, `friends_nickname`).
   - Категории в БД: `complaint`, `appeal`, `question`, `friends`, `general` (`_MS_CAT`). Одновременно можно вести один активный тикет (`check_active_ticket`).
   - Фото/видео собираются в буфер до 5 штук (раздел «Создание тикетов с медиа-буфером»).
-- **Заявки**: на хелпера (`BTN_HELPER_APPLY`, `Form.helper_*`) и в искатели секреток (`BTN_SECRET_APPLY`, `Form.secret_*`). Учитываются `applications_pending` (повтор не чаще чем раз в 7 дней) и `secret_apply_attempts` (лимит попыток). Решение принимают `helper_accept_`, `helper_reject_`, `secret_accept_`, `secret_reject_`.
+- **Заявки**: на хелпера (`BTN_HELPER_APPLY`, `Form.helper_*`) и в искатели секреток (`BTN_SECRET_APPLY`, `Form.secret_*`). Учитываются `applications_pending` (повтор не чаще чем раз в 7 дней) и `secret_apply_attempts` (лимит попыток). Решение принимают `helper_accept_`, `helper_reject_`, `secret_accept_`, `secret_reject_`; права проверяет `can_decide_application`: если в таблице `recruiters` есть люди, решать могут только они (главные админы тоже нет); пока список пуст, как раньше главные админы и стафф. В вопросе «Возраст» в обоих наборах принимаются только цифры (1–3 знака).
 - **Оценка ответа**: `rate_` (`main.py: process_rating`), `rfb_*` и `rfbx` (сценарий комментария к оценке, не проверено подробно). Оценки хранит таблица `ratings`.
 - **Промокоды**: команда `/promocode` и кнопка «Промокод» в магазине (`ShopUserStates.waiting_promo`). Введённый код проверяется и закрепляется (`promo_ok_`, `promo_no`, воркер `promo_hold_worker`).
 - **Платные услуги (Telegram Stars)**: `BTN_SHOP`, `shop_home`, `shop_s_` (услуга), `shop_buy_` (покупка), `shop_ad_` (объявление). Оплата: `/donate` и «донат» (`don_<сумма>`, `donate_custom`), `F.successful_payment`. Поддержка по оплатам: `/paysupport`. Возврат: `/refund ID` (только владелец). Тестовая оплата без звёзд: `/testpay` (только владелец).
@@ -197,6 +197,7 @@
    - публикаторы секреток (`sec_manage_pubs`);
    - предссылки и личные пинги (`adm_sec_people`);
    - наборы и друзья (`adm_recruit`): открыть или закрыть набор в хелперы, искатели секреток, добавление в друзья, «Ник для друзей» (`change_friend_nick`);
+   - ответственные по наборам (`rec_manage`): кого добавить или снять по ID или @нику; добавленный получает уведомление;
    - главные админы (`manage_main_admins`, `add_main_admin_start`, `del_main_admin_start`);
    - внести игрока в ЧС (`bl_add`).
 5. **Платное и рефералка** (`adm_pay`, `pay_kb`):
@@ -317,6 +318,7 @@
 | `admin_agents` | Номера агентов поддержки. |
 | `main_admins` | Главные админы. |
 | `secret_publishers` | Публикаторы и искатели секреток. |
+| `recruiters` | Ответственные по наборам: только они принимают и отклоняют анкеты (хелперы и искатели). Управление: «Доступ» → «Ответственные по наборам» (`rec_manage`, `rec_add`, `rec_del`). |
 | `publisher_nicks` | Сохранённые ники публикаторов (до 5). |
 | `secret_channels` | Каналы публикации. |
 | `secret_types`, `special_secret_types` | Типы секреток (обычные и особые). |
