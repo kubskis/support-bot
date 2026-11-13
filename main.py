@@ -21,6 +21,7 @@ import aiohttp
 import psycopg2
 import psycopg2.pool
 from aiohttp import web
+from aiogram.dispatcher.event.bases import SkipHandler
 from aiogram import Bot, Dispatcher, F, Router, BaseMiddleware
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter, TelegramBadRequest
 from aiogram.filters import Command, CommandStart, CommandObject, StateFilter
@@ -13902,7 +13903,9 @@ async def cmd_unban(message: Message):
 async def handle_admin_group_messages(message: Message):
     text = (message.text or message.caption or "").strip()
     if text.startswith("/"):
-        return
+        # команды не наша забота: пропускаем дальше, иначе этот общий обработчик «съедает» все команды,
+        # объявленные в коде ниже него (/htmltest) и в подключаемых модулях
+        raise SkipHandler()
 
     thread_id = message.message_thread_id
 
