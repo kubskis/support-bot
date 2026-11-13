@@ -1909,6 +1909,9 @@ def _init_db_sync():
                 CREATE TABLE IF NOT EXISTS recruiters (
                     user_id BIGINT PRIMARY KEY
                 );
+                CREATE TABLE IF NOT EXISTS testers (
+                    user_id BIGINT PRIMARY KEY
+                );
                 CREATE TABLE IF NOT EXISTS secret_channels (
                     user_id BIGINT PRIMARY KEY,
                     channel_id TEXT
@@ -2347,6 +2350,16 @@ async def is_recruiter(user_id: int) -> bool:
         return bool(await _db_one("SELECT 1 FROM recruiters WHERE user_id = %s", (user_id,)))
     except Exception:
         return False
+
+async def is_tester(user_id: int) -> bool:
+    try:
+        return bool(await _db_one("SELECT 1 FROM testers WHERE user_id = %s", (user_id,)))
+    except Exception:
+        return False
+
+async def can_use_tests(user_id: int) -> bool:
+    """Тестовые команды (/wpanel, /htmltest в личке): главные админы и тестеры."""
+    return await is_main_admin(user_id) or await is_tester(user_id)
 
 async def can_decide_application(user_id: int) -> bool:
     """Кто решает анкеты наборов: ответственные по наборам. Пока список пуст, как раньше: главные админы и стафф."""
@@ -4159,6 +4172,10 @@ class RecruiterStates(StatesGroup):
     add_id = State()
     del_id = State()
 
+class TesterStates(StatesGroup):
+    add_id = State()
+    del_id = State()
+
 class SecretAdminStates(StatesGroup):
     add_publisher_id = State()
     del_publisher_id = State()
@@ -4243,6 +4260,7 @@ def access_kb():
         [IB(text="🔔 Предссылки и личные пинги", callback_data="adm_sec_people")],
         [IB(text="📝 Наборы и друзья", callback_data="adm_recruit")],
         [IB(text="🎯 Ответственные по наборам", callback_data="rec_manage")],
+        [IB(text="🧪 Тестеры", callback_data="tst_manage")],
         [IB(text="👑 Главные админы", callback_data="manage_main_admins")],
         [IB(text="🚫 Внести игрока в ЧС", callback_data="bl_add")],
         [IB(text="🔙 Назад", callback_data="back_to_adm")],
@@ -5727,6 +5745,75 @@ async def rec_del_proc(message: Message, state: FSMContext):
     left = await _db_one("SELECT 1 FROM recruiters LIMIT 1")
     tail = "" if left else "\n⚠️ Список пуст: анкеты снова решают главные админы и стафф."
     await message.answer(f"{ICON_CHECK} Пользователь <code>{t_id}</code> снят с ответственных по наборам.{tail}",
+                         reply_markup=await main_keyboard(message.from_user.id), parse_mode="HTML")
+
+@router.callback_query(F.data == "tst_manage")
+async def tst_manage(call: CallbackQuery):
+    if not await is_main_admin(call.from_user.id):
+        await call.answer("❌ Только главные админы.", show_alert=True)
+        return
+    ids = [r[0] for r in await _db_all("SELECT user_id FROM testers ORDER BY user_id")]
+    text = ("🧪 <b>Тестеры</b>\n\nМогут пользоваться тестовыми командами в личке с ботом: "
+            "<code>/wpanel</code> (админ-панель-виджет) и <code>/htmltest</code>. Остальных возможностей админов у них нет.\n\n")
+    if ids:
+        names = await asyncio.gather(*[_plain_name(int(i)) for i in ids], return_exceptions=True)
+        for idx, (uid, nm) in enumerate(zip(ids, names), 1):
+            name_display = html.escape(nm) if isinstance(nm, str) else "Неизвестно"
+            text += f"{idx}. <a href='tg://openmessage?user_id={uid}'>{uid}</a> - {name_display}\n"
+    else:
+        text += "<i>Список пуст.</i>\n"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [IB(text="➕ Добавить тестера", callback_data="tst_add")],
+        [IB(text="➖ Удалить тестера", callback_data="tst_del")],
+        [IB(text="🔙 Назад", callback_data="adm_access")],
+    ])
+    await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
+    await call.answer()
+
+@router.callback_query(F.data == "tst_add")
+async def tst_add_prompt(call: CallbackQuery, state: FSMContext):
+    if not await is_main_admin(call.from_user.id): return
+    await state.set_state(TesterStates.add_id)
+    await call.message.answer("🧪 Введите <b>ID или @юзернейм</b> тестера:", parse_mode="HTML")
+    await call.answer()
+
+@router.message(TesterStates.add_id, F.text)
+async def tst_add_proc(message: Message, state: FSMContext):
+    if not await is_main_admin(message.from_user.id): return
+    try:
+        t_id = await resolve_user_one(message.text)
+    except ValueError:
+        await message.answer(f"{ICON_CROSS} " + USER_NOT_FOUND_TEXT, parse_mode="HTML")
+        return
+    await _db_exec("INSERT INTO testers (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING", (t_id,))
+    await alog(message.from_user.id, "tester_add", f"ID {t_id}")
+    await state.clear()
+    await message.answer(f"{ICON_CHECK} Пользователь <code>{t_id}</code> теперь тестер.",
+                         reply_markup=await main_keyboard(message.from_user.id), parse_mode="HTML")
+    try:
+        await bot.send_message(t_id, "🧪 Вас добавили в тестеры. В личке с ботом доступны тестовые команды: /wpanel (админ-панель-виджет) и /htmltest.", parse_mode="HTML")
+    except Exception:
+        pass
+
+@router.callback_query(F.data == "tst_del")
+async def tst_del_prompt(call: CallbackQuery, state: FSMContext):
+    if not await is_main_admin(call.from_user.id): return
+    await state.set_state(TesterStates.del_id)
+    await call.message.answer("🧪 Введите <b>ID или @юзернейм</b> тестера, которого нужно убрать:", parse_mode="HTML")
+    await call.answer()
+
+@router.message(TesterStates.del_id, F.text)
+async def tst_del_proc(message: Message, state: FSMContext):
+    if not await is_main_admin(message.from_user.id): return
+    try:
+        t_id = await resolve_user_one(message.text)
+    except ValueError:
+        await message.answer(f"{ICON_CROSS} " + USER_NOT_FOUND_TEXT, parse_mode="HTML")
+        return
+    await _db_exec("DELETE FROM testers WHERE user_id = %s", (t_id,))
+    await alog(message.from_user.id, "tester_del", f"ID {t_id}")
+    await state.clear()
+    await message.answer(f"{ICON_CHECK} Пользователь <code>{t_id}</code> больше не тестер.",
                          reply_markup=await main_keyboard(message.from_user.id), parse_mode="HTML")
 
 @router.callback_query(F.data == "sec_set_timer")
@@ -17543,7 +17630,7 @@ async def main():
         import widget_panel
         widget_panel.setup(dp, _bot_api_raw, get_db, is_main_admin, _plain_name,
                            lambda: {"maint": MAINTENANCE_ON, "pause": PUBLISH_PAUSED, "userbot": bool(userbot)},
-                           lambda: _STARTUP, ADMIN_CHAT_ID)
+                           lambda: _STARTUP, ADMIN_CHAT_ID, can_use_tests)
         global _WP
         _WP = widget_panel
         _su("Виджет-панель /wpanel", True)

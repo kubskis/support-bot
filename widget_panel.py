@@ -24,6 +24,7 @@ MSK = ZoneInfo("Europe/Moscow")
 
 _api = _get_db = _is_admin = _name = _flags = _startup = None
 _admin_chat = 0
+_can_use = None
 
 CAT = {"complaint": "Жалобы", "appeal": "Обжалования", "question": "Вопросы", "friends": "Друзья", "general": "Общее"}
 TABS = ("sum", "tk", "sec", "nm", "ac", "sys")
@@ -75,10 +76,11 @@ tabs();draw(__D0__);
 </script>"""
 
 
-def setup(dp, api_raw, get_db, is_main_admin, plain_name, flags_fn, startup_fn, admin_chat_id=0):
-    global _api, _get_db, _is_admin, _name, _flags, _startup, _admin_chat
+def setup(dp, api_raw, get_db, is_main_admin, plain_name, flags_fn, startup_fn, admin_chat_id=0, can_use=None):
+    global _api, _get_db, _is_admin, _name, _flags, _startup, _admin_chat, _can_use
     _api, _get_db, _is_admin, _name, _flags, _startup = api_raw, get_db, is_main_admin, plain_name, flags_fn, startup_fn
     _admin_chat = admin_chat_id
+    _can_use = can_use or is_main_admin   # главные админы и тестеры
     dp.include_router(router)
     # основной router в main.py имеет общий обработчик личных сообщений («выберите пункт меню»):
     # подроутер должен проверяться раньше него
@@ -193,8 +195,8 @@ async def handle_query(wq: dict) -> bool:
     uid = (wq.get("from") or {}).get("id")
     if not qid:
         return True
-    if not uid or not await _is_admin(uid):
-        await _api("answerWidgetQuery", {"widget_query_id": qid, "data": json.dumps({"k": [["Доступ", "только главные админы"]]}, ensure_ascii=False)})
+    if not uid or not await _can_use(uid):
+        await _api("answerWidgetQuery", {"widget_query_id": qid, "data": json.dumps({"k": [["Доступ", "только тестеры и админы"]]}, ensure_ascii=False)})
         return True
     tab = data[2:]
     try:
@@ -212,10 +214,10 @@ async def handle_query(wq: dict) -> bool:
 @router.message(Command("wpanel"))
 async def cmd_wpanel(message: Message):
     if message.chat.type != "private":
-        if await _is_admin(message.from_user.id):
+        if await _can_use(message.from_user.id):
             await message.reply("Виджеты в продакшене работают только в личке с ботом. Напишите /wpanel мне в ЛС.")
         return
-    if not await _is_admin(message.from_user.id):
+    if not await _can_use(message.from_user.id):
         return
     first = _pack(await _build("sum"))
     page = PAGE.replace("__D0__", first.replace("</", "<\\/"))
@@ -257,7 +259,7 @@ async def cmd_htmltest(message: Message):
     in_staff = message.chat.id == _admin_chat
     if message.chat.type != "private" and not in_staff:
         return
-    if not await _is_admin(message.from_user.id):
+    if not await (_is_admin(message.from_user.id) if in_staff else _can_use(message.from_user.id)):
         return
     body = {"chat_id": message.chat.id, "html": HTMLTEST_WIDGET, "caption": "🧪 Тест виджета",
             "allow_queries": True, "chat_data": '{"t":1}'}
