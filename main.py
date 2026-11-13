@@ -14842,20 +14842,22 @@ dp.update.outer_middleware(WidgetQueryMiddleware())
 
 @router.message(Command("htmltest"))
 async def cmd_htmltest(message: Message):
-    """Тест виджетов Bot API 10.4 (sendWidget). Работает только в личке с ботом, главным админам."""
-    if message.chat.type != "private":
-        if await is_main_admin(message.from_user.id):
-            await message.reply("Виджеты в продакшене работают только в личке с ботом. Напишите /htmltest мне в ЛС.")
+    """Тест виджетов Bot API 10.4 (sendWidget). Главным админам: в личке с ботом и в чате стаффа (проверка, пускает ли Telegram виджеты в группы)."""
+    in_staff = message.chat.id == ADMIN_CHAT_ID
+    if message.chat.type != "private" and not in_staff:
         return
     if not await is_main_admin(message.from_user.id):
         return
-    ok, res = await _bot_api_raw("sendWidget", {
-        "chat_id": message.chat.id, "html": HTMLTEST_WIDGET, "caption": "🧪 Тест виджета",
-        "allow_queries": True, "chat_data": '{"t":1}'})
+    body = {"chat_id": message.chat.id, "html": HTMLTEST_WIDGET, "caption": "🧪 Тест виджета",
+            "allow_queries": True, "chat_data": '{"t":1}'}
+    if in_staff and message.message_thread_id:
+        body["message_thread_id"] = message.message_thread_id
+    ok, res = await _bot_api_raw("sendWidget", body)
+    where = "в чат стаффа" if in_staff else "в личку"
     if ok:
-        await message.answer(f"✅ sendWidget принят, message_id={(res or {}).get('message_id')}.\nНажмите «Счётчик» (работает без бота) и «Спросить бота» (проверяет widget_query).")
+        await message.answer(f"✅ sendWidget {where} принят, message_id={(res or {}).get('message_id')}.\nНажмите «Счётчик» (без бота) и «Спросить бота» (проверяет widget_query).")
     else:
-        await message.answer(f"❌ sendWidget не прошёл:\n<code>{html.escape(str(res))[:500]}</code>", parse_mode="HTML")
+        await message.answer(f"❌ sendWidget {where} не прошёл:\n<code>{html.escape(str(res))[:500]}</code>", parse_mode="HTML")
 
 async def _ub_rich_send(peer, kind: str, text: str):
     """Отправка «богатого» сообщения юзерботом (Telethon 1.44+). kind: 'html' или 'markdown'."""
