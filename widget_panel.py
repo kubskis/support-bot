@@ -23,6 +23,7 @@ router = Router(name="widget_panel")
 MSK = ZoneInfo("Europe/Moscow")
 
 _api = _get_db = _is_admin = _name = _flags = _startup = None
+_admin_chat = 0
 
 CAT = {"complaint": "Жалобы", "appeal": "Обжалования", "question": "Вопросы", "friends": "Друзья", "general": "Общее"}
 TABS = ("sum", "tk", "sec", "nm", "ac", "sys")
@@ -74,9 +75,10 @@ tabs();draw(__D0__);
 </script>"""
 
 
-def setup(dp, api_raw, get_db, is_main_admin, plain_name, flags_fn, startup_fn):
-    global _api, _get_db, _is_admin, _name, _flags, _startup
+def setup(dp, api_raw, get_db, is_main_admin, plain_name, flags_fn, startup_fn, admin_chat_id=0):
+    global _api, _get_db, _is_admin, _name, _flags, _startup, _admin_chat
     _api, _get_db, _is_admin, _name, _flags, _startup = api_raw, get_db, is_main_admin, plain_name, flags_fn, startup_fn
+    _admin_chat = admin_chat_id
     dp.include_router(router)
     # основной router в main.py имеет общий обработчик личных сообщений («выберите пункт меню»):
     # подроутер должен проверяться раньше него
@@ -224,3 +226,46 @@ async def cmd_wpanel(message: Message):
         await message.answer(f"✅ Панель отправлена (HTML {len(page.encode())} Б, сжато {size} Б из 4096).")
     else:
         await message.answer(f"❌ sendWidget не прошёл (сжато {size} Б):\n<code>{_html.escape(str(res))[:500]}</code>", parse_mode="HTML")
+
+
+HTMLTEST_WIDGET = """<style>
+body{font:15px system-ui,sans-serif;margin:0;padding:14px}
+h3{margin:0 0 6px}p{margin:0 0 10px}
+.b{padding:10px 14px;border:0;border-radius:10px;background:#2a9df4;color:#fff;font-size:15px;margin:4px 6px 0 0}
+#o{margin-top:12px;opacity:.85}
+</style>
+<h3>🧪 Тест виджета</h3>
+<p>Если вы видите эту карточку, виджеты работают.</p>
+<button class="b" id="c">Счётчик: 0</button>
+<button class="b" id="q">Спросить бота</button>
+<div id="o"></div>
+<script>
+var n=0,o=document.getElementById('o');
+document.getElementById('c').onclick=function(){n++;this.textContent='Счётчик: '+n};
+document.getElementById('q').onclick=function(){
+o.textContent='Жду ответ бота…';
+TelegramWidget.request('ping').then(
+function(a){o.textContent='Ответ бота: '+a.result},
+function(e){o.textContent='Ошибка: '+(e&&e.code)});
+};
+</script>"""
+
+
+@router.message(Command("htmltest"))
+async def cmd_htmltest(message: Message):
+    """Тест виджетов Bot API 10.4: главным админам, в личке с ботом и в чате стаффа (проверка, пускает ли Telegram виджеты в группы)."""
+    in_staff = message.chat.id == _admin_chat
+    if message.chat.type != "private" and not in_staff:
+        return
+    if not await _is_admin(message.from_user.id):
+        return
+    body = {"chat_id": message.chat.id, "html": HTMLTEST_WIDGET, "caption": "🧪 Тест виджета",
+            "allow_queries": True, "chat_data": '{"t":1}'}
+    if in_staff and message.message_thread_id:
+        body["message_thread_id"] = message.message_thread_id
+    ok, res = await _api("sendWidget", body)
+    where = "в чат стаффа" if in_staff else "в личку"
+    if ok:
+        await message.answer(f"✅ sendWidget {where} принят, message_id={(res or {}).get('message_id')}.\nНажмите «Счётчик» (без бота) и «Спросить бота» (проверяет widget_query).")
+    else:
+        await message.answer(f"❌ sendWidget {where} не прошёл:\n<code>{_html.escape(str(res))[:500]}</code>", parse_mode="HTML")

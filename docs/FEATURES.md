@@ -415,7 +415,7 @@
 | `/tohwatch` | главные админы | Оповещения об обновлении Tower of Hell (`on`, `off`, статус). |
 | `/emojipack` | владелец | Статус пака, `sync [force]`, `on`, `off`. |
 | `/wpanel` | главные админы, только ЛС | Админ-панель в виде виджета (`widget_panel.py`). Вкладки подгружаются нажатиями (`widget_query` → `answerWidgetQuery`). |
-| `/htmltest` | главные админы, ЛС и чат стаффа | Тест виджетов Bot API 10.4: шлёт виджет через сырой `sendWidget` (`main.py: cmd_htmltest`). Кнопка «Спросить бота» проверяет `widget_query` → `answerWidgetQuery` (`_on_widget_query`). |
+| `/htmltest` | главные админы, ЛС и чат стаффа | Тест виджетов Bot API 10.4: шлёт виджет через сырой `sendWidget` (`widget_panel.py: cmd_htmltest`). Кнопка «Спросить бота» проверяет `widget_query` → `answerWidgetQuery` (`_on_widget_query`). |
 | `/rich` | владелец | Богатый формат постов: `on`, `off`, `br`, `p`. |
 | `/richtest`, `/richuser` | владелец | Проба богатых сообщений через юзербот. |
 | `/photo имя` | владелец | Запомнить фото (ответом на фото) или показать. |

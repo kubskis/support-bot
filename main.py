@@ -14794,28 +14794,6 @@ async def _bot_api_raw(method: str, body: dict) -> tuple:
     except Exception as ex:
         return False, f"сбой запроса: {ex!r}"
 
-HTMLTEST_WIDGET = """<style>
-body{font:15px system-ui,sans-serif;margin:0;padding:14px}
-h3{margin:0 0 6px}p{margin:0 0 10px}
-.b{padding:10px 14px;border:0;border-radius:10px;background:#2a9df4;color:#fff;font-size:15px;margin:4px 6px 0 0}
-#o{margin-top:12px;opacity:.85}
-</style>
-<h3>🧪 Тест виджета</h3>
-<p>Если вы видите эту карточку, виджеты работают.</p>
-<button class="b" id="c">Счётчик: 0</button>
-<button class="b" id="q">Спросить бота</button>
-<div id="o"></div>
-<script>
-var n=0,o=document.getElementById('o');
-document.getElementById('c').onclick=function(){n++;this.textContent='Счётчик: '+n};
-document.getElementById('q').onclick=function(){
-o.textContent='Жду ответ бота…';
-TelegramWidget.request('ping').then(
-function(a){o.textContent='Ответ бота: '+a.result},
-function(e){o.textContent='Ошибка: '+(e&&e.code)});
-};
-</script>"""
-
 async def _on_widget_query(wq: dict):
     """Ответ на нажатие в виджете (update widget_query / shared_widget_query)."""
     qid, data = wq.get("id"), wq.get("data")
@@ -14842,25 +14820,6 @@ class WidgetQueryMiddleware(BaseMiddleware):
         return await handler(event, data)
 
 dp.update.outer_middleware(WidgetQueryMiddleware())
-
-@router.message(Command("htmltest"))
-async def cmd_htmltest(message: Message):
-    """Тест виджетов Bot API 10.4 (sendWidget). Главным админам: в личке с ботом и в чате стаффа (проверка, пускает ли Telegram виджеты в группы)."""
-    in_staff = message.chat.id == ADMIN_CHAT_ID
-    if message.chat.type != "private" and not in_staff:
-        return
-    if not await is_main_admin(message.from_user.id):
-        return
-    body = {"chat_id": message.chat.id, "html": HTMLTEST_WIDGET, "caption": "🧪 Тест виджета",
-            "allow_queries": True, "chat_data": '{"t":1}'}
-    if in_staff and message.message_thread_id:
-        body["message_thread_id"] = message.message_thread_id
-    ok, res = await _bot_api_raw("sendWidget", body)
-    where = "в чат стаффа" if in_staff else "в личку"
-    if ok:
-        await message.answer(f"✅ sendWidget {where} принят, message_id={(res or {}).get('message_id')}.\nНажмите «Счётчик» (без бота) и «Спросить бота» (проверяет widget_query).")
-    else:
-        await message.answer(f"❌ sendWidget {where} не прошёл:\n<code>{html.escape(str(res))[:500]}</code>", parse_mode="HTML")
 
 async def _ub_rich_send(peer, kind: str, text: str):
     """Отправка «богатого» сообщения юзерботом (Telethon 1.44+). kind: 'html' или 'markdown'."""
@@ -17584,7 +17543,7 @@ async def main():
         import widget_panel
         widget_panel.setup(dp, _bot_api_raw, get_db, is_main_admin, _plain_name,
                            lambda: {"maint": MAINTENANCE_ON, "pause": PUBLISH_PAUSED, "userbot": bool(userbot)},
-                           lambda: _STARTUP)
+                           lambda: _STARTUP, ADMIN_CHAT_ID)
         global _WP
         _WP = widget_panel
         _su("Виджет-панель /wpanel", True)
