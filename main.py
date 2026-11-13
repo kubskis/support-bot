@@ -14778,6 +14778,81 @@ async def _send_rich_raw(chat_id, rich_message: dict, reply_markup: dict = None)
     except Exception as ex:
         return f"сбой запроса: {ex!r}"
 
+async def _bot_api_raw(method: str, body: dict) -> tuple:
+    """Сырой вызов Bot API (для методов новее aiogram). Возвращает (ok, result или текст ошибки)."""
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as sess:
+            async with sess.post(url, json=body) as r:
+                data = await r.json(content_type=None)
+        if data.get("ok"):
+            return True, data.get("result")
+        return False, f"ОШИБКА {data.get('error_code')}: {data.get('description')}"
+    except Exception as ex:
+        return False, f"сбой запроса: {ex!r}"
+
+HTMLTEST_WIDGET = """<style>
+body{font:15px system-ui,sans-serif;margin:0;padding:14px}
+h3{margin:0 0 6px}p{margin:0 0 10px}
+.b{padding:10px 14px;border:0;border-radius:10px;background:#2a9df4;color:#fff;font-size:15px;margin:4px 6px 0 0}
+#o{margin-top:12px;opacity:.85}
+</style>
+<h3>🧪 Тест виджета</h3>
+<p>Если вы видите эту карточку, виджеты работают.</p>
+<button class="b" id="c">Счётчик: 0</button>
+<button class="b" id="q">Спросить бота</button>
+<div id="o"></div>
+<script>
+var n=0,o=document.getElementById('o');
+document.getElementById('c').onclick=function(){n++;this.textContent='Счётчик: '+n};
+document.getElementById('q').onclick=function(){
+o.textContent='Жду ответ бота…';
+TelegramWidget.request('ping').then(
+function(a){o.textContent='Ответ бота: '+a.result},
+function(e){o.textContent='Ошибка: '+(e&&e.code)});
+};
+</script>"""
+
+async def _on_widget_query(wq: dict):
+    """Ответ на нажатие в виджете (update widget_query / shared_widget_query)."""
+    qid, data = wq.get("id"), wq.get("data")
+    if not qid:
+        return
+    who = (wq.get("from") or {}).get("first_name", "")
+    answer = f"pong, {who}, {datetime.now(MSK_TZ).strftime('%H:%M:%S')} МСК" if data == "ping" else "неизвестный запрос"
+    ok, res = await _bot_api_raw("answerWidgetQuery", {"widget_query_id": qid, "data": answer[:200]})
+    if not ok:
+        logging.warning(f"answerWidgetQuery: {res}")
+
+class WidgetQueryMiddleware(BaseMiddleware):
+    """aiogram 3.31 знает Bot API только до 10.3 и пропускает update widget_query. Перехватываем его до диспетчера."""
+    async def __call__(self, handler, event, data):
+        extra = getattr(event, "model_extra", None) or {}
+        wq = extra.get("widget_query") or extra.get("shared_widget_query")
+        if wq:
+            spawn(_on_widget_query(dict(wq) if isinstance(wq, dict) else {}))
+            return None
+        return await handler(event, data)
+
+dp.update.outer_middleware(WidgetQueryMiddleware())
+
+@router.message(Command("htmltest"))
+async def cmd_htmltest(message: Message):
+    """Тест виджетов Bot API 10.4 (sendWidget). Работает только в личке с ботом, главным админам."""
+    if message.chat.type != "private":
+        if await is_main_admin(message.from_user.id):
+            await message.reply("Виджеты в продакшене работают только в личке с ботом. Напишите /htmltest мне в ЛС.")
+        return
+    if not await is_main_admin(message.from_user.id):
+        return
+    ok, res = await _bot_api_raw("sendWidget", {
+        "chat_id": message.chat.id, "html": HTMLTEST_WIDGET, "caption": "🧪 Тест виджета",
+        "allow_queries": True, "chat_data": '{"t":1}'})
+    if ok:
+        await message.answer(f"✅ sendWidget принят, message_id={(res or {}).get('message_id')}.\nНажмите «Счётчик» (работает без бота) и «Спросить бота» (проверяет widget_query).")
+    else:
+        await message.answer(f"❌ sendWidget не прошёл:\n<code>{html.escape(str(res))[:500]}</code>", parse_mode="HTML")
+
 async def _ub_rich_send(peer, kind: str, text: str):
     """Отправка «богатого» сообщения юзерботом (Telethon 1.44+). kind: 'html' или 'markdown'."""
     import inspect
@@ -17607,7 +17682,8 @@ async def main():
             _t0 = time.monotonic()
             try:
                 # сессию бота не закрываем между попытками: сбой Telegram не должен ронять весь процесс
-                await dp.start_polling(bot, close_bot_session=False)
+                await dp.start_polling(bot, close_bot_session=False,
+                                       allowed_updates=[*dp.resolve_used_update_types(), "widget_query", "shared_widget_query"])
                 break   # штатная остановка
             except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
                 raise
