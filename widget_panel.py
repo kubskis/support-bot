@@ -78,6 +78,9 @@ def setup(dp, api_raw, get_db, is_main_admin, plain_name, flags_fn, startup_fn):
     global _api, _get_db, _is_admin, _name, _flags, _startup
     _api, _get_db, _is_admin, _name, _flags, _startup = api_raw, get_db, is_main_admin, plain_name, flags_fn, startup_fn
     dp.include_router(router)
+    # основной router в main.py имеет общий обработчик личных сообщений («выберите пункт меню»):
+    # подроутер должен проверяться раньше него
+    dp.sub_routers.insert(0, dp.sub_routers.pop())
 
 
 def _one(cur, sql, args=()):
