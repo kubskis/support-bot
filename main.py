@@ -14818,11 +14818,15 @@ async def _on_widget_query(wq: dict):
     qid, data = wq.get("id"), wq.get("data")
     if not qid:
         return
+    if _WP is not None and await _WP.handle_query(wq):
+        return
     who = (wq.get("from") or {}).get("first_name", "")
     answer = f"pong, {who}, {datetime.now(MSK_TZ).strftime('%H:%M:%S')} МСК" if data == "ping" else "неизвестный запрос"
     ok, res = await _bot_api_raw("answerWidgetQuery", {"widget_query_id": qid, "data": answer[:200]})
     if not ok:
         logging.warning(f"answerWidgetQuery: {res}")
+
+_WP = None   # widget_panel, если подключён
 
 class WidgetQueryMiddleware(BaseMiddleware):
     """aiogram 3.31 знает Bot API только до 10.3 и пропускает update widget_query. Перехватываем его до диспетчера."""
@@ -17571,6 +17575,17 @@ async def main():
     if MAINTENANCE_ON:
         logging.warning("Бот запущен в режиме ТЕХНИЧЕСКОГО ПЕРЕРЫВА (включён ранее).")
     await _ref_cfg_load()
+    try:
+        import widget_panel
+        widget_panel.setup(dp, _bot_api_raw, get_db, is_main_admin, _plain_name,
+                           lambda: {"maint": MAINTENANCE_ON, "pause": PUBLISH_PAUSED, "userbot": bool(userbot)},
+                           lambda: _STARTUP)
+        global _WP
+        _WP = widget_panel
+        _su("Виджет-панель /wpanel", True)
+    except Exception as e:
+        logging.error(f"Виджет-панель не подключена: {e}")
+        _su("Виджет-панель /wpanel", False, e)
     try:
         import punish
         punish.setup(dp, bot, is_main_admin, resolve_username)
