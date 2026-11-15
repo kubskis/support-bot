@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import time
 from datetime import datetime, timezone, timedelta
 from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Awaitable
 
 import aiohttp
@@ -2321,41 +2322,49 @@ async def setup_bot_commands(bot: Bot):
     except Exception as e:
         logging.warning(f"Ошибка настройки подсказок команд: {e}")
 
+# Кэш ролей: проверки роли идут почти в каждом обработчике, а база удалённая. Пока ответ свежий (30 с),
+# в БД не ходим. При смене ролей кэш сбрасывается сразу (invalidate_roles), так что изменения видны мгновенно.
+_ROLE_CACHE: Dict[tuple, tuple] = {}
+_ROLE_TTL = 30
+
+def invalidate_roles():
+    _ROLE_CACHE.clear()
+
+def _role_get(role: str, uid: int):
+    hit = _ROLE_CACHE.get((role, uid))
+    if hit and hit[1] > time.monotonic():
+        return hit[0]
+    return None
+
+def _role_put(role: str, uid: int, val: bool, ttl: float = _ROLE_TTL):
+    if len(_ROLE_CACHE) > 20000:
+        _ROLE_CACHE.clear()
+    _ROLE_CACHE[(role, uid)] = (val, time.monotonic() + ttl)
+
+async def _role_in_table(role: str, sql: str, user_id: int) -> bool:
+    hit = _role_get(role, user_id)
+    if hit is not None:
+        return hit
+    try:
+        val = bool(await _db_one(sql, (user_id,)))
+    except Exception:
+        return False   # сбой БД не кэшируем
+    _role_put(role, user_id, val)
+    return val
+
 async def is_main_admin(user_id: int) -> bool:
     if OWNER_ID and user_id == OWNER_ID:
         return True
-    def _query():
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT admin_id FROM main_admins WHERE admin_id = %s", (user_id,))
-                return cur.fetchone() is not None
-    try:
-        return await asyncio.to_thread(_query)
-    except Exception:
-        return False
+    return await _role_in_table("adm", "SELECT 1 FROM main_admins WHERE admin_id = %s", user_id)
 
 async def is_secret_publisher(user_id: int) -> bool:
-    def _query():
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT user_id FROM secret_publishers WHERE user_id = %s", (user_id,))
-                return cur.fetchone() is not None
-    try:
-        return await asyncio.to_thread(_query)
-    except Exception:
-        return False
+    return await _role_in_table("pub", "SELECT 1 FROM secret_publishers WHERE user_id = %s", user_id)
 
 async def is_recruiter(user_id: int) -> bool:
-    try:
-        return bool(await _db_one("SELECT 1 FROM recruiters WHERE user_id = %s", (user_id,)))
-    except Exception:
-        return False
+    return await _role_in_table("rec", "SELECT 1 FROM recruiters WHERE user_id = %s", user_id)
 
 async def is_tester(user_id: int) -> bool:
-    try:
-        return bool(await _db_one("SELECT 1 FROM testers WHERE user_id = %s", (user_id,)))
-    except Exception:
-        return False
+    return await _role_in_table("tst", "SELECT 1 FROM testers WHERE user_id = %s", user_id)
 
 async def can_use_tests(user_id: int) -> bool:
     """Тестовые команды (/wpanel, /htmltest в личке): главные админы и тестеры."""
@@ -2363,25 +2372,31 @@ async def can_use_tests(user_id: int) -> bool:
 
 async def can_decide_application(user_id: int) -> bool:
     """Кто решает анкеты наборов: ответственные по наборам. Пока список пуст, как раньше: главные админы и стафф."""
-    try:
-        any_rec = await _db_one("SELECT 1 FROM recruiters LIMIT 1")
-    except Exception:
-        any_rec = None
-    if any_rec:
+    hit = _role_get("anyrec", 0)
+    if hit is None:
+        try:
+            hit = bool(await _db_one("SELECT 1 FROM recruiters LIMIT 1"))
+            _role_put("anyrec", 0, hit)
+        except Exception:
+            hit = False
+    if hit:
         return await is_recruiter(user_id)
     return await is_main_admin(user_id) or await is_support_member(user_id)
 
 async def is_support_member(user_id: int) -> bool:
     if await is_main_admin(user_id):
         return True
+    hit = _role_get("sup", user_id)
+    if hit is not None:
+        return hit
     try:
         member = await bot.get_chat_member(chat_id=ADMIN_CHAT_ID, user_id=user_id)
-        if member.status in ["creator", "administrator", "member", "restricted"]:
-            return True
     except Exception as e:
         logging.error(f"Ошибка проверки статуса участника {user_id}: {e}")
         return False
-    return False
+    val = member.status in ["creator", "administrator", "member", "restricted"]
+    _role_put("sup", user_id, val, ttl=300 if val else 60)   # вопрос к Telegram дорогой: помним дольше
+    return val
 
 async def get_or_create_agent_number(admin_id: int) -> int:
     if OWNER_ID and admin_id == OWNER_ID:
@@ -2442,17 +2457,33 @@ async def get_setting(key: str, default: str = "") -> str:
     # Шаблоны помечаются: автозамена эмодзи их не трогает (в Telethon и в Bot API маркеры убираются)
     return NT(val) if isinstance(key, str) and key.startswith("template_") else val
 
+# Настройки читаем из памяти: вся таблица settings подгружается одним запросом раз в 30 с, а при записи
+# через set_setting значение сразу обновляется и в базе, и в памяти.
+_SETTINGS: Dict[str, Any] = {}
+_SETTINGS_AT = 0.0
+_SETTINGS_TTL = 30
+_SETTINGS_LOCK = asyncio.Lock()
+
+async def _settings_all() -> Dict[str, Any]:
+    global _SETTINGS, _SETTINGS_AT
+    if _SETTINGS_AT and time.monotonic() - _SETTINGS_AT < _SETTINGS_TTL:
+        return _SETTINGS
+    async with _SETTINGS_LOCK:
+        if _SETTINGS_AT and time.monotonic() - _SETTINGS_AT < _SETTINGS_TTL:
+            return _SETTINGS
+        rows = await _db_all("SELECT key, value FROM settings")
+        _SETTINGS = {k: v for k, v in rows}
+        _SETTINGS_AT = time.monotonic()
+    return _SETTINGS
+
 async def _get_setting_raw(key: str, default: str = "") -> str:
-    def _query():
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT value FROM settings WHERE key = %s", (key,))
-                row = cur.fetchone()
-                return row[0] if row else default
     try:
-        return await asyncio.to_thread(_query)
+        d = await _settings_all()
     except Exception:
-        return default
+        d = _SETTINGS   # база недоступна: берём то, что помним
+        if not d:
+            return default
+    return d[key] if key in d else default
 
 async def set_setting(key: str, value: str):
     def _query():
@@ -2464,6 +2495,7 @@ async def set_setting(key: str, value: str):
                     (key, value)
                 )
     await asyncio.to_thread(_query)
+    _SETTINGS[key] = value   # в памяти сразу новое значение
 
 # ----------------------------------------------------------------------
 # ЖУРНАЛ ДЕЙСТВИЙ КОМАНДЫ (виден главным админам в личном кабинете на сайте)
@@ -5063,6 +5095,7 @@ async def process_add_main_admin(message: Message, state: FSMContext):
                 with conn.cursor() as cur:
                     cur.execute("INSERT INTO main_admins (admin_id) VALUES (%s) ON CONFLICT (admin_id) DO NOTHING", (new_id,))
         await asyncio.to_thread(_query)
+        invalidate_roles()
         await alog(message.from_user.id, "admin_add", f"ID {new_id}")
         await state.clear()
         kb = await main_keyboard(message.from_user.id)
@@ -5093,6 +5126,7 @@ async def process_del_main_admin(message: Message, state: FSMContext):
                 with conn.cursor() as cur:
                     cur.execute("DELETE FROM main_admins WHERE admin_id = %s", (del_id,))
         await asyncio.to_thread(_query)
+        invalidate_roles()
         await alog(message.from_user.id, "admin_del", f"ID {del_id}")
         await state.clear()
         kb = await main_keyboard(message.from_user.id)
@@ -5644,6 +5678,7 @@ async def sec_add_pub_proc(message: Message, state: FSMContext):
                 with conn.cursor() as cur:
                     cur.execute("INSERT INTO secret_publishers (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING", (t_id,))
         await asyncio.to_thread(_q)
+        invalidate_roles()
         await alog(message.from_user.id, "pub_add", f"ID {t_id}")
         await state.clear()
         kb = await main_keyboard(message.from_user.id)
@@ -5668,6 +5703,7 @@ async def sec_del_pub_proc(message: Message, state: FSMContext):
                 with conn.cursor() as cur:
                     cur.execute("DELETE FROM secret_publishers WHERE user_id = %s", (t_id,))
         await asyncio.to_thread(_q)
+        invalidate_roles()
         await alog(message.from_user.id, "pub_del", f"ID {t_id}")
         await state.clear()
         kb = await main_keyboard(message.from_user.id)
@@ -5714,6 +5750,7 @@ async def rec_add_proc(message: Message, state: FSMContext):
         await message.answer(f"{ICON_CROSS} " + USER_NOT_FOUND_TEXT, parse_mode="HTML")
         return
     await _db_exec("INSERT INTO recruiters (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING", (t_id,))
+    invalidate_roles()
     await alog(message.from_user.id, "recruiter_add", f"ID {t_id}")
     await state.clear()
     await message.answer(
@@ -5740,6 +5777,7 @@ async def rec_del_proc(message: Message, state: FSMContext):
         await message.answer(f"{ICON_CROSS} " + USER_NOT_FOUND_TEXT, parse_mode="HTML")
         return
     await _db_exec("DELETE FROM recruiters WHERE user_id = %s", (t_id,))
+    invalidate_roles()
     await alog(message.from_user.id, "recruiter_del", f"ID {t_id}")
     await state.clear()
     left = await _db_one("SELECT 1 FROM recruiters LIMIT 1")
@@ -5786,6 +5824,7 @@ async def tst_add_proc(message: Message, state: FSMContext):
         await message.answer(f"{ICON_CROSS} " + USER_NOT_FOUND_TEXT, parse_mode="HTML")
         return
     await _db_exec("INSERT INTO testers (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING", (t_id,))
+    invalidate_roles()
     await alog(message.from_user.id, "tester_add", f"ID {t_id}")
     await state.clear()
     await message.answer(f"{ICON_CHECK} Пользователь <code>{t_id}</code> теперь тестер.",
@@ -5811,6 +5850,7 @@ async def tst_del_proc(message: Message, state: FSMContext):
         await message.answer(f"{ICON_CROSS} " + USER_NOT_FOUND_TEXT, parse_mode="HTML")
         return
     await _db_exec("DELETE FROM testers WHERE user_id = %s", (t_id,))
+    invalidate_roles()
     await alog(message.from_user.id, "tester_del", f"ID {t_id}")
     await state.clear()
     await message.answer(f"{ICON_CHECK} Пользователь <code>{t_id}</code> больше не тестер.",
@@ -6844,6 +6884,7 @@ async def pub_confirm(call: CallbackQuery, state: FSMContext):
                             return cur.fetchone()[0]
                 
                 post_id = await asyncio.to_thread(_save)
+                spawn(counters.bump("sec", call.from_user.id))
 
                 # 2.1 Предссылки (одновременно со стаффом), с запоминанием копий
                 spawn(send_prelinks(
@@ -7201,6 +7242,7 @@ async def _sab_core(user, data, ch_id) -> tuple:
                     """, (post_id, user.id, data["sab_nick"], data["sab_tg"], data["sab_link"], data["sab_method"], data["sab_friends"]))
                     return cur.fetchone()[0]
         srv_id = await asyncio.to_thread(_save_srv)
+        spawn(counters.bump("sab", user.id))
 
     spawn(send_prelinks(
         _prelink_header("поиск саботера") +
@@ -7264,6 +7306,7 @@ async def _farm_core(user, data, ch_id) -> tuple:
                     """, (post_id, user.id, data["farm_nick"], data["farm_tg"], data["farm_sections"], data["farm_link"], data["farm_friends"], bool(data.get("farm_effects"))))
                     return cur.fetchone()[0]
         srv_id = await asyncio.to_thread(_save_srv)
+        spawn(counters.bump("farm", user.id))
 
     spawn(send_prelinks(
         _prelink_header("фарм сервер") +
@@ -7331,6 +7374,7 @@ async def _res_core(user, data, ch_id) -> tuple:
                         (user.id, ch_id, msg_id, link)
                     )
         await asyncio.to_thread(_save)
+        spawn(counters.bump("res", user.id))
         return True, (
             f"{ICON_CHECK} <b>Бейдж исследователь опубликован в канале!</b>\n"
             "Когда он перестанет быть актуальным, закройте его в «📋 Мои бейджи исследователя»."
@@ -8024,6 +8068,7 @@ async def mutator_confirm_proc(call: CallbackQuery, state: FSMContext):
                         (call.from_user.id, ch_id, msg_id, link)
                     )
         await asyncio.to_thread(_save)
+        spawn(counters.bump("mut", call.from_user.id))
 
         await call.message.answer(
             f"{ICON_CHECK} <b>Бейдж мутатор опубликован в канале!</b>\n"
@@ -17607,6 +17652,9 @@ router.message.register(user_private_message, F.chat.type == "private")
 
 async def main():
     global MAINTENANCE_ON, TEST_MODE_ON, TEST_CHANNEL_ID, TEST_STARTED_AT, PUBLISH_PAUSED, PUBLISH_PAUSED_SINCE
+    # по умолчанию у asyncio всего cpu+4 потока (на 2 ядрах их 6): запросы к БД стояли в очереди друг за другом.
+    # Пул соединений на 20, поэтому потоков столько же.
+    asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=20, thread_name_prefix="bot"))
     MAINTENANCE_ON = (await get_setting("maintenance_mode", "false")) == "true"
     PUBLISH_PAUSED = (await get_setting("publish_paused", "false")) == "true"
     try:

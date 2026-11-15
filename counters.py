@@ -4,8 +4,8 @@
 sec — секретки, sab — саботёр, farm — фарм, mut — мутатор, res — исследователь,
 m_* — ручные зачёты из раздела «Вручную».
 
-Бот пересчитывает последние 2 дня раз в 5 минут и весь архив при старте. Значит, сегодняшние цифры
-отстают не больше чем на 5 минут. Статистика читает эту таблицу, а не объединяет исходные таблицы заново.
+Каждое новое событие сразу прибавляется (bump), а пересчёт последних 2 дней раз в 5 минут и всего архива при старте
+сверяет цифры с исходными таблицами (на случай пропущенного события). Статистика читает эту таблицу, а не объединяет исходные таблицы заново.
 """
 import asyncio
 import logging
@@ -91,6 +91,22 @@ def _read_sync(d0):
 async def per_user(period: str) -> dict:
     """{user_id: {sec, sab, farm, mut, res}} за период ('d', 'w', 'a')."""
     return await asyncio.to_thread(_read_sync, day_from(period))
+
+
+def _bump_sync(kind, uid, n):
+    with _get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO daily_counts(day, kind, user_id, n) VALUES (%s, %s, %s, %s) "
+                        "ON CONFLICT (day, kind, user_id) DO UPDATE SET n = daily_counts.n + EXCLUDED.n",
+                        (today_msk(), kind, uid, n))
+
+
+async def bump(kind: str, uid: int, n: int = 1):
+    """Сразу прибавляет событие к сегодняшнему счётчику, чтобы статистика не ждала пересчёта. Пересчёт раз в 5 минут всё сверяет."""
+    try:
+        await asyncio.to_thread(_bump_sync, kind, uid, n)
+    except Exception:
+        log.exception("counters: не удалось прибавить %s для %s", kind, uid)
 
 
 async def refresh(d0=None):

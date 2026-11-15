@@ -11,6 +11,7 @@
 Данные берутся автоматически: secret_publishers (искатели) и secret_posts (опубликованные секретки, дата по МСК).
 """
 import asyncio
+import time
 import html
 import logging
 import math
@@ -95,13 +96,35 @@ async def init_tables():
     await q("UPDATE norm_excuse SET status='no' WHERE status='pending' AND ts < now() - interval '2 days'")
 
 
+# Настройки норматива читаются десятки раз за один показ панели (в том числе в цикле по людям).
+# Всю таблицу берём одним запросом раз в 30 с, а при записи через set_cfg память обновляется сразу.
+_CFG = {}
+_CFG_AT = 0.0
+_CFG_TTL = 30
+
+
+async def _cfg_all():
+    global _CFG, _CFG_AT
+    if _CFG_AT and time.monotonic() - _CFG_AT < _CFG_TTL:
+        return _CFG
+    rows = await q("SELECT key, value FROM norm_cfg", many=True) or []
+    _CFG = {k: v for k, v in rows}
+    _CFG_AT = time.monotonic()
+    return _CFG
+
+
 async def cfg(key):
-    r = await q("SELECT value FROM norm_cfg WHERE key=%s", (key,), one=True)
-    return r[0] if r else DEFAULTS[key]
+    try:
+        d = await _cfg_all()
+    except Exception:
+        d = _CFG
+    v = d.get(key)
+    return v if v is not None else DEFAULTS[key]
 
 
 async def set_cfg(key, value):
     await q("INSERT INTO norm_cfg(key,value) VALUES(%s,%s) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value", (key, str(value)))
+    _CFG[key] = str(value)
 
 
 def today_msk() -> date:
@@ -180,11 +203,18 @@ def fmt_hours(h: float) -> str:
     return f"{h:g} ч"
 
 
+_SYNC_AT = 0.0
+
+
 async def sync_state():
     """У каждого искателя есть дата «с какого дня учитываем». Первый запуск — со стартового дня, новичкам — со следующего."""
+    global _SYNC_AT
+    if time.monotonic() - _SYNC_AT < 30:   # при каждом показе панели не нужно: проверяем не чаще раза в 30 с
+        return
     fs = await finders()
     if not fs:
         return
+    _SYNC_AT = time.monotonic()
     have = {r[0] for r in (await q("SELECT user_id FROM norm_state", many=True) or [])}
     first_ever = not have
     since = (await _start()) - timedelta(days=1) if first_ever else today_msk()
