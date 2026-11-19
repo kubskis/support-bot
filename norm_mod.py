@@ -260,8 +260,11 @@ def warn_mode(n_people: int, n_done: int, best: int, pct_low: int, pct_ok: int, 
     return "all"
 
 
-def required_for(n_active: int, percent: int) -> int:
-    return (n_active * percent + 99) // 100 if n_active else 0
+async def required_for_pool(pool) -> int:
+    """Общая норма дня: по одной секретке на каждого человека в учёте. Наблюдатели в число людей не входят
+    (их секретки при этом идут в общий счёт), отгульщики уже убраны из pool."""
+    obs = await observers()
+    return len([u for u in pool if u not in obs])
 
 
 async def active_warns(uid) -> int:
@@ -478,7 +481,6 @@ async def _send_weekly():
 async def process_day(d: date):
     if await q("SELECT 1 FROM norm_days WHERE day=%s", (d,), one=True):
         return
-    percent = int(await cfg("percent"))
     elig = await eligible_on(d)
     finds = await finds_on(d)
     total = sum(finds.values())
@@ -490,7 +492,7 @@ async def process_day(d: date):
         except Exception as e:
             log.warning("праздничный итог: %s", e)
         return
-    req = required_for(len(elig), percent)
+    req = await required_for_pool(elig)
     met = total >= req
     obs = await observers()
     n_done = sum(1 for u in elig if finds.get(u, 0) > 0)
@@ -576,7 +578,7 @@ async def _remind(kind):
     pool = await eligible_on(d)
     finds = await finds_on(d)
     total = sum(finds.values())
-    req = required_for(len(pool), int(await cfg("percent")))
+    req = await required_for_pool(pool)
     if kind == "morning":
         txt = (f"🌅 <b>Новый день, норматив {_fmt(d)}</b>\nСекретки засчитываются с {await window_label()}.\n"
                f"Искателей в учёте: {len(pool)} · общая норма: <b>{req}</b> секр.\nКаждому — 1 секретка. Статус: /norm, таблица: /normtop")
@@ -603,7 +605,7 @@ async def _remind_dm(hours_left):
     pool = await eligible_on(d)
     finds = await finds_on(d)
     total = sum(finds.values())
-    req = required_for(len(pool), int(await cfg("percent")))
+    req = await required_for_pool(pool)
     if total >= req:
         return
     end = (await window())[1]
@@ -641,8 +643,8 @@ async def _welcome_text() -> str:
     a, b = await window()
     return ("👋 <b>Добро пожаловать в норматив секреток!</b>\n\n"
             f"<b>Как это работает</b>\n• Приём секреток: <b>{a:02d}:00–{b:02d}:00 МСК</b>, ночью не считается.\n"
-            f"• Норма на каждого: 1 секретка в день, общая норма дня — {await cfg('percent')}% от числа искателей.\n"
-            f"• Если общая норма не выполнена, а у вас 0 секреток — предупреждение. Лимит: {await cfg('max_warns')}, дальше решают админы.\n"
+            "• Норма на каждого: 1 секретка в день. Общая норма дня — столько секреток, сколько искателей в учёте (наблюдатели и те, кто в отгуле, не считаются).\n"
+            f"• Если секретки в этот день нашли мало людей, а у вас 0 — предупреждение. Лимит: {await cfg('max_warns')}, дальше решают админы.\n"
             "• Бот напомнит в личку за 3 часа и за 1 час до закрытия, если у вас 0.\n\n"
             "<b>Команды</b>\n/norm — ваш статус · /normtop — таблица стаффа · /normrec — топ и рекорды · /otgul — заявка на отгул\n\n"
             "<b>Отгул</b>: болезнь, нет випки (до 7 дней), поездка. Кнопки в /otgul видите только вы, решение примут главные админы.\n\n"
@@ -740,7 +742,7 @@ async def cmd_norm(message: Message):
     pool = await eligible_on(d)
     finds = await finds_on(d)
     total = sum(finds.values())
-    req = required_for(len(pool), int(await cfg("percent")))
+    req = await required_for_pool(pool)
     mine = finds.get(uid, 0)
     n = await active_warns(uid)
     limit = int(await cfg("max_warns"))
@@ -795,7 +797,7 @@ async def cmd_normtop(message: Message):
     fs = await finders()
     finds = await finds_on(d)
     pool = await eligible_on(d)
-    req = required_for(len(pool), int(await cfg("percent")))
+    req = await required_for_pool(pool)
     total = sum(finds.values())
     lines = [f"📊 <b>Норматив {_fmt(d)}</b> — общая норма {total}/{req} {'✅' if total >= req else '⏳'}\n"]
     obs = await observers()
@@ -1061,7 +1063,7 @@ async def cmd_admin(message: Message):
     if not await _is_main_admin(message.from_user.id):
         return
     a = (message.text or "").split()[1:]
-    help_ = ("<b>/normadmin</b>\n<code>on</code> / <code>off</code> — включить/выключить\n<code>percent 60</code> — процент общей нормы\n"
+    help_ = ("<b>/normadmin</b>\n<code>on</code> / <code>off</code> — включить/выключить\n"
              "<code>start 2026-11-02</code> — день старта\n<code>warn UID +1</code> / <code>warn UID -1</code> — вручную\n"
              "<code>reset UID</code> — сбросить предупреждения\n<code>excuse UID ЧАСОВ [причина]</code> — выдать отгул\n"
              "<code>run</code> — пересчитать прошедшие дни\n<code>status</code> — настройки")
@@ -1071,9 +1073,6 @@ async def cmd_admin(message: Message):
     if c in ("on", "off"):
         await set_cfg("enabled", "1" if c == "on" else "0")
         return await message.answer(f"Норматив: {'включён' if c == 'on' else 'выключен'}.")
-    if c == "percent" and len(a) > 1 and a[1].isdigit():
-        await set_cfg("percent", max(1, min(int(a[1]), 100)))
-        return await message.answer(f"Общая норма: {a[1]}% от числа искателей.")
     if c == "start" and len(a) > 1:
         try:
             date.fromisoformat(a[1])
@@ -1104,7 +1103,7 @@ async def cmd_admin(message: Message):
         await process_pending()
         return await message.answer("Пересчитано.")
     if c == "status":
-        return await message.answer(f"Включён: {await cfg('enabled')}\nПроцент: {await cfg('percent')}\nСтарт: {await cfg('start')}\nЛимит предупреждений: {await cfg('max_warns')}\nИскателей: {len(await finders())}")
+        return await message.answer(f"Включён: {await cfg('enabled')}\nСтарт: {await cfg('start')}\nЛимит предупреждений: {await cfg('max_warns')}\nИскателей: {len(await finders())}")
     await message.answer(help_, parse_mode="HTML")
 
 
@@ -1222,19 +1221,18 @@ async def adm_norm_obs_toggle(cb: CallbackQuery):
 
 async def overview(page=0):
     d = today_msk()
-    pct = int(await cfg("percent"))
     pool = set(await eligible_on(d))
     exc = await excused_on(d)
     fs = await finders()
     finds = await finds_on(d)
     total_all = sum(finds.get(u, 0) for u in fs)
-    req = required_for(len(pool), pct)
+    req = await required_for_pool(pool)
     perc = int(total_all * 100 / req) if req else 100
     enabled = (await cfg("enabled")) == "1"
     lines = [f"📋 <b>Норматив секреток · {_fmt(d)}</b>" + ("" if enabled else " · 🔴 <b>ВЫКЛЮЧЕН</b>"),
              f"Приём секреток: {await window_label()} · {html.escape(await _time_note(d))}", "",
              f"<b>Общая норма:</b> {total_all}/{req} · {perc}%  {_bar(total_all, req)}",
-             f"Искателей в учёте: {len(pool)} из {len(fs)} · отгул: {len([u for u in fs if u in exc])} · норма {pct}%", ""]
+             f"Искателей в учёте: {len(pool)} из {len(fs)} · отгул: {len([u for u in fs if u in exc])} · наблюдателей: {len(await observers())}", ""]
     warn_cnt = {int(a): int(b) for a, b in (await q("SELECT user_id, COUNT(*) FROM norm_warns WHERE active GROUP BY user_id", many=True) or [])}
     rows = []
     obs_set = await observers()
@@ -1680,10 +1678,9 @@ async def adm_norm_manual_del(cb: CallbackQuery, state: FSMContext = None):
 
 async def _settings_view():
     on = (await cfg("enabled")) == "1"
-    pct = await cfg("percent")
     a, b = await window()
     text = ("⚙️ <b>Настройки норматива</b>\n\n"
-            f"Состояние: {'🟢 включён' if on else '🔴 выключен'}\nОбщая норма: <b>{pct}%</b> от числа искателей (округление вверх)\n"
+            f"Состояние: {'🟢 включён' if on else '🔴 выключен'}\nОбщая норма: <b>1 секретка на каждого искателя в учёте</b> (без наблюдателей и ушедших в отгул)\n"
             f"Приём секреток: <b>{a:02d}:00–{b:02d}:00 МСК</b>\nСтарт: {(await _start()).strftime('%d.%m.%Y')}\n"
             f"Вылет при предупреждениях: {await cfg('max_warns')}\n\n"
             f"<b>Варны по числу сделавших норму</b> (доля участников; сделал норму = минимум 1 секретка):\n"
@@ -1692,7 +1689,6 @@ async def _settings_view():
             f"• {await cfg('pct_ok')}% и больше: варнов нет\n"
             f"Наблюдателей: {len(await observers())} (раздел «Доступ» → «Наблюдатели»; идут в общую норму, варн им не выдаётся)")
     rows = [[InlineKeyboardButton(text="🔴 Выключить" if on else "🟢 Включить", callback_data="nrmt:enabled:" + ("0" if on else "1"))],
-            [InlineKeyboardButton(text=("• " if str(v) == pct else "") + f"{v}%", callback_data=f"nrmt:percent:{v}") for v in (40, 50, 60, 70, 80)],
             [InlineKeyboardButton(text=("• " if v == a else "") + f"с {v:02d}:00", callback_data=f"nrmt:win_from:{v}") for v in (0, 6, 8, 10)],
             [InlineKeyboardButton(text=("• " if v == b else "") + f"до {v:02d}:00", callback_data=f"nrmt:win_to:{v}") for v in (22, 23, 24)],
             [InlineKeyboardButton(text=("• " if int(await cfg("max_warns")) == v else "") + f"{v} предупр.", callback_data=f"nrmt:max_warns:{v}") for v in (3, 4, 5, 6, 7)],
@@ -1711,7 +1707,7 @@ async def adm_norm_settings(cb: CallbackQuery):
     await _edit(cb, text, kb)
 
 
-@router.callback_query(F.data.regexp(r"^nrmt:(enabled|percent|win_from|win_to|max_warns|pct_low|pct_ok|big_finds):\d+$"))
+@router.callback_query(F.data.regexp(r"^nrmt:(enabled|win_from|win_to|max_warns|pct_low|pct_ok|big_finds):\d+$"))
 async def adm_norm_set(cb: CallbackQuery):
     if not await _guard(cb):
         return
