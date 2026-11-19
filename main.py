@@ -4292,6 +4292,8 @@ def access_kb():
         [IB(text="🔔 Предссылки и личные пинги", callback_data="adm_sec_people")],
         [IB(text="📝 Наборы и друзья", callback_data="adm_recruit")],
         [IB(text="🎯 Ответственные по наборам", callback_data="rec_manage")],
+        [IB(text="👁 Наблюдатели норматива", callback_data="nrmo")],
+        [IB(text="🏖 Отгулы от норматива", callback_data="nrme")],
         [IB(text="🧪 Тестеры", callback_data="tst_manage")],
         [IB(text="👑 Главные админы", callback_data="manage_main_admins")],
         [IB(text="🚫 Внести игрока в ЧС", callback_data="bl_add")],
@@ -14832,7 +14834,7 @@ async def adm_access_screen(call: CallbackQuery):
         await call.answer("❌ Нет доступа", show_alert=True)
         return
     await call.message.edit_text(
-        "👥 <b>Доступ</b>\n\nКто публикует секретки, кому видны предссылки, наборы, главные админы и чёрный список.",
+        "👥 <b>Доступ</b>\n\nКто публикует секретки, кому видны предссылки, наборы, наблюдатели и отгулы норматива, главные админы и чёрный список.",
         reply_markup=access_kb(), parse_mode="HTML")
     await call.answer()
 

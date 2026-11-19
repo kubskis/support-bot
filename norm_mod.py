@@ -1192,7 +1192,7 @@ async def _observers_view():
              "Отгул, как и у всех, уменьшает число участников.\n",
              "Нажмите на человека, чтобы добавить или убрать. Показаны искатели (кто в списке публикаторов)."]
     btns = [[InlineKeyboardButton(text=("👁 " if u in obs else "▫️ ") + (await _nm(u))[:40], callback_data=f"nrmot:{u}")] for u in fs]
-    btns.append([InlineKeyboardButton(text="🔙 К настройкам", callback_data="nrms")])
+    btns.append([InlineKeyboardButton(text="🔙 Назад", callback_data="adm_access")])
     return "\n".join(lines), _ikb(btns)
 
 
@@ -1265,7 +1265,7 @@ async def overview(page=0):
         nav.append(InlineKeyboardButton(text="▶️", callback_data=f"nrmp:{page + 1}"))
     kb = _ikb([nav,
                [InlineKeyboardButton(text="⚠️ Предупреждения", callback_data="nrmw"), InlineKeyboardButton(text="📅 История", callback_data="nrmh")],
-               [InlineKeyboardButton(text="🏖 Отгулы", callback_data="nrme"), InlineKeyboardButton(text="✍️ Ручная правка", callback_data="nrmm")],
+               [InlineKeyboardButton(text="✍️ Ручная правка", callback_data="nrmm")],
                [InlineKeyboardButton(text="🎉 Праздники", callback_data="nrmholi"), InlineKeyboardButton(text="⚙️ Настройки", callback_data="nrms")],
                [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_adm")]])
     return "\n".join(lines), kb
@@ -1495,7 +1495,7 @@ async def adm_norm_exc(cb: CallbackQuery, state: FSMContext = None):
             btns.append([InlineKeyboardButton(text=f"⏹ Завершить: {(await _nm(u))[:26]}", callback_data=f"nrmx:{eid}")])
         else:
             btns.append([InlineKeyboardButton(text=f"🗑 Убрать заявку: {(await _nm(u))[:22]}", callback_data=f"nrmz:{eid}")])
-    btns.append([InlineKeyboardButton(text="🔙 К таблице", callback_data="adm_norm")])
+    btns.append([InlineKeyboardButton(text="🔙 Назад", callback_data="adm_access")])
     await _edit(cb, "\n".join(lines), _ikb(btns))
 
 
@@ -1687,7 +1687,7 @@ async def _settings_view():
             f"• меньше {await cfg('pct_low')}% участников: варн всем, кто не искал\n"
             f"• от {await cfg('pct_low')}% до {await cfg('pct_ok')}%: варн не искавшим, только если у кого-то {await cfg('big_finds')}+ секретки\n"
             f"• {await cfg('pct_ok')}% и больше: варнов нет\n"
-            f"Наблюдателей: {len(await observers())} (идут в общую норму, варн им не выдаётся)")
+            f"Наблюдателей: {len(await observers())} (раздел «Доступ» → «Наблюдатели»; идут в общую норму, варн им не выдаётся)")
     rows = [[InlineKeyboardButton(text="🔴 Выключить" if on else "🟢 Включить", callback_data="nrmt:enabled:" + ("0" if on else "1"))],
             [InlineKeyboardButton(text=("• " if str(v) == pct else "") + f"{v}%", callback_data=f"nrmt:percent:{v}") for v in (40, 50, 60, 70, 80)],
             [InlineKeyboardButton(text=("• " if v == a else "") + f"с {v:02d}:00", callback_data=f"nrmt:win_from:{v}") for v in (0, 6, 8, 10)],
@@ -1696,7 +1696,6 @@ async def _settings_view():
             [InlineKeyboardButton(text=("• " if int(await cfg("pct_low")) == v else "") + f"мало {v}%", callback_data=f"nrmt:pct_low:{v}") for v in (25, 30, 33, 40)],
             [InlineKeyboardButton(text=("• " if int(await cfg("pct_ok")) == v else "") + f"хватает {v}%", callback_data=f"nrmt:pct_ok:{v}") for v in (35, 40, 42, 50)],
             [InlineKeyboardButton(text=("• " if int(await cfg("big_finds")) == v else "") + f"{v}+ секр.", callback_data=f"nrmt:big_finds:{v}") for v in (3, 4, 5, 6)],
-            [InlineKeyboardButton(text="👁 Наблюдатели", callback_data="nrmo")],
             [InlineKeyboardButton(text="🔙 К таблице", callback_data="adm_norm")]]
     return text, _ikb(rows)
 
