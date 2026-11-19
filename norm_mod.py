@@ -806,10 +806,7 @@ async def cmd_normtop(message: Message):
     rows.sort(key=lambda r: (-r[1], r[2]))
     for u, f, n, e in rows[:60]:
         mark = "🏖" if e else ("👁" if u in obs else ("✅" if f else "▫️"))
-        lines.append(f"{mark} {await _mention(u)} — {f} сегодня" + (" · наблюдатель" if u in obs else "") + (f" · ⚠️{n}" if n else ""))
-    if any(r[0] in obs for r in rows):
-        lines.append("\n👁 <b>Наблюдатели</b>: их секретки идут в общую норму и в число участников, но искать им не нужно и варн они не получают. "
-                     "Из-за этого общая норма и пороги варнов считаются с их участием.")
+        lines.append(f"{mark} {await _mention(u)} — {f} сегодня" + (f" · ⚠️{n}" if n else ""))
     await message.answer("\n".join(lines), parse_mode="HTML")
 
 
