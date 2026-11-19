@@ -755,6 +755,8 @@ async def cmd_norm(message: Message):
         f"Предупреждения: <b>{n}/{limit}</b>",
         f"Дней без секреток подряд: {await _streak_days(uid)}",
     ]
+    if uid in await observers():
+        lines.append("👁 Вы наблюдатель: ваши секретки идут в общую норму, но искать вам не нужно и варн вы не получаете.")
     if ex:
         lines.append(f"🏖 Отгул до {fmt_dt(ex[0])} МСК ({html.escape(ex[1] or '')})")
     elif pend:
@@ -796,14 +798,18 @@ async def cmd_normtop(message: Message):
     req = required_for(len(pool), int(await cfg("percent")))
     total = sum(finds.values())
     lines = [f"📊 <b>Норматив {_fmt(d)}</b> — общая норма {total}/{req} {'✅' if total >= req else '⏳'}\n"]
+    obs = await observers()
     rows = []
     for u in fs:
         n = await active_warns(u)
         rows.append((u, finds.get(u, 0), n, u in exc))
     rows.sort(key=lambda r: (-r[1], r[2]))
     for u, f, n, e in rows[:60]:
-        mark = "🏖" if e else ("✅" if f else "▫️")
-        lines.append(f"{mark} {await _mention(u)} — {f} сегодня" + (f" · ⚠️{n}" if n else ""))
+        mark = "🏖" if e else ("👁" if u in obs else ("✅" if f else "▫️"))
+        lines.append(f"{mark} {await _mention(u)} — {f} сегодня" + (" · наблюдатель" if u in obs else "") + (f" · ⚠️{n}" if n else ""))
+    if any(r[0] in obs for r in rows):
+        lines.append("\n👁 <b>Наблюдатели</b>: их секретки идут в общую норму и в число участников, но искать им не нужно и варн они не получают. "
+                     "Из-за этого общая норма и пороги варнов считаются с их участием.")
     await message.answer("\n".join(lines), parse_mode="HTML")
 
 
