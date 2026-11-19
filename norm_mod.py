@@ -495,9 +495,10 @@ async def process_day(d: date):
     req = await required_for_pool(elig)
     met = total >= req
     obs = await observers()
-    n_done = sum(1 for u in elig if finds.get(u, 0) > 0)
-    best = max([finds.get(u, 0) for u in elig] or [0])
-    mode = warn_mode(len(elig), n_done, best, int(await cfg("pct_low")), int(await cfg("pct_ok")), int(await cfg("big_finds")))
+    people = [u for u in elig if u not in obs]          # наблюдатели в пороги варнов не входят
+    n_done = sum(1 for u in people if finds.get(u, 0) > 0)
+    best = max([finds.get(u, 0) for u in people] or [0])
+    mode = warn_mode(len(people), n_done, best, int(await cfg("pct_low")), int(await cfg("pct_ok")), int(await cfg("big_finds")))
     warned, streak_warned = [], []
     for u in elig:
         if u in obs:
@@ -506,7 +507,7 @@ async def process_day(d: date):
             if await q("SELECT 1 FROM norm_warns WHERE user_id=%s AND day=%s AND kind='day'", (u, d), one=True):
                 warned.append(u)
                 continue
-            await add_warn(u, d, "day", f"{_fmt(d)}: не найдено ни одной секретки; норму дня сделали {n_done} из {len(elig)} участников.")
+            await add_warn(u, d, "day", f"{_fmt(d)}: не найдено ни одной секретки; норму дня сделали {n_done} из {len(people)} участников.")
             warned.append(u)
     # серия: 3 дня подряд без секреток и без «дневных» предупреждений
     d0 = d - timedelta(days=2)
@@ -526,7 +527,7 @@ async def process_day(d: date):
     await q("INSERT INTO norm_days(day,finders,required,found,met) VALUES(%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING", (d, len(elig), req, total, met))
     lines = [f"📊 <b>Итог дня {_fmt(d)}</b> (приём {await window_label()})", f"Искателей в учёте: {len(elig)} · нужно секреток: {req} · найдено: {total}",
              "✅ Общая норма выполнена." if met else "❌ Общая норма не выполнена.",
-             f"Сделали норму: {n_done} из {len(elig)} · " + ("варны не выдаются" if mode == "none" else "варн не искавшим")]
+             f"Сделали норму: {n_done} из {len(people)} · " + ("варны не выдаются" if mode == "none" else "варн не искавшим")]
     if warned:
         lines.append("⚠️ Предупреждения за день: " + ", ".join([await _mention(u) for u in warned]))
     if streak_warned:
