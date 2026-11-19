@@ -331,7 +331,7 @@ _TZ = "'Europe/Moscow'"
 
 async def per_user_day(d1: date, d2: date) -> list:
     """[(user_id, day, n)] за период: секретки в окне приёма + ручные зачёты
-    + фарм и саботёр (сервер, который провели и сняли от часа), + бейджи исследователя (любое время),
+    + саботёр (сервер, который провели и сняли от часа; фарм-серверы в норму не входят), + бейджи исследователя (любое время),
     + выданное главным админом вручную по типу (manual_grants; мутатор в норму не входит).
     Бейджи мутатора в норму не входят."""
     a, b = await window()
@@ -343,12 +343,9 @@ async def per_user_day(d1: date, d2: date) -> list:
         UNION ALL SELECT user_id, (ended_at AT TIME ZONE {_TZ})::date, COUNT(*) FROM saboteur_servers
           WHERE ended_at IS NOT NULL AND ended_at - created_at >= INTERVAL '1 hour'
             AND (ended_at AT TIME ZONE {_TZ})::date BETWEEN %s AND %s GROUP BY 1,2
-        UNION ALL SELECT user_id, (ended_at AT TIME ZONE {_TZ})::date, COUNT(*) FROM farm_servers
-          WHERE ended_at IS NOT NULL AND ended_at - created_at >= INTERVAL '1 hour'
-            AND (ended_at AT TIME ZONE {_TZ})::date BETWEEN %s AND %s GROUP BY 1,2
         UNION ALL SELECT user_id, (created_at AT TIME ZONE {_TZ})::date, COUNT(*) FROM researcher_badges
           WHERE message_id <> 0 AND (created_at AT TIME ZONE {_TZ})::date BETWEEN %s AND %s GROUP BY 1,2
-        ) t GROUP BY 1,2""", (d1, d2, a, b, d1, d2, d1, d2, d1, d2, d1, d2, d1, d2), many=True)
+        ) t GROUP BY 1,2""", (d1, d2, a, b, d1, d2, d1, d2, d1, d2, d1, d2), many=True)
     return [(u, d, int(n)) for u, d, n in (rows or [])]
 
 
@@ -499,6 +496,8 @@ async def process_day(d: date):
     n_done = sum(1 for u in people if finds.get(u, 0) > 0)
     best = max([finds.get(u, 0) for u in people] or [0])
     mode = warn_mode(len(people), n_done, best, int(await cfg("pct_low")), int(await cfg("pct_ok")), int(await cfg("big_finds")))
+    if met and mode == "all":
+        mode = "none"                      # общая норма набрана (с секретками наблюдателей): варны за день не выдаются
     warned, streak_warned = [], []
     for u in elig:
         if u in obs:
