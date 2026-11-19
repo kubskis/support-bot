@@ -47,7 +47,8 @@ _mention = None
 _admin_chat = None
 _topic = None
 
-DEFAULTS = {"enabled": "1", "percent": "60", "start": "2026-11-02", "max_warns": "5", "win_from": "6", "win_to": "23"}
+DEFAULTS = {"enabled": "1", "percent": "60", "start": "2026-11-02", "max_warns": "5", "win_from": "6", "win_to": "23",
+            "pct_low": "33", "pct_ok": "42", "big_finds": "4"}
 REASONS = {"sick": "🤒 Болезнь / плохое самочувствие", "vip": "🔑 Нет випки (до 7 дней)", "trip": "✈️ Поездка / нет интернета"}
 
 _DDL = """
@@ -71,6 +72,7 @@ CREATE INDEX IF NOT EXISTS secret_posts_user_created ON secret_posts(user_id, cr
 CREATE TABLE IF NOT EXISTS manual_grants(id SERIAL PRIMARY KEY, user_id BIGINT NOT NULL, kind TEXT NOT NULL, day DATE NOT NULL,
                                          by_id BIGINT, ts TIMESTAMPTZ DEFAULT now());
 CREATE INDEX IF NOT EXISTS manual_grants_u ON manual_grants(user_id, kind);
+CREATE TABLE IF NOT EXISTS norm_observers(user_id BIGINT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS norm_msgs(ref TEXT NOT NULL, chat_id BIGINT NOT NULL, message_id BIGINT NOT NULL, PRIMARY KEY(ref, chat_id));
 """
 
@@ -229,6 +231,33 @@ async def eligible_on(d: date) -> list:
     exc = await excused_on(d)
     rows = await q("SELECT s.user_id FROM norm_state s JOIN secret_publishers p ON p.user_id=s.user_id WHERE s.since<%s", (d,), many=True)
     return [r[0] for r in (rows or []) if r[0] not in exc]
+
+
+async def observers() -> set:
+    """Наблюдатели: их секретки идут в общую норму, они входят в число участников, но им не нужно искать и варн не выдаётся."""
+    return {r[0] for r in (await q("SELECT user_id FROM norm_observers", many=True) or [])}
+
+
+def _share(n: int, pct: int) -> int:
+    """Доля участников в % -> число людей (обычное округление, не меньше 1)."""
+    return max(1, int(n * pct / 100 + 0.5)) if n else 0
+
+
+def warn_mode(n_people: int, n_done: int, best: int, pct_low: int, pct_ok: int, big: int) -> str:
+    """Кому выдавать варны за день по числу людей, сделавших норму (n_done) из n_people участников:
+    'all'  - варн всем, кто не искал; 'none' - никому.
+    Порог «мало» это pct_low % участников (при 12 людях 33% = 4), порог «достаточно» это pct_ok % (42% = 5):
+      меньше порога «мало»  - варн не искавшим;
+      от «мало» до «достаточно» - варн не искавшим, только если у кого-то big и больше секреток;
+      «достаточно» и больше - никому."""
+    if n_people <= 0:
+        return "none"
+    low, ok = _share(n_people, pct_low), _share(n_people, pct_ok)
+    if n_done >= ok:
+        return "none"
+    if n_done >= low:
+        return "all" if best >= big else "none"
+    return "all"
 
 
 def required_for(n_active: int, percent: int) -> int:
@@ -463,13 +492,19 @@ async def process_day(d: date):
         return
     req = required_for(len(elig), percent)
     met = total >= req
+    obs = await observers()
+    n_done = sum(1 for u in elig if finds.get(u, 0) > 0)
+    best = max([finds.get(u, 0) for u in elig] or [0])
+    mode = warn_mode(len(elig), n_done, best, int(await cfg("pct_low")), int(await cfg("pct_ok")), int(await cfg("big_finds")))
     warned, streak_warned = [], []
     for u in elig:
-        if finds.get(u, 0) == 0 and not met:
+        if u in obs:
+            continue                       # наблюдателям варн не выдаётся никогда
+        if finds.get(u, 0) == 0 and mode == "all":
             if await q("SELECT 1 FROM norm_warns WHERE user_id=%s AND day=%s AND kind='day'", (u, d), one=True):
                 warned.append(u)
                 continue
-            await add_warn(u, d, "day", f"{_fmt(d)}: не найдено ни одной секретки, общая норма дня не выполнена ({total}/{req}).")
+            await add_warn(u, d, "day", f"{_fmt(d)}: не найдено ни одной секретки; норму дня сделали {n_done} из {len(elig)} участников.")
             warned.append(u)
     # серия: 3 дня подряд без секреток и без «дневных» предупреждений
     d0 = d - timedelta(days=2)
@@ -478,7 +513,7 @@ async def process_day(d: date):
         excs = [await excused_on(d0 + timedelta(days=i)) for i in range(3)]
         excused = set().union(*excs)
         for u in elig:
-            if u in warned:
+            if u in warned or u in obs:
                 continue
             if u in counted or u in excused:
                 continue
@@ -488,12 +523,13 @@ async def process_day(d: date):
             streak_warned.append(u)
     await q("INSERT INTO norm_days(day,finders,required,found,met) VALUES(%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING", (d, len(elig), req, total, met))
     lines = [f"📊 <b>Итог дня {_fmt(d)}</b> (приём {await window_label()})", f"Искателей в учёте: {len(elig)} · нужно секреток: {req} · найдено: {total}",
-             "✅ Общая норма выполнена." if met else "❌ Общая норма не выполнена."]
+             "✅ Общая норма выполнена." if met else "❌ Общая норма не выполнена.",
+             f"Сделали норму: {n_done} из {len(elig)} · " + ("варны не выдаются" if mode == "none" else "варн не искавшим")]
     if warned:
         lines.append("⚠️ Предупреждения за день: " + ", ".join([await _mention(u) for u in warned]))
     if streak_warned:
         lines.append("⚠️ Предупреждения за 3 дня без секреток: " + ", ".join([await _mention(u) for u in streak_warned]))
-    if met and not streak_warned:
+    if not warned and not streak_warned:
         lines.append("Личных предупреждений за день нет.")
     try:
         hl = await day_highlights(d)
@@ -1147,6 +1183,40 @@ async def _time_note(d) -> str:
     return f"До закрытия приёма: {left // 60} ч {left % 60:02d} мин."
 
 
+async def _observers_view():
+    fs = await finders()
+    obs = await observers()
+    await asyncio.gather(*[_nm(u) for u in fs], return_exceptions=True)
+    lines = ["👁 <b>Наблюдатели</b>\n",
+             "Их секретки идут в общую норму, они входят в число участников для процентов, но искать им не нужно и варн им не выдаётся. "
+             "Отгул, как и у всех, уменьшает число участников.\n",
+             "Нажмите на человека, чтобы добавить или убрать. Показаны искатели (кто в списке публикаторов)."]
+    btns = [[InlineKeyboardButton(text=("👁 " if u in obs else "▫️ ") + (await _nm(u))[:40], callback_data=f"nrmot:{u}")] for u in fs]
+    btns.append([InlineKeyboardButton(text="🔙 К настройкам", callback_data="nrms")])
+    return "\n".join(lines), _ikb(btns)
+
+
+@router.callback_query(F.data == "nrmo")
+async def adm_norm_obs(cb: CallbackQuery):
+    if not await _guard(cb):
+        return
+    text, kb = await _observers_view()
+    await _edit(cb, text, kb)
+
+
+@router.callback_query(F.data.regexp(r"^nrmot:\d+$"))
+async def adm_norm_obs_toggle(cb: CallbackQuery):
+    if not await _guard(cb):
+        return
+    uid = int(cb.data.split(":")[1])
+    if uid in await observers():
+        await q("DELETE FROM norm_observers WHERE user_id=%s", (uid,))
+    else:
+        await q("INSERT INTO norm_observers(user_id) VALUES(%s) ON CONFLICT DO NOTHING", (uid,))
+    text, kb = await _observers_view()
+    await _edit(cb, text, kb)
+
+
 async def overview(page=0):
     d = today_msk()
     pct = int(await cfg("percent"))
@@ -1164,6 +1234,7 @@ async def overview(page=0):
              f"Искателей в учёте: {len(pool)} из {len(fs)} · отгул: {len([u for u in fs if u in exc])} · норма {pct}%", ""]
     warn_cnt = {int(a): int(b) for a, b in (await q("SELECT user_id, COUNT(*) FROM norm_warns WHERE active GROUP BY user_id", many=True) or [])}
     rows = []
+    obs_set = await observers()
     for u in fs:
         n = warn_cnt.get(u, 0)
         rows.append((u, finds.get(u, 0), n, u in exc, u in pool))
@@ -1177,6 +1248,8 @@ async def overview(page=0):
             mark, pc = "🏖", "отгул"
         elif not inpool:
             mark, pc = "🆕", "с завтра"
+        elif u in obs_set:
+            mark, pc = "👁", "наблюдатель"
         else:
             mark, pc = ("✅" if f else "▫️"), f"{f * 100}% нормы"
         lines.append(f"{mark} {await _nm(u)} — <b>{f}</b> · {pc}" + (f" · ⚠️{n}/{await cfg('max_warns')}" if n else ""))
@@ -1609,12 +1682,21 @@ async def _settings_view():
     text = ("⚙️ <b>Настройки норматива</b>\n\n"
             f"Состояние: {'🟢 включён' if on else '🔴 выключен'}\nОбщая норма: <b>{pct}%</b> от числа искателей (округление вверх)\n"
             f"Приём секреток: <b>{a:02d}:00–{b:02d}:00 МСК</b>\nСтарт: {(await _start()).strftime('%d.%m.%Y')}\n"
-            f"Вылет при предупреждениях: {await cfg('max_warns')}")
+            f"Вылет при предупреждениях: {await cfg('max_warns')}\n\n"
+            f"<b>Варны по числу сделавших норму</b> (доля участников; сделал норму = минимум 1 секретка):\n"
+            f"• меньше {await cfg('pct_low')}% участников: варн всем, кто не искал\n"
+            f"• от {await cfg('pct_low')}% до {await cfg('pct_ok')}%: варн не искавшим, только если у кого-то {await cfg('big_finds')}+ секретки\n"
+            f"• {await cfg('pct_ok')}% и больше: варнов нет\n"
+            f"Наблюдателей: {len(await observers())} (идут в общую норму, варн им не выдаётся)")
     rows = [[InlineKeyboardButton(text="🔴 Выключить" if on else "🟢 Включить", callback_data="nrmt:enabled:" + ("0" if on else "1"))],
             [InlineKeyboardButton(text=("• " if str(v) == pct else "") + f"{v}%", callback_data=f"nrmt:percent:{v}") for v in (40, 50, 60, 70, 80)],
             [InlineKeyboardButton(text=("• " if v == a else "") + f"с {v:02d}:00", callback_data=f"nrmt:win_from:{v}") for v in (0, 6, 8, 10)],
             [InlineKeyboardButton(text=("• " if v == b else "") + f"до {v:02d}:00", callback_data=f"nrmt:win_to:{v}") for v in (22, 23, 24)],
             [InlineKeyboardButton(text=("• " if int(await cfg("max_warns")) == v else "") + f"{v} предупр.", callback_data=f"nrmt:max_warns:{v}") for v in (3, 4, 5, 6, 7)],
+            [InlineKeyboardButton(text=("• " if int(await cfg("pct_low")) == v else "") + f"мало {v}%", callback_data=f"nrmt:pct_low:{v}") for v in (25, 30, 33, 40)],
+            [InlineKeyboardButton(text=("• " if int(await cfg("pct_ok")) == v else "") + f"хватает {v}%", callback_data=f"nrmt:pct_ok:{v}") for v in (35, 40, 42, 50)],
+            [InlineKeyboardButton(text=("• " if int(await cfg("big_finds")) == v else "") + f"{v}+ секр.", callback_data=f"nrmt:big_finds:{v}") for v in (3, 4, 5, 6)],
+            [InlineKeyboardButton(text="👁 Наблюдатели", callback_data="nrmo")],
             [InlineKeyboardButton(text="🔙 К таблице", callback_data="adm_norm")]]
     return text, _ikb(rows)
 
@@ -1627,7 +1709,7 @@ async def adm_norm_settings(cb: CallbackQuery):
     await _edit(cb, text, kb)
 
 
-@router.callback_query(F.data.regexp(r"^nrmt:(enabled|percent|win_from|win_to|max_warns):\d+$"))
+@router.callback_query(F.data.regexp(r"^nrmt:(enabled|percent|win_from|win_to|max_warns|pct_low|pct_ok|big_finds):\d+$"))
 async def adm_norm_set(cb: CallbackQuery):
     if not await _guard(cb):
         return
@@ -1638,6 +1720,10 @@ async def adm_norm_set(cb: CallbackQuery):
         return await cb.answer("Начало должно быть раньше конца", show_alert=True)
     if key == "win_to" and v <= a:
         return await cb.answer("Конец должен быть позже начала", show_alert=True)
+    if key == "pct_low" and v > int(await cfg("pct_ok")):
+        return await cb.answer("«Мало» не может быть больше «хватает»", show_alert=True)
+    if key == "pct_ok" and v < int(await cfg("pct_low")):
+        return await cb.answer("«Хватает» не может быть меньше «мало»", show_alert=True)
     await set_cfg(key, v)
     text, kb = await _settings_view()
     await _edit(cb, text, kb)
