@@ -1191,8 +1191,7 @@ async def _observers_view():
     obs = await observers()
     await asyncio.gather(*[_nm(u) for u in fs], return_exceptions=True)
     lines = ["👁 <b>Наблюдатели</b>\n",
-             "Их секретки идут в общую норму, они входят в число участников для процентов, но искать им не нужно и варн им не выдаётся. "
-             "Отгул, как и у всех, уменьшает число участников.\n",
+             "Их секретки идут в общий счёт, но в число людей для общей нормы и порогов варнов они не входят: искать им не нужно и варн им не выдаётся.\n",
              "Нажмите на человека, чтобы добавить или убрать. Показаны искатели (кто в списке публикаторов)."]
     btns = [[InlineKeyboardButton(text=("👁 " if u in obs else "▫️ ") + (await _nm(u))[:40], callback_data=f"nrmot:{u}")] for u in fs]
     btns.append([InlineKeyboardButton(text="🔙 Назад", callback_data="adm_access")])
