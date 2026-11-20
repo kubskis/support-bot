@@ -4362,6 +4362,17 @@ SEC_TYPES_KB = InlineKeyboardMarkup(inline_keyboard=[
     [IB(text="🔙 Назад", callback_data="adm_secret_panel")]
 ])
 
+def publisher_my_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [IB(text="📋 Мои секретки", callback_data="pub_my_posts")],
+        [IB(text="📋 Мои сервера саботера", callback_data="pub_my_saboteurs")],
+        [IB(text="📋 Мои сервера фарма", callback_data="pub_my_farms")],
+        [IB(text="📋 Мои бейджи мутатора", callback_data="pub_my_mutators")],
+        [IB(text="📋 Мои бейджи исследователя", callback_data="pub_my_researchers")],
+        [IB(text="🔙 Назад", callback_data="pub_menu_back")],
+    ])
+
+
 def publisher_menu_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [IB(text="📥 Отправить секретку", callback_data="pub_send_secret")],
@@ -4369,11 +4380,7 @@ def publisher_menu_kb():
         [IB(text="🌾 Фарм сервер", callback_data="pub_send_farm")],
         [IB(text="🧬 Бейдж мутатор", callback_data="pub_send_mutator")],
         [IB(text="🔍 Бейдж исследователь", callback_data="pub_send_researcher")],
-        [IB(text="📋 Мои секретки", callback_data="pub_my_posts"),
-         IB(text="📋 Мои сервера саботера", callback_data="pub_my_saboteurs")],
-        [IB(text="📋 Мои сервера фарма", callback_data="pub_my_farms")],
-        [IB(text="📋 Мои бейджи мутатора", callback_data="pub_my_mutators"),
-         IB(text="📋 Мои бейджи исследователя", callback_data="pub_my_researchers")],
+        [IB(text="📋 Мои сервера", callback_data="pub_my_menu")],
         [IB(text="🚫 Внести игрока в ЧС", callback_data="bl_add")],
         [IB(text="📢 Привязать канал", callback_data="pub_bind_channel")]
     ])
@@ -6578,6 +6585,27 @@ async def open_secrets_menu(message: Message, state: FSMContext):
         reply_markup=publisher_menu_kb(),
         parse_mode="HTML"
     )
+
+@router.callback_query(F.data == "pub_my_menu")
+async def pub_my_menu(call: CallbackQuery):
+    if not await is_secret_publisher(call.from_user.id): return
+    try:
+        await call.message.edit_text(f"{ICON_BALL} <b>Мои сервера</b>\n\nВыберите, что показать:", reply_markup=publisher_my_kb(), parse_mode="HTML")
+    except Exception:
+        await call.message.answer(f"{ICON_BALL} <b>Мои сервера</b>\n\nВыберите, что показать:", reply_markup=publisher_my_kb(), parse_mode="HTML")
+    await call.answer()
+
+@router.callback_query(F.data == "pub_menu_back")
+async def pub_menu_back(call: CallbackQuery):
+    if not await is_secret_publisher(call.from_user.id): return
+    text = (f"{ICON_BALL} <b>Панель публикации секреток</b>\n\n"
+            + ("⏸ <b>Публикации в канал сейчас приостановлены администрацией.</b> Отправить новый пост пока нельзя.\n\n" if _pub_paused() else "")
+            + "Выберите нужное действие:")
+    try:
+        await call.message.edit_text(text, reply_markup=publisher_menu_kb(), parse_mode="HTML")
+    except Exception:
+        await call.message.answer(text, reply_markup=publisher_menu_kb(), parse_mode="HTML")
+    await call.answer()
 
 @router.callback_query(F.data == "pub_bind_channel")
 async def pub_bind_channel_prompt(call: CallbackQuery, state: FSMContext):
