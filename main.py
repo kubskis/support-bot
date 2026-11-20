@@ -6717,21 +6717,11 @@ async def pub_mode_farm(call: CallbackQuery, state: FSMContext):
         await call.message.answer(f"{ICON_CROSS} В базе нет особых типов секреток. Добавьте их в админ-панели!", parse_mode="HTML")
         await call.answer()
         return
-    if len(spec_list) == 1:
-        # Особый тип всего один: выбирать не из чего, сразу просим фото (с кнопкой отмены)
-        only = list(spec_list)[0]
-        await state.update_data(secret_type=only)
-        await call.message.edit_text(
-            f"🌾 <b>Фарм секретка</b>\nТип: <b>{html.escape(str(only))}</b>\n\nОтправьте <b>фотографию</b> секретки:",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[IB(style="danger", text="❌ Отмена", callback_data="pub_spec_cancel")]]),
-            parse_mode="HTML")
-        await state.set_state(SecretPublisherStates.waiting_for_photo)
-        await call.answer()
-        return
     buttons = []
     for k in spec_list:
         if len(f"pub_farm_sel_{k}".encode()) > 64: continue
         buttons.append([IB(text=f"🌾 {k}", callback_data=f"pub_farm_sel_{k}")])
+    buttons.append([IB(style="danger", text="❌ Отмена", callback_data="pub_spec_cancel")])
     await call.message.edit_text("🌾 <b>Выбран режим: Фарм секретка</b>\n\nВыберите тип фарма кнопкой ниже:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
     await state.set_state(SecretPublisherStates.waiting_for_farm_choice)
     await call.answer()
@@ -6751,7 +6741,8 @@ async def pub_spec_cancel(call: CallbackQuery, state: FSMContext):
 async def pub_farm_choice_selected(call: CallbackQuery, state: FSMContext):
     f_type = call.data.split("_", 3)[3]
     await state.update_data(secret_type=f_type)
-    await call.message.edit_text(f"Выбран тип: <b>{html.escape(f_type)}</b>\n\nТеперь отправьте <b>фотографию</b> секретки:", parse_mode="HTML")
+    await call.message.edit_text(f"Выбран тип: <b>{html.escape(f_type)}</b>\n\nТеперь отправьте <b>фотографию</b> секретки:", parse_mode="HTML",
+                                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[[IB(style="danger", text="❌ Отмена", callback_data="pub_spec_cancel")]]))
     await state.set_state(SecretPublisherStates.waiting_for_photo)
     await call.answer()
 
