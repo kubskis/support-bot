@@ -6687,7 +6687,7 @@ async def pub_send_secret(call: CallbackQuery, state: FSMContext):
     
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [IB(text="🔮 Обычная секретка", callback_data="pub_mode_normal")],
-        [IB(text="🌾 Фарм секретка", callback_data="pub_mode_farm")]
+        [IB(text="🌾 Особая секретка", callback_data="pub_mode_farm")]
     ])
     await call.message.edit_text("<b>Выберите категорию публикации:</b>", reply_markup=kb, parse_mode="HTML")
     await state.set_state(SecretPublisherStates.waiting_for_mode)
@@ -6722,7 +6722,7 @@ async def pub_mode_farm(call: CallbackQuery, state: FSMContext):
         if len(f"pub_farm_sel_{k}".encode()) > 64: continue
         buttons.append([IB(text=f"🌾 {k}", callback_data=f"pub_farm_sel_{k}")])
     buttons.append([IB(style="danger", text="❌ Отмена", callback_data="pub_spec_cancel")])
-    await call.message.edit_text("🌾 <b>Выбран режим: Фарм секретка</b>\n\nВыберите тип фарма кнопкой ниже:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
+    await call.message.edit_text("🌾 <b>Выбран режим: Особая секретка</b>\n\nВыберите тип особой секретки кнопкой ниже:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
     await state.set_state(SecretPublisherStates.waiting_for_farm_choice)
     await call.answer()
 
